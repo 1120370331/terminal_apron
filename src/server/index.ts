@@ -144,6 +144,41 @@ app.post("/api/sessions", async (req, res) => {
   });
 });
 
+app.post("/api/sessions/:id/duplicate", async (req, res) => {
+  const source = await store.get(req.params.id);
+  if (!source) {
+    res.status(404).json({ error: "session not found" });
+    return;
+  }
+
+  const sessions = await store.all();
+  const duplicate = await store.create({
+    name: nextCopyName(source.name, sessions.map((session) => session.name)),
+    group: source.group,
+    tags: source.tags,
+    cwd: source.cwd,
+    shell: source.shell,
+    backend: source.backend,
+    color: source.color
+  });
+
+  const updated =
+    source.layout &&
+    (await store.update(duplicate.id, {
+      layout: {
+        ...source.layout,
+        x: source.layout.x + 1,
+        y: source.layout.y + 1
+      }
+    }));
+
+  const copied = updated || duplicate;
+  res.status(201).json({
+    ...copied,
+    runtime: await getRuntime(copied)
+  });
+});
+
 app.patch("/api/sessions/:id", async (req, res) => {
   const updated = await store.update(req.params.id, req.body as UpdateSessionInput);
   if (!updated) {
@@ -264,4 +299,21 @@ async function killSession(session: TerminalSession) {
     return;
   }
   await nativeSessions.kill(session);
+}
+
+function nextCopyName(name: string, existingNames: string[]): string {
+  const names = new Set(existingNames);
+  const base = `${name} copy`;
+  if (!names.has(base)) {
+    return base;
+  }
+
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${base} ${index}`;
+    if (!names.has(candidate)) {
+      return candidate;
+    }
+  }
+
+  return `${base} ${Date.now()}`;
 }

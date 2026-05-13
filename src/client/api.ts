@@ -75,6 +75,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
+  duplicateSession: (id: string) =>
+    request<TerminalSession>(`/api/sessions/${id}/duplicate`, {
+      method: "POST"
+    }),
   updateSession: (id: string, input: UpdateSessionInput) =>
     request<TerminalSession>(`/api/sessions/${id}`, {
       method: "PATCH",

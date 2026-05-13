@@ -1,4 +1,4 @@
-import { Archive, Edit3, ExternalLink, Grip, Play, RotateCcw, Square, Tag } from "lucide-react";
+import { Archive, Copy, Edit3, ExternalLink, Grip, Play, RotateCcw, Square, Tag } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
 
 interface Props {
@@ -6,12 +6,22 @@ interface Props {
   preview: string;
   onOpen: () => void;
   onEdit: () => void;
+  onDuplicate: () => void;
   onArchive: () => void;
   onRestore: () => void;
   onKill: () => void;
 }
 
-export function SessionCard({ session, preview, onOpen, onEdit, onArchive, onRestore, onKill }: Props) {
+export function SessionCard({
+  session,
+  preview,
+  onOpen,
+  onEdit,
+  onDuplicate,
+  onArchive,
+  onRestore,
+  onKill
+}: Props) {
   const runtime = session.runtime;
   const livePath = runtime?.currentPath || session.cwd;
   const isLive = runtime?.exists;
@@ -60,6 +70,9 @@ export function SessionCard({ session, preview, onOpen, onEdit, onArchive, onRes
               </button>
               <button className="icon-button small" type="button" onClick={onEdit} title="编辑">
                 <Edit3 size={16} />
+              </button>
+              <button className="icon-button small" type="button" onClick={onDuplicate} title="复制配置">
+                <Copy size={16} />
               </button>
               <button className="icon-button small" type="button" onClick={onArchive} title="归档">
                 <Archive size={16} />

@@ -11,7 +11,7 @@ TWM_HOST=127.0.0.1 TWM_PORT=3131 npm start
 通过 Tailscale Serve 暴露：
 
 ```bash
-tailscale serve --bg --https=443 http://127.0.0.1:3131
+tailscale serve --bg 3131
 ```
 
 查看状态：
@@ -23,7 +23,7 @@ tailscale serve status
 关闭：
 
 ```bash
-tailscale serve --https=443 off
+tailscale serve reset
 ```
 
 ## SSH 入口

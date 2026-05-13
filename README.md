@@ -8,6 +8,7 @@
 - `xterm.js` + `node-pty` 负责浏览器里的交互式终端附着。
 - `react-grid-layout` 负责多 terminal 预览卡片的拖拽、缩放和排列。
 - SSH 公钥签名登录和密码登录都支持；生产环境建议只监听 localhost，再用 Tailscale Serve 暴露到 tailnet。
+- terminal 卡片支持复制配置；只复制名称、分组、标签、路径、shell、backend、颜色和布局，不复制正在运行的进程或输出。
 
 ## 能力边界
 
@@ -90,7 +91,7 @@ SSH 登录使用 OpenSSH 签名验证。页面会生成 challenge，你用本机
 
 ```bash
 TWM_HOST=127.0.0.1 TWM_PORT=3131 npm start
-tailscale serve --bg --https=443 http://127.0.0.1:3131
+tailscale serve --bg 3131
 ```
 
 这样 Web 面板只在 tailnet 内可访问，并由 Tailscale 处理 tailnet 传输加密和 ACL。不要用 Funnel 暴露到公网，除非你明确需要公网访问并已额外加固。
@@ -114,6 +115,29 @@ mkdir -p ~/.config/systemd/user
 cp deploy/terminal-web-monitor.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now terminal-web-monitor.service
+```
+
+## Windows 开机自启
+
+Windows 原生运行时可以使用 `scripts/start-windows.ps1`。它会读取项目根目录 `.env`，再启动生产服务：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1
+```
+
+如果要只监听 Tailscale 地址，可以在 `.env` 里设置：
+
+```dotenv
+TWM_HOST=tailscale
+TWM_PORT=3131
+```
+
+脚本会在启动时解析当前 `tailscale ip -4`，再让服务绑定到该地址。
+
+用任务计划程序设置当前用户登录后自启：
+
+```powershell
+schtasks /Create /TN "TerminalWebMonitor" /SC ONLOGON /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:\path\to\terminal_web_monitor\scripts\start-windows.ps1\"" /F
 ```
 
 ## 开源组件

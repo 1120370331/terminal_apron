@@ -274,6 +274,10 @@ export function App() {
                 preview={previews[session.id] ?? ""}
                 onOpen={() => setActiveTerminal(session)}
                 onEdit={() => setEditorSession(session)}
+                onDuplicate={async () => {
+                  await api.duplicateSession(session.id);
+                  await loadSessions();
+                }}
                 onArchive={async () => {
                   await api.archiveSession(session.id);
                   await loadSessions();
@@ -283,7 +287,7 @@ export function App() {
                   await loadSessions();
                 }}
                 onKill={async () => {
-                  if (window.confirm(`停止 ${session.name} 的 tmux 会话？`)) {
+                  if (window.confirm(`停止 ${session.name} 的 terminal 会话？`)) {
                     await api.killSession(session.id);
                     await loadSessions();
                   }
