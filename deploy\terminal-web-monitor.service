@@ -1,0 +1,17 @@
+[Unit]
+Description=Terminal Web Monitor
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/projects/terminal_web_monitor
+Environment=TWM_HOST=127.0.0.1
+Environment=TWM_PORT=3131
+Environment=TWM_AUTH_MODE=password,ssh
+EnvironmentFile=-%h/.config/terminal-web-monitor/env
+ExecStart=/usr/bin/env npm start
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
