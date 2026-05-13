@@ -373,6 +373,29 @@ select {
   white-space: pre-wrap;
 }
 
+.quick-input {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 10px 0;
+}
+
+.quick-input input {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  outline: 0;
+}
+
+.quick-input input:focus {
+  border-color: #a7c7f4;
+  background: #fff;
+}
+
 .session-footer {
   justify-content: space-between;
   gap: 10px;

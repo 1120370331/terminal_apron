@@ -88,6 +88,11 @@ export const api = {
     request<TerminalSession>(`/api/sessions/${id}/ensure`, {
       method: "POST"
     }),
+  sendInput: (id: string, input: { data: string; enter?: boolean }) =>
+    request<{ ok: boolean; runtime?: TerminalSession["runtime"]; preview?: string }>(`/api/sessions/${id}/input`, {
+      method: "POST",
+      body: JSON.stringify(input)
+    }),
   archiveSession: (id: string) =>
     request<TerminalSession>(`/api/sessions/${id}/archive`, {
       method: "POST"

@@ -278,6 +278,21 @@ export function App() {
                   await api.duplicateSession(session.id);
                   await loadSessions();
                 }}
+                onQuickInput={async (value) => {
+                  const result = await api.sendInput(session.id, { data: value, enter: true });
+                  if (result.preview !== undefined) {
+                    setPreviews((current) => ({ ...current, [session.id]: result.preview || current[session.id] || "" }));
+                  }
+                  await loadSessions();
+                  window.setTimeout(() => {
+                    void api
+                      .preview(session.id)
+                      .then((preview) =>
+                        setPreviews((current) => ({ ...current, [session.id]: preview.text }))
+                      )
+                      .catch(() => undefined);
+                  }, 900);
+                }}
                 onArchive={async () => {
                   await api.archiveSession(session.id);
                   await loadSessions();

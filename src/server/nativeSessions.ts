@@ -135,6 +135,11 @@ export class NativeSessionManager {
     this.sessions.delete(session.id);
   }
 
+  async write(session: TerminalSession, data: string, enter = false): Promise<void> {
+    const entry = await this.ensure(session);
+    entry.term.write(enter ? `${data}\r` : data);
+  }
+
   async preview(session: TerminalSession, lines = 42): Promise<string> {
     const entry = this.sessions.get(session.id);
     if (!entry) {

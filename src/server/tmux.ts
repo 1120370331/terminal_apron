@@ -76,6 +76,20 @@ export async function capturePreview(session: Pick<TerminalSession, "tmuxName">,
   return result.stdout.replace(/\s+$/g, "");
 }
 
+export async function sendTmuxInput(
+  session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
+  data: string,
+  enter = false
+): Promise<void> {
+  await ensureTmuxSession(session);
+  const bufferName = `twm_input_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  await runTmux(["set-buffer", "-b", bufferName, data], 5000);
+  await runTmux(["paste-buffer", "-d", "-b", bufferName, "-t", session.tmuxName], 5000);
+  if (enter) {
+    await runTmux(["send-keys", "-t", session.tmuxName, "Enter"], 5000);
+  }
+}
+
 export async function runtimeInfo(session: TerminalSession): Promise<SessionRuntime> {
   if (!(await hasSession(session.tmuxName))) {
   return {

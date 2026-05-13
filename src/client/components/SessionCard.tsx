@@ -1,4 +1,5 @@
-import { Archive, Copy, Edit3, ExternalLink, Grip, Play, RotateCcw, Square, Tag } from "lucide-react";
+import { FormEvent, useState } from "react";
+import { Archive, Copy, Edit3, ExternalLink, Grip, Play, RotateCcw, Send, Square, Tag } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
 
 interface Props {
@@ -7,6 +8,7 @@ interface Props {
   onOpen: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
+  onQuickInput: (value: string) => Promise<void>;
   onArchive: () => void;
   onRestore: () => void;
   onKill: () => void;
@@ -18,6 +20,7 @@ export function SessionCard({
   onOpen,
   onEdit,
   onDuplicate,
+  onQuickInput,
   onArchive,
   onRestore,
   onKill
@@ -26,6 +29,24 @@ export function SessionCard({
   const livePath = runtime?.currentPath || session.cwd;
   const isLive = runtime?.exists;
   const backend = runtime?.backend ?? session.backend;
+  const [quickInput, setQuickInput] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const submitQuickInput = async (event: FormEvent) => {
+    event.preventDefault();
+    const value = quickInput.trimEnd();
+    if (!value || sending) {
+      return;
+    }
+
+    setSending(true);
+    try {
+      await onQuickInput(value);
+      setQuickInput("");
+    } finally {
+      setSending(false);
+    }
+  };
 
   return (
     <article className={session.archived ? "session-card archived" : "session-card"}>
@@ -48,6 +69,20 @@ export function SessionCard({
       </div>
 
       <pre className="preview">{preview || (isLive ? "" : "terminal is not running")}</pre>
+
+      {!session.archived && (
+        <form className="quick-input" onSubmit={submitQuickInput} onMouseDown={(event) => event.stopPropagation()}>
+          <input
+            value={quickInput}
+            onChange={(event) => setQuickInput(event.target.value)}
+            placeholder="Type to terminal..."
+            disabled={sending}
+          />
+          <button className="icon-button small" type="submit" disabled={sending || !quickInput.trim()} title="Send">
+            <Send size={15} />
+          </button>
+        </form>
+      )}
 
       <footer className="session-footer">
         <div className="tag-row">

@@ -9,6 +9,7 @@
 - `react-grid-layout` 负责多 terminal 预览卡片的拖拽、缩放和排列。
 - SSH 公钥签名登录和密码登录都支持；生产环境建议只监听 localhost，再用 Tailscale Serve 暴露到 tailnet。
 - terminal 卡片支持复制配置；只复制名称、分组、标签、路径、shell、backend、颜色和布局，不复制正在运行的进程或输出。
+- terminal 卡片支持快速输入；不用打开完整终端，也可以直接把回复写入对应 CLI 助手的 stdin 并回车。
 
 ## 能力边界
 

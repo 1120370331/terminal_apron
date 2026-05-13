@@ -23,6 +23,7 @@ import {
   ensureTmuxSession,
   killTmuxSession,
   runtimeInfo,
+  sendTmuxInput,
   tmuxHealth
 } from "./tmux.js";
 import { registerTerminalSockets } from "./terminalSocket.js";
@@ -206,6 +207,31 @@ app.post("/api/sessions/:id/ensure", async (req, res) => {
   });
 });
 
+app.post("/api/sessions/:id/input", async (req, res) => {
+  const session = await store.get(req.params.id);
+  if (!session) {
+    res.status(404).json({ error: "session not found" });
+    return;
+  }
+
+  const { data, enter } = req.body as { data?: unknown; enter?: unknown };
+  if (typeof data !== "string" || data.length === 0) {
+    res.status(400).json({ error: "input data is required" });
+    return;
+  }
+  if (data.length > 16_000) {
+    res.status(413).json({ error: "input data is too large" });
+    return;
+  }
+
+  await sendSessionInput(session, data, enter !== false);
+  res.json({
+    ok: true,
+    runtime: await getRuntime(session),
+    preview: await captureSessionPreview(session).catch(() => "")
+  });
+});
+
 app.post("/api/sessions/:id/archive", async (req, res) => {
   const updated = await store.update(req.params.id, { archived: true });
   if (!updated) {
@@ -301,6 +327,15 @@ async function killSession(session: TerminalSession) {
     return;
   }
   await nativeSessions.kill(session);
+}
+
+async function sendSessionInput(session: TerminalSession, data: string, enter: boolean) {
+  const backend = await resolveBackend(session);
+  if (backend === "tmux") {
+    await sendTmuxInput(session, data, enter);
+    return;
+  }
+  await nativeSessions.write(session, data, enter);
 }
 
 function nextCopyName(name: string, existingNames: string[]): string {
