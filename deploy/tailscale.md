@@ -1,46 +1,57 @@
-# Tailscale 部署建议
+# Tailscale Deployment
 
-## 私有 tailnet 访问
+## Direct Tailnet Access
 
-应用默认监听 localhost：
+On this Windows host the currently verified endpoint is direct tailnet HTTP:
+
+```env
+TWM_HOST=tailscale
+TWM_PORT=3131
+```
+
+`scripts/start-windows.ps1` resolves `tailscale` with `tailscale ip -4` at startup and binds the app to that address.
+
+Use one of these URLs from another device in the same tailnet:
+
+```text
+http://duren.tail4cd288.ts.net:3131
+http://100.111.229.76:3131
+```
+
+Do not use `https://duren.tail4cd288.ts.net/` for this mode. That URL is the Tailscale Serve HTTPS entrypoint.
+
+## Tailscale Serve
+
+If you want a no-port HTTPS URL, first enable HTTPS certificates in the Tailscale admin console, then run:
 
 ```bash
 TWM_HOST=127.0.0.1 TWM_PORT=3131 npm start
-```
-
-通过 Tailscale Serve 暴露：
-
-```bash
 tailscale serve --bg 3131
 ```
 
-查看状态：
+Check certificate support first:
 
 ```bash
-tailscale serve status
+tailscale cert duren.tail4cd288.ts.net
 ```
 
-关闭：
+If it returns `your Tailscale account does not support getting TLS certs`, Serve HTTPS is not available yet and direct tailnet HTTP should be used instead.
 
-```bash
-tailscale serve reset
-```
+## SSH Entry
 
-## SSH 入口
-
-如果你还需要直接 SSH 到机器：
+If you also need direct SSH to the machine:
 
 ```bash
 tailscale up --ssh
 ```
 
-然后在 tailnet ACL 里限制允许的用户和目标主机。Web 面板自身仍建议保留 `password` 或 `ssh` 登录，不要只依赖内网可达。
+Then restrict users and hosts in the tailnet ACL. The Web panel should still keep `password` or `ssh` login enabled.
 
-## frp 备选
+## frp Alternative
 
-frp 可以做公网反代，但安全边界更靠近你自己维护的公网入口。若使用 frp：
+frp can do public reverse proxying, but it moves the security boundary to your public entrypoint. If using frp:
 
-- 面板必须开启 `TWM_AUTH_MODE=password,ssh`
-- 建议前面放 Caddy/Nginx TLS
-- 限制来源 IP 或加额外 OIDC/Basic Auth
-- 不建议把未加固的 terminal 面板直接暴露公网
+- Keep `TWM_AUTH_MODE=password,ssh` enabled.
+- Put Caddy/Nginx TLS in front.
+- Restrict source IPs or add OIDC/Basic Auth.
+- Do not expose an unauthenticated terminal panel to the public internet.

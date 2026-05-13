@@ -98,14 +98,30 @@ SSH 登录使用 OpenSSH 签名验证。页面会生成 challenge，你用本机
 
 ## Tailscale 访问
 
-推荐让应用只监听 localhost，然后交给 Tailscale Serve：
+当前 Windows 原生部署已验证的入口是 direct tailnet HTTP：
+
+```dotenv
+TWM_HOST=tailscale
+TWM_PORT=3131
+```
+
+访问地址：
+
+```text
+http://duren.tail4cd288.ts.net:3131
+http://100.111.229.76:3131
+```
+
+不要把 `https://duren.tail4cd288.ts.net/` 当成这个入口；那个地址属于 Tailscale Serve/HTTPS。Serve 没配置成功或后端没有监听 localhost 时会不可用或返回 502。
+
+如果要使用无端口 HTTPS 地址，需要先在 Tailscale Admin Console 启用 HTTPS certificates，然后：
 
 ```bash
 TWM_HOST=127.0.0.1 TWM_PORT=3131 npm start
 tailscale serve --bg 3131
 ```
 
-这样 Web 面板只在 tailnet 内可访问，并由 Tailscale 处理 tailnet 传输加密和 ACL。不要用 Funnel 暴露到公网，除非你明确需要公网访问并已额外加固。
+可以用 `tailscale cert duren.tail4cd288.ts.net` 验证 HTTPS certificates 是否可用。不要用 Funnel 暴露到公网，除非你明确需要公网访问并已额外加固。
 
 ## tmux 持久化
 
