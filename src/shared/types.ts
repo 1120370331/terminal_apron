@@ -83,6 +83,13 @@ export interface SessionPreview {
 export interface HealthStatus {
   ok: boolean;
   auth: AuthConfig;
+  processUser: {
+    username: string;
+    homedir: string;
+    shell?: string | null;
+    uid?: number;
+    gid?: number;
+  };
   backend: {
     default: ResolvedTerminalBackend | null;
     configured: TerminalBackend;

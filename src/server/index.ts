@@ -1,6 +1,7 @@
 import express from "express";
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server as SocketServer } from "socket.io";
@@ -104,6 +105,7 @@ app.get("/api/health", async (_req, res) => {
   res.json({
     ok: nodePty.available && Boolean(backend.default),
     auth: authConfig(),
+    processUser: currentProcessUser(),
     backend,
     tmux,
     nodePty,
@@ -316,4 +318,15 @@ function nextCopyName(name: string, existingNames: string[]): string {
   }
 
   return `${base} ${Date.now()}`;
+}
+
+function currentProcessUser() {
+  const user = os.userInfo();
+  return {
+    username: user.username,
+    homedir: user.homedir,
+    shell: user.shell,
+    uid: user.uid,
+    gid: user.gid
+  };
 }

@@ -30,6 +30,17 @@
 
 Windows 原生 PowerShell 可以运行面板和 terminal。Windows native pty 能支持 Codex CLI 这类交互命令，但不能提供 `tmux attach` 那种本机终端多路复用，也不能在系统重启后保留正在运行的进程。
 
+## 执行权限
+
+terminal 里的命令权限跟随 Web 服务进程的操作系统用户。
+
+- Windows Startup 文件夹方式启动时，命令以当前登录 Windows 用户运行，例如 `a1120`，不会提升为 `SYSTEM`。
+- Linux/macOS 的 `systemd --user` 方式启动时，命令以该 user service 所属用户运行。
+- Web 登录账号只控制谁能访问面板，不会把远程浏览器用户自动映射成另一个 Windows/Linux 用户。
+- 如果需要多用户严格隔离，应让每个 OS 用户运行自己的实例，使用不同端口、数据目录和 Tailscale ACL。
+
+可以通过 `/api/health` 的 `processUser.username` 确认当前 terminal 实际会以哪个 OS 用户执行。
+
 ## 快速开始
 
 ```bash
