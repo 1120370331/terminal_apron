@@ -16,9 +16,14 @@ export function SessionEditor({ session, onClose, onSave }: Props) {
   const [shell, setShell] = useState(session?.shell ?? "");
   const [color, setColor] = useState(session?.color ?? "#2f80ed");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (busy) {
+      return;
+    }
+    setError("");
     setBusy(true);
     try {
       await onSave({
@@ -33,6 +38,8 @@ export function SessionEditor({ session, onClose, onSave }: Props) {
         backend: "zellij",
         color
       });
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : String(saveError));
     } finally {
       setBusy(false);
     }
@@ -73,12 +80,14 @@ export function SessionEditor({ session, onClose, onSave }: Props) {
           <input type="color" value={color} onChange={(event) => setColor(event.target.value)} />
         </label>
 
+        {error && <div className="form-error editor-error">{error}</div>}
+
         <footer className="modal-actions">
           <button className="secondary-button" type="button" onClick={onClose}>
             取消
           </button>
           <button className="primary-button" type="submit" disabled={busy}>
-            保存
+            {busy ? "保存中..." : "保存"}
           </button>
         </footer>
       </form>

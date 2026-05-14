@@ -167,16 +167,7 @@ app.get("/api/sessions", async (req, res) => {
   const enriched = await Promise.all(
     visible.map(async (session) => ({
       ...session,
-        runtime: await getRuntime(session, store.dataDir).catch(() => ({
-        exists: false,
-        backend: "native",
-        persistent: false,
-        attached: 0,
-        currentPath: session.cwd,
-        currentCommand: "",
-        windows: 0,
-        lastAttached: null
-      }))
+      runtime: await getRuntime(session, store.dataDir).catch(() => fallbackRuntime(session))
     }))
   );
   res.json(enriched);
@@ -185,10 +176,12 @@ app.get("/api/sessions", async (req, res) => {
 app.post("/api/sessions", async (req, res) => {
   const store = await storeForUser(res.locals.user as AuthUser);
   const session = await store.create(req.body as CreateSessionInput);
-  await ensureSession(session, store.dataDir);
+  void ensureSession(session, store.dataDir).catch((error) => {
+    console.error(`Failed to start session ${session.id}`, error);
+  });
   res.status(201).json({
     ...session,
-    runtime: await getRuntime(session, store.dataDir)
+    runtime: await getRuntime(session, store.dataDir).catch(() => fallbackRuntime(session))
   });
 });
 
@@ -479,6 +472,19 @@ function currentProcessUser() {
     shell: user.shell,
     uid: user.uid,
     gid: user.gid
+  };
+}
+
+function fallbackRuntime(session: TerminalSession) {
+  return {
+    exists: false,
+    backend: "zellij" as const,
+    persistent: true,
+    attached: 0,
+    currentPath: session.cwd,
+    currentCommand: "",
+    windows: 0,
+    lastAttached: null
   };
 }
 

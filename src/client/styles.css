@@ -861,6 +861,10 @@ select {
   font-size: 13px;
 }
 
+.editor-error {
+  margin: 0 16px;
+}
+
 .terminal-dock {
   position: fixed;
   inset: 18px;
