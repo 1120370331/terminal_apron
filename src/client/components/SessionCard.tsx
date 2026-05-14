@@ -1,4 +1,4 @@
-import { FormEvent, UIEvent, useLayoutEffect, useRef, useState } from "react";
+import { FormEvent, UIEvent, WheelEvent, useLayoutEffect, useRef, useState } from "react";
 import { Archive, Copy, Edit3, ExternalLink, Grip, Play, RotateCcw, Send, Square, Tag } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
 
@@ -49,6 +49,23 @@ export function SessionCard({
     stickToBottomRef.current = distanceToBottom < 24;
   };
 
+  const handlePreviewWheel = (event: WheelEvent<HTMLPreElement>) => {
+    const target = event.currentTarget;
+    if (target.scrollHeight <= target.clientHeight) {
+      return;
+    }
+
+    event.stopPropagation();
+    const atTop = target.scrollTop <= 0;
+    const atBottom = target.scrollTop + target.clientHeight >= target.scrollHeight - 1;
+    if ((event.deltaY < 0 && atTop) || (event.deltaY > 0 && atBottom)) {
+      return;
+    }
+
+    event.preventDefault();
+    target.scrollTop += event.deltaY;
+  };
+
   const submitQuickInput = async (event: FormEvent) => {
     event.preventDefault();
     const value = quickInput.trimEnd();
@@ -89,6 +106,7 @@ export function SessionCard({
         className="preview"
         ref={previewRef}
         onScroll={trackPreviewScroll}
+        onWheel={handlePreviewWheel}
         onMouseDown={(event) => event.stopPropagation()}
         onTouchStart={(event) => event.stopPropagation()}
       >
