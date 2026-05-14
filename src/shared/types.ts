@@ -78,7 +78,28 @@ export interface UpdateSessionInput {
 export interface SessionPreview {
   sessionId: string;
   text: string;
+  grid?: TerminalPreviewGrid;
   capturedAt: string;
+}
+
+export interface TerminalPreviewGrid {
+  cols: number;
+  rows: TerminalPreviewRow[];
+}
+
+export interface TerminalPreviewRow {
+  segments: TerminalPreviewSegment[];
+}
+
+export interface TerminalPreviewSegment {
+  text: string;
+  cols: number;
+  fg?: string;
+  bg?: string;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  dim?: boolean;
 }
 
 export interface HealthStatus {

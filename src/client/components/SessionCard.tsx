@@ -12,11 +12,11 @@ import {
   type ReactNode
 } from "react";
 import { Archive, Copy, Edit3, ExternalLink, Grip, Play, RotateCcw, Send, Square, Tag } from "lucide-react";
-import type { TerminalSession } from "../../shared/types";
+import type { SessionPreview, TerminalPreviewGrid, TerminalPreviewSegment, TerminalSession } from "../../shared/types";
 
 interface Props {
   session: TerminalSession;
-  preview: string;
+  preview?: SessionPreview;
   onOpen: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
@@ -50,10 +50,10 @@ function SessionCardComponent({
   const backend = runtime?.backend ?? session.backend;
   const [quickInput, setQuickInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [displayedPreview, setDisplayedPreview] = useState(preview);
+  const [displayedPreview, setDisplayedPreview] = useState<SessionPreview | undefined>(preview);
   const [historyPaused, setHistoryPaused] = useState(false);
   const [hasPendingPreview, setHasPendingPreview] = useState(false);
-  const previewRef = useRef<HTMLPreElement | null>(null);
+  const previewRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
 
   useEffect(() => {
@@ -62,7 +62,7 @@ function SessionCardComponent({
     }
 
     if (historyPaused) {
-      if (preview !== displayedPreview) {
+      if (preview?.text !== displayedPreview?.text) {
         setHasPendingPreview(true);
       }
       return;
@@ -96,7 +96,7 @@ function SessionCardComponent({
     }
   };
 
-  const handlePreviewWheel = (event: WheelEvent<HTMLPreElement>) => {
+  const handlePreviewWheel = (event: WheelEvent<HTMLDivElement>) => {
     const target = event.currentTarget;
     if (target.scrollHeight <= target.clientHeight) {
       return;
@@ -143,7 +143,8 @@ function SessionCardComponent({
   };
 
   const deferredPreview = useDeferredValue(displayedPreview);
-  const output = deferredPreview || (isLive ? "" : "terminal is not running");
+  const output = deferredPreview?.text || (isLive ? "" : "terminal is not running");
+  const grid = deferredPreview?.grid;
   const compactOutput = useMemo(() => compactPreview(output), [output]);
   const renderedOutput = useMemo(() => renderAnsi(compactOutput), [compactOutput]);
 
@@ -168,16 +169,16 @@ function SessionCardComponent({
       </div>
 
       <div className="preview-wrap">
-        <pre
-          className="preview ansi-preview"
+        <div
+          className={grid ? "preview terminal-grid-preview" : "preview ansi-preview"}
           ref={previewRef}
           onScroll={trackPreviewScroll}
           onWheel={handlePreviewWheel}
           onMouseDown={(event) => event.stopPropagation()}
           onTouchStart={(event) => event.stopPropagation()}
         >
-          {renderedOutput}
-        </pre>
+          {grid ? renderGrid(grid) : renderedOutput}
+        </div>
         {historyPaused && hasPendingPreview && (
           <button
             className="preview-latest"
@@ -252,7 +253,7 @@ function SessionCardComponent({
 export const SessionCard = memo(SessionCardComponent, areSessionCardPropsEqual);
 
 function areSessionCardPropsEqual(previous: Props, next: Props): boolean {
-  return previous.preview === next.preview && sessionCardSignature(previous.session) === sessionCardSignature(next.session);
+  return previous.preview?.text === next.preview?.text && sessionCardSignature(previous.session) === sessionCardSignature(next.session);
 }
 
 function sessionCardSignature(session: TerminalSession): string {
@@ -272,6 +273,34 @@ function sessionCardSignature(session: TerminalSession): string {
     runtime?.currentCommand ?? "",
     String(runtime?.windows ?? "")
   ].join("\u001f");
+}
+
+function renderGrid(grid: TerminalPreviewGrid): ReactNode[] {
+  return grid.rows.map((row, rowIndex) => (
+    <div className="terminal-grid-row" key={rowIndex}>
+      {row.segments.length
+        ? row.segments.map((segment, segmentIndex) => renderGridSegment(segment, segmentIndex))
+        : "\u00a0"}
+    </div>
+  ));
+}
+
+function renderGridSegment(segment: TerminalPreviewSegment, index: number): ReactNode {
+  const style = {
+    "--segment-cols": segment.cols,
+    color: segment.fg,
+    backgroundColor: segment.bg,
+    fontWeight: segment.bold ? 700 : undefined,
+    fontStyle: segment.italic ? "italic" : undefined,
+    textDecoration: segment.underline ? "underline" : undefined,
+    opacity: segment.dim ? 0.72 : undefined
+  } as CSSProperties;
+
+  return (
+    <span className="terminal-grid-segment" key={index} style={style}>
+      {segment.text}
+    </span>
+  );
 }
 
 function compactPreview(value: string): string {

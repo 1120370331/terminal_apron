@@ -38,6 +38,7 @@ import { registerTerminalSockets } from "./terminalSocket.js";
 import { nodePtyHealth } from "./pty.js";
 import { backendHealth, resolveBackend } from "./backend.js";
 import { NativeSessionManager } from "./nativeSessions.js";
+import { renderPreviewGrid } from "./previewGrid.js";
 import type { CreateSessionInput, SystemMetrics, TerminalSession, UpdateSessionInput } from "../shared/types.js";
 
 const app = express();
@@ -245,10 +246,12 @@ app.post("/api/sessions/:id/input", async (req, res) => {
 
   await sendSessionInput(session, data, enter !== false);
   const previewText = await captureSessionPreview(session, parsePreviewLines(req.body?.lines), false).catch(() => "");
+  const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.body?.maxChars));
   res.json({
     ok: true,
     runtime: await getRuntime(session),
-    preview: compactPreviewPayload(previewText, parsePreviewMaxChars(req.body?.maxChars))
+    preview: compactPreview,
+    grid: await renderPreviewGrid(compactPreview).catch(() => undefined)
   });
 });
 
@@ -296,9 +299,11 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
     parsePreviewLines(req.query.lines),
     parsePreviewFull(req.query.full)
   ).catch(() => "");
+  const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.query.maxChars));
   res.json({
     sessionId: session.id,
-    text: compactPreviewPayload(previewText, parsePreviewMaxChars(req.query.maxChars)),
+    text: compactPreview,
+    grid: await renderPreviewGrid(compactPreview).catch(() => undefined),
     capturedAt: new Date().toISOString()
   });
 });

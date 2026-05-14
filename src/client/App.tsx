@@ -18,7 +18,7 @@ import {
   SlidersHorizontal,
   Sun
 } from "lucide-react";
-import type { AuthUser, HealthStatus, SystemMetrics, TerminalSession } from "../shared/types";
+import type { AuthUser, HealthStatus, SessionPreview, SystemMetrics, TerminalSession } from "../shared/types";
 import { api, ApiError } from "./api";
 import { Login } from "./components/Login";
 import { SessionCard } from "./components/SessionCard";
@@ -199,12 +199,20 @@ function sessionSignature(session: TerminalSession): string {
   ].join("\u001f");
 }
 
+function emptyPreview(sessionId: string): SessionPreview {
+  return {
+    sessionId,
+    text: "",
+    capturedAt: new Date(0).toISOString()
+  };
+}
+
 export function App() {
   const initialFilters = useMemo(loadFilterState, []);
   const initialSettings = useMemo(loadPanelSettings, []);
   const [auth, setAuth] = useState<AuthUser | null | undefined>(undefined);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
-  const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [previews, setPreviews] = useState<Record<string, SessionPreview>>({});
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [metricsHistory, setMetricsHistory] = useState<SystemMetrics[]>([]);
   const [query, setQuery] = useState(initialFilters.query);
@@ -346,7 +354,9 @@ export function App() {
       const visible = filtered.slice(0, settings.maxPreviewCards);
       for (const session of visible) {
         if (!session.runtime?.exists) {
-          setPreviews((current) => (current[session.id] === "" ? current : { ...current, [session.id]: "" }));
+          setPreviews((current) =>
+            current[session.id]?.text === "" ? current : { ...current, [session.id]: emptyPreview(session.id) }
+          );
         }
       }
       const targets = visible.filter((session) => session.runtime?.exists);
@@ -359,12 +369,14 @@ export function App() {
             const preview = await api.preview(session.id, settings.previewLines);
             if (!cancelled) {
               setPreviews((current) =>
-                current[session.id] === preview.text ? current : { ...current, [session.id]: preview.text }
+                current[session.id]?.text === preview.text ? current : { ...current, [session.id]: preview }
               );
             }
           } catch {
             if (!cancelled) {
-              setPreviews((current) => (current[session.id] === "" ? current : { ...current, [session.id]: "" }));
+              setPreviews((current) =>
+                current[session.id]?.text === "" ? current : { ...current, [session.id]: emptyPreview(session.id) }
+              );
             }
           }
         }
@@ -559,7 +571,7 @@ export function App() {
             <div key={session.id}>
               <SessionCard
                 session={session}
-                preview={previews[session.id] ?? ""}
+                preview={previews[session.id]}
                 onOpen={() => setActiveTerminal(session)}
                 onEdit={() => setEditorSession(session)}
                 onDuplicate={async () => {
@@ -570,14 +582,20 @@ export function App() {
                   const input = { data: value, enter: true, submitKey: "enter" as const };
                   const result = await api.sendInput(session.id, input);
                   if (result.preview !== undefined) {
-                    setPreviews((current) => ({ ...current, [session.id]: result.preview || current[session.id] || "" }));
+                    setPreviews((current) => ({
+                      ...current,
+                      [session.id]: {
+                        ...emptyPreview(session.id),
+                        text: result.preview || current[session.id]?.text || ""
+                      }
+                    }));
                   }
                   await loadSessions();
                   window.setTimeout(() => {
                     void api
                       .preview(session.id, settings.previewLines)
                       .then((preview) =>
-                        setPreviews((current) => ({ ...current, [session.id]: preview.text }))
+                        setPreviews((current) => ({ ...current, [session.id]: preview }))
                       )
                       .catch(() => undefined);
                   }, 900);

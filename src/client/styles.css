@@ -544,6 +544,7 @@ select {
 }
 
 .preview {
+  --terminal-cell-width: 1ch;
   contain: content;
   flex: 1 1 auto;
   width: 100%;
@@ -564,6 +565,24 @@ select {
   tab-size: 8;
   scrollbar-color: #6d7a72 #111614;
   scrollbar-width: thin;
+}
+
+.terminal-grid-preview {
+  line-height: 1.35;
+}
+
+.terminal-grid-row {
+  height: 1.35em;
+  white-space: nowrap;
+}
+
+.terminal-grid-segment {
+  display: inline-block;
+  width: calc(var(--segment-cols) * var(--terminal-cell-width));
+  min-height: 1.35em;
+  overflow: hidden;
+  vertical-align: top;
+  white-space: pre;
 }
 
 .preview-latest {
