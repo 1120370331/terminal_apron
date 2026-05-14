@@ -298,7 +298,7 @@ export function App() {
   }
 
   const shellStyle = {
-    "--session-preview-min-height": `${settings.previewMinHeight}px`
+    "--session-card-min-height": `${settings.previewMinHeight + 120}px`
   } as CSSProperties;
 
   return (
