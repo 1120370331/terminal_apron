@@ -54,6 +54,7 @@ export const config = {
   port: Number(process.env.TWM_PORT ?? process.env.PORT ?? 3131),
   dataDir,
   tmuxBin: process.env.TWM_TMUX_BIN ?? "tmux",
+  zellijBin: process.env.TWM_ZELLIJ_BIN ?? "zellij",
   sessionBackend: parseBackend(process.env.TWM_SESSION_BACKEND),
   adminUser: process.env.TWM_ADMIN_USER ?? "admin",
   adminPassword: process.env.TWM_ADMIN_PASSWORD ?? "",
@@ -64,11 +65,12 @@ export const config = {
   nativeHistoryBytes: parseBoundedInteger(process.env.TWM_NATIVE_HISTORY_BYTES, 8_000_000, 240_000, 50_000_000),
   nativeScreenScrollback: parseBoundedInteger(process.env.TWM_NATIVE_SCREEN_SCROLLBACK, 50_000, 1_000, 200_000),
   previewMaxLines: parseBoundedInteger(process.env.TWM_PREVIEW_MAX_LINES, 5_000, 100, 20_000),
-  tmuxHistoryLimit: parseBoundedInteger(process.env.TWM_TMUX_HISTORY_LIMIT, 50_000, 1_000, 200_000)
+  tmuxHistoryLimit: parseBoundedInteger(process.env.TWM_TMUX_HISTORY_LIMIT, 50_000, 1_000, 200_000),
+  zellijScrollback: parseBoundedInteger(process.env.TWM_ZELLIJ_SCROLLBACK, 50_000, 1_000, 200_000)
 };
 
 function parseBackend(value: string | undefined): TerminalBackend {
-  if (value === "native" || value === "tmux" || value === "auto") {
+  if (value === "native" || value === "tmux" || value === "zellij" || value === "auto") {
     return value;
   }
   return "auto";

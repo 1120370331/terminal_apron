@@ -1,6 +1,6 @@
 export type AuthMethod = "none" | "password" | "ssh";
-export type TerminalBackend = "auto" | "native" | "tmux";
-export type ResolvedTerminalBackend = "native" | "tmux";
+export type TerminalBackend = "auto" | "native" | "tmux" | "zellij";
+export type ResolvedTerminalBackend = "native" | "tmux" | "zellij";
 
 export interface AuthConfig {
   methods: AuthMethod[];
@@ -31,6 +31,7 @@ export interface SessionRuntime {
   windows: number;
   lastAttached: number | null;
   tmuxVersion?: string;
+  zellijVersion?: string;
 }
 
 export interface TerminalSession {
@@ -97,6 +98,11 @@ export interface HealthStatus {
     error?: string;
   };
   tmux: {
+    available: boolean;
+    version?: string;
+    error?: string;
+  };
+  zellij: {
     available: boolean;
     version?: string;
     error?: string;

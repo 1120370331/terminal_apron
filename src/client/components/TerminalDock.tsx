@@ -64,7 +64,7 @@ export function TerminalDock({ session, onClose }: Props) {
     socket.on("terminal:ready", (payload: { attachCommand: string | null; backend?: string }) => {
       setAttachCommand(payload.attachCommand);
       if (payload.backend) {
-        setBackend(payload.backend as "auto" | "native" | "tmux");
+        setBackend(payload.backend as "auto" | "native" | "tmux" | "zellij");
       }
     });
     socket.on("terminal:data", (data: string) => {

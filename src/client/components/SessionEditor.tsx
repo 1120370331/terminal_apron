@@ -71,8 +71,12 @@ export function SessionEditor({ session, onClose, onSave }: Props) {
         </label>
         <label>
           后端
-          <select value={backend} onChange={(event) => setBackend(event.target.value as "auto" | "native" | "tmux")}>
+          <select
+            value={backend}
+            onChange={(event) => setBackend(event.target.value as "auto" | "native" | "tmux" | "zellij")}
+          >
             <option value="auto">auto</option>
+            <option value="zellij">zellij</option>
             <option value="native">native pty</option>
             <option value="tmux">tmux</option>
           </select>

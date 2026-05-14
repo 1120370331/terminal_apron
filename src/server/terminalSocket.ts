@@ -2,6 +2,7 @@ import type { Server, Socket } from "socket.io";
 import { config } from "./config.js";
 import { SessionStore } from "./db.js";
 import { ensureTmuxSession } from "./tmux.js";
+import { appendZellijTranscript, ensureZellijSession, zellijAttachArgs, zellijAttachCommand } from "./zellij.js";
 import { userFromCookie } from "./auth.js";
 import { loadPty } from "./pty.js";
 import { resolveBackend } from "./backend.js";
@@ -44,11 +45,70 @@ async function attachTerminal(
       await nativeSessions.attach(session, socket, cols, rows);
       return;
     }
+    if (backend === "zellij") {
+      await attachZellij(socket, session, cols, rows);
+      return;
+    }
     await attachTmux(socket, session, cols, rows);
   } catch (error) {
     socket.emit("terminal:error", error instanceof Error ? error.message : String(error));
     socket.disconnect(true);
   }
+}
+
+async function attachZellij(
+  socket: Socket,
+  session: { id: string; tmuxName: string; cwd: string; shell?: string },
+  cols: number,
+  rows: number
+): Promise<void> {
+  await ensureZellijSession(session);
+  const pty = await loadPty();
+  const term = pty.spawn(config.zellijBin, zellijAttachArgs(session), {
+    name: "xterm-256color",
+    cols,
+    rows,
+    cwd: session.cwd,
+    env: {
+      ...process.env,
+      TERM: "xterm-256color",
+      COLORTERM: "truecolor"
+    }
+  });
+
+  socket.emit("terminal:ready", {
+    backend: "zellij",
+    persistent: true,
+    tmuxName: session.tmuxName,
+    attachCommand: zellijAttachCommand(session)
+  });
+
+  let transcriptQueue = Promise.resolve();
+  term.onData((data) => {
+    socket.emit("terminal:data", data);
+    transcriptQueue = transcriptQueue
+      .then(() => appendZellijTranscript(session.id, data))
+      .catch(() => undefined);
+  });
+
+  term.onExit((event) => {
+    socket.emit("terminal:exit", event);
+    socket.disconnect(true);
+  });
+
+  socket.on("terminal:input", (data: string) => {
+    term.write(data);
+  });
+
+  socket.on("terminal:resize", (size: { cols?: number; rows?: number }) => {
+    const nextCols = clampDimension(size.cols, cols, 20, 300);
+    const nextRows = clampDimension(size.rows, rows, 10, 120);
+    term.resize(nextCols, nextRows);
+  });
+
+  socket.on("disconnect", () => {
+    term.kill();
+  });
 }
 
 async function attachTmux(

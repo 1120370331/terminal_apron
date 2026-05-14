@@ -26,6 +26,14 @@ import {
   sendTmuxInput,
   tmuxHealth
 } from "./tmux.js";
+import {
+  captureZellijPreview,
+  ensureZellijSession,
+  killZellijSession,
+  sendZellijInput,
+  zellijHealth,
+  zellijRuntimeInfo
+} from "./zellij.js";
 import { registerTerminalSockets } from "./terminalSocket.js";
 import { nodePtyHealth } from "./pty.js";
 import { backendHealth, resolveBackend } from "./backend.js";
@@ -102,13 +110,19 @@ app.post("/api/auth/ssh/verify", async (req, res) => {
 });
 
 app.get("/api/health", async (_req, res) => {
-  const [tmux, nodePty, backend] = await Promise.all([tmuxHealth(), nodePtyHealth(), backendHealth()]);
+  const [tmux, zellij, nodePty, backend] = await Promise.all([
+    tmuxHealth(),
+    zellijHealth(),
+    nodePtyHealth(),
+    backendHealth()
+  ]);
   res.json({
     ok: nodePty.available && Boolean(backend.default),
     auth: authConfig(),
     processUser: currentProcessUser(),
     backend,
     tmux,
+    zellij,
     nodePty,
     dataDir: config.dataDir
   });
@@ -307,23 +321,43 @@ async function ensureSession(session: TerminalSession) {
     await ensureTmuxSession(session);
     return;
   }
+  if (backend === "zellij") {
+    await ensureZellijSession(session);
+    return;
+  }
   await nativeSessions.ensure(session);
 }
 
 async function getRuntime(session: TerminalSession) {
   const backend = await resolveBackend(session);
-  return backend === "tmux" ? runtimeInfo(session) : nativeSessions.runtime(session);
+  if (backend === "tmux") {
+    return runtimeInfo(session);
+  }
+  if (backend === "zellij") {
+    return zellijRuntimeInfo(session);
+  }
+  return nativeSessions.runtime(session);
 }
 
 async function captureSessionPreview(session: TerminalSession, lines = 500) {
   const backend = await resolveBackend(session);
-  return backend === "tmux" ? capturePreview(session, lines) : nativeSessions.preview(session, lines);
+  if (backend === "tmux") {
+    return capturePreview(session, lines);
+  }
+  if (backend === "zellij") {
+    return captureZellijPreview(session, lines);
+  }
+  return nativeSessions.preview(session, lines);
 }
 
 async function killSession(session: TerminalSession) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
     await killTmuxSession(session);
+    return;
+  }
+  if (backend === "zellij") {
+    await killZellijSession(session);
     return;
   }
   await nativeSessions.kill(session);
@@ -338,6 +372,10 @@ async function sendSessionInput(
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
     await sendTmuxInput(session, data, enter, submitKey);
+    return;
+  }
+  if (backend === "zellij") {
+    await sendZellijInput(session, data, enter, submitKey);
     return;
   }
   await nativeSessions.write(session, data, enter, submitKey);
