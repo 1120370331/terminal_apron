@@ -14,7 +14,6 @@ export function SessionEditor({ session, onClose, onSave }: Props) {
   const [tags, setTags] = useState(session?.tags.join(", ") ?? "");
   const [cwd, setCwd] = useState(session?.cwd ?? "");
   const [shell, setShell] = useState(session?.shell ?? "");
-  const [backend, setBackend] = useState(session?.backend ?? "auto");
   const [color, setColor] = useState(session?.color ?? "#2f80ed");
   const [busy, setBusy] = useState(false);
 
@@ -31,7 +30,7 @@ export function SessionEditor({ session, onClose, onSave }: Props) {
           .filter(Boolean),
         cwd,
         shell,
-        backend,
+        backend: "zellij",
         color
       });
     } finally {
@@ -68,18 +67,6 @@ export function SessionEditor({ session, onClose, onSave }: Props) {
         <label>
           Shell
           <input value={shell} onChange={(event) => setShell(event.target.value)} placeholder="bash / zsh / pwsh" />
-        </label>
-        <label>
-          后端
-          <select
-            value={backend}
-            onChange={(event) => setBackend(event.target.value as "auto" | "native" | "tmux" | "zellij")}
-          >
-            <option value="auto">auto</option>
-            <option value="zellij">zellij</option>
-            <option value="native">native pty</option>
-            <option value="tmux">tmux</option>
-          </select>
         </label>
         <label>
           颜色

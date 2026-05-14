@@ -71,10 +71,7 @@ export const config = {
 };
 
 function parseBackend(value: string | undefined): TerminalBackend {
-  if (value === "native" || value === "tmux" || value === "zellij" || value === "auto") {
-    return value;
-  }
-  return "auto";
+  return value === "auto" ? "auto" : "zellij";
 }
 
 function resolveBinaryPath(value: string): string {

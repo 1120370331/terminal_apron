@@ -89,7 +89,7 @@ export function Login({ onAuthenticated }: Props) {
           <ShieldCheck size={30} />
           <div>
             <h1>Terminal Web Monitor</h1>
-            <p>登录后管理本机 tmux terminal。</p>
+            <p>登录后管理本机 Zellij terminal。</p>
           </div>
         </div>
 

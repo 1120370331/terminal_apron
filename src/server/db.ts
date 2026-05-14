@@ -42,10 +42,7 @@ function tmuxNameFromId(id: string): string {
 }
 
 function normalizeBackend(value: TerminalBackend | undefined): TerminalBackend {
-  if (value === "native" || value === "tmux" || value === "zellij" || value === "auto") {
-    return value;
-  }
-  return "auto";
+  return "zellij";
 }
 
 export class SessionStore {

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { SessionRuntime, TerminalSession } from "../shared/types.js";
 import { config } from "./config.js";
+import { loadPty } from "./pty.js";
 
 interface RunOptions {
   cwd?: string;
@@ -37,7 +38,7 @@ function runZellij(args: string[], options: RunOptions = {}): Promise<{ stdout: 
       },
       (error, stdout, stderr) => {
         if (error) {
-          const wrapped = new Error(stderr || error.message);
+          const wrapped = new Error([stderr, stdout, error.message].filter(Boolean).join("\n"));
           reject(wrapped);
           return;
         }
@@ -75,10 +76,7 @@ export async function ensureZellijSession(
     return;
   }
 
-  await runZellij(["attach", "--create-background", session.tmuxName, ...zellijOptions(session)], {
-    cwd: resolveCwd(session.cwd),
-    timeoutMs: 10000
-  }).catch(() => undefined);
+  await bootstrapZellijSession(session);
 }
 
 export async function killZellijSession(session: Pick<TerminalSession, "tmuxName">): Promise<void> {
@@ -182,7 +180,7 @@ export function zellijAttachCommand(session: Pick<TerminalSession, "tmuxName">):
 async function listZellijSessions(): Promise<string[]> {
   const result = await runZellij(["list-sessions"], { timeoutMs: 5000 }).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
-    if (/no active sessions|no sessions/i.test(message)) {
+    if (/no active zellij sessions|no active sessions|no sessions/i.test(message)) {
       return { stdout: "", stderr: "" };
     }
     throw error;
@@ -201,6 +199,52 @@ async function listZellijPanes(sessionName: string): Promise<ZellijPane[]> {
   });
   const parsed = JSON.parse(result.stdout) as unknown;
   return Array.isArray(parsed) ? (parsed as ZellijPane[]) : [];
+}
+
+async function bootstrapZellijSession(session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">): Promise<void> {
+  const pty = await loadPty();
+  const cwd = resolveCwd(session.cwd);
+  const term = pty.spawn(config.zellijBin, zellijAttachArgs(session), {
+    name: "xterm-256color",
+    cols: 120,
+    rows: 36,
+    cwd,
+    env: {
+      ...process.env,
+      TERM: "xterm-256color",
+      COLORTERM: "truecolor"
+    }
+  });
+
+  try {
+    await waitForZellijSession(session.tmuxName, 8000);
+    await runZellij(["--session", session.tmuxName, "action", "detach"], { timeoutMs: 5000 }).catch(() => undefined);
+  } finally {
+    windowlessKill(term);
+  }
+}
+
+async function waitForZellijSession(sessionName: string, timeoutMs: number): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await hasZellijSession(sessionName)) {
+      return;
+    }
+    await delay(200);
+  }
+  throw new Error(`zellij session ${sessionName} was not created`);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function windowlessKill(term: { kill: () => void }): void {
+  try {
+    term.kill();
+  } catch {
+    // The attach client may already have exited after detach.
+  }
 }
 
 async function activeTerminalPaneId(sessionName: string): Promise<string | null> {
