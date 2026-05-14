@@ -7,11 +7,16 @@ import { userFromCookie } from "./auth.js";
 import { loadPty } from "./pty.js";
 import { resolveBackend } from "./backend.js";
 import { NativeSessionManager } from "./nativeSessions.js";
+import type { AuthUser } from "../shared/types.js";
 
 const MAX_TERMINAL_COLS = 4096;
 const MAX_TERMINAL_ROWS = 2048;
 
-export function registerTerminalSockets(io: Server, store: SessionStore, nativeSessions: NativeSessionManager): void {
+export function registerTerminalSockets(
+  io: Server,
+  storeForUser: (user: AuthUser) => Promise<SessionStore>,
+  nativeSessions: NativeSessionManager
+): void {
   io.use(async (socket, next) => {
     const user = await userFromCookie(socket.handshake.headers.cookie);
     if (!user) {
@@ -23,15 +28,22 @@ export function registerTerminalSockets(io: Server, store: SessionStore, nativeS
   });
 
   io.on("connection", (socket) => {
-    void attachTerminal(socket, store, nativeSessions);
+    void attachTerminal(socket, storeForUser, nativeSessions);
   });
 }
 
 async function attachTerminal(
   socket: Socket,
-  store: SessionStore,
+  storeForUser: (user: AuthUser) => Promise<SessionStore>,
   nativeSessions: NativeSessionManager
 ): Promise<void> {
+  const user = socket.data.user as AuthUser | undefined;
+  if (!user) {
+    socket.emit("terminal:error", "unauthorized");
+    socket.disconnect(true);
+    return;
+  }
+  const store = await storeForUser(user);
   const sessionId = String(socket.handshake.query.sessionId ?? "");
   const session = await store.get(sessionId);
   if (!session) {
@@ -45,11 +57,11 @@ async function attachTerminal(
     const rows = clampDimension(socket.handshake.query.rows, 36, 10, MAX_TERMINAL_ROWS);
     const backend = await resolveBackend(session);
     if (backend === "native") {
-      await nativeSessions.attach(session, socket, cols, rows);
+      await nativeSessions.attach(session, socket, store.dataDir, cols, rows);
       return;
     }
     if (backend === "zellij") {
-      await attachZellij(socket, session, cols, rows);
+      await attachZellij(socket, session, store.dataDir, cols, rows);
       return;
     }
     await attachTmux(socket, session, cols, rows);
@@ -62,6 +74,7 @@ async function attachTerminal(
 async function attachZellij(
   socket: Socket,
   session: { id: string; tmuxName: string; cwd: string; shell?: string },
+  dataDir: string,
   cols: number,
   rows: number
 ): Promise<void> {
@@ -91,7 +104,7 @@ async function attachZellij(
   term.onData((data) => {
     socket.emit("terminal:data", data);
     transcriptQueue = transcriptQueue
-      .then(() => appendZellijTranscript(session.id, data))
+      .then(() => appendZellijTranscript(session.id, data, dataDir))
       .catch(() => undefined);
   });
 

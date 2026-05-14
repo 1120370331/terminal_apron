@@ -33,8 +33,9 @@ const TRANSCRIPT_TRIM_INTERVAL_MS = 5000;
 export class NativeSessionManager {
   private readonly sessions = new Map<string, NativeEntry>();
 
-  async ensure(session: TerminalSession, cols = 120, rows = 36): Promise<NativeEntry> {
-    const existing = this.sessions.get(session.id);
+  async ensure(session: TerminalSession, dataDir = config.dataDir, cols = 120, rows = 36): Promise<NativeEntry> {
+    const sessionKey = sessionKeyForDataDir(dataDir, session.id);
+    const existing = this.sessions.get(sessionKey);
     if (existing && !existing.exited) {
       existing.session = session;
       return existing;
@@ -43,7 +44,7 @@ export class NativeSessionManager {
     const pty = await loadPty();
     const command = resolveShell(session.shell);
     const cwd = resolveCwd(session.cwd);
-    const initialOutput = await loadTranscript(session.id);
+    const initialOutput = await loadTranscript(dataDir, session.id);
     const term = pty.spawn(command.file, command.args, {
       name: "xterm-256color",
       cols,
@@ -73,7 +74,7 @@ export class NativeSessionManager {
       currentPath: cwd,
       command: [command.file, ...command.args].join(" "),
       exited: false,
-      transcriptPath: transcriptPathForSession(session.id),
+      transcriptPath: transcriptPathForSession(dataDir, session.id),
       transcriptQueue: Promise.resolve(),
       pendingTranscriptBytes: 0,
       lastTranscriptTrimAt: Date.now()
@@ -105,15 +106,15 @@ export class NativeSessionManager {
         client.emit("terminal:exit", event);
       }
       entry.clients.clear();
-      this.sessions.delete(session.id);
+      this.sessions.delete(sessionKey);
     });
 
-    this.sessions.set(session.id, entry);
+    this.sessions.set(sessionKey, entry);
     return entry;
   }
 
-  async attach(session: TerminalSession, socket: Socket, cols: number, rows: number): Promise<void> {
-    const entry = await this.ensure(session, cols, rows);
+  async attach(session: TerminalSession, socket: Socket, dataDir: string, cols: number, rows: number): Promise<void> {
+    const entry = await this.ensure(session, dataDir, cols, rows);
     entry.clients.add(socket);
     entry.term.resize(cols, rows);
     entry.screen.resize(cols, rows);
@@ -126,7 +127,7 @@ export class NativeSessionManager {
     });
     socket.emit("terminal:resized", { cols, rows, seq: 0 });
 
-    const attachHistory = await loadTranscript(session.id);
+    const attachHistory = await loadTranscript(dataDir, session.id);
     if (attachHistory) {
       socket.emit("terminal:data", attachHistory);
     }
@@ -148,28 +149,29 @@ export class NativeSessionManager {
     });
   }
 
-  async kill(session: TerminalSession): Promise<void> {
-    const entry = this.sessions.get(session.id);
+  async kill(session: TerminalSession, dataDir = config.dataDir): Promise<void> {
+    const sessionKey = sessionKeyForDataDir(dataDir, session.id);
+    const entry = this.sessions.get(sessionKey);
     if (!entry) {
       return;
     }
     entry.term.kill();
     entry.clients.clear();
-    this.sessions.delete(session.id);
+    this.sessions.delete(sessionKey);
   }
 
-  async write(session: TerminalSession, data: string, enter = false): Promise<void> {
-    const entry = await this.ensure(session);
+  async write(session: TerminalSession, data: string, enter = false, dataDir = config.dataDir): Promise<void> {
+    const entry = await this.ensure(session, dataDir);
     entry.term.write(data);
     if (enter) {
       entry.term.write("\r");
     }
   }
 
-  async preview(session: TerminalSession, lines = 500): Promise<string> {
-    const entry = this.sessions.get(session.id);
+  async preview(session: TerminalSession, lines = 500, dataDir = config.dataDir): Promise<string> {
+    const entry = this.sessions.get(sessionKeyForDataDir(dataDir, session.id));
     if (!entry) {
-      return renderPlainPreview(await loadTranscript(session.id), lines);
+      return renderPlainPreview(await loadTranscript(dataDir, session.id), lines);
     }
     await entry.screenQueue;
     const buffer = entry.screen.buffer.active;
@@ -182,8 +184,8 @@ export class NativeSessionManager {
     return rendered.trim() ? rendered : renderPlainPreview(entry.output, lines);
   }
 
-  runtime(session: TerminalSession): SessionRuntime {
-    const entry = this.sessions.get(session.id);
+  runtime(session: TerminalSession, dataDir = config.dataDir): SessionRuntime {
+    const entry = this.sessions.get(sessionKeyForDataDir(dataDir, session.id));
     return {
       exists: Boolean(entry && !entry.exited),
       backend: "native",
@@ -203,12 +205,16 @@ function writeHeadless(screen: HeadlessTerminal, data: string): Promise<void> {
   });
 }
 
-function transcriptPathForSession(sessionId: string): string {
-  return path.join(config.dataDir, "transcripts", `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.ansi`);
+function sessionKeyForDataDir(dataDir: string, sessionId: string): string {
+  return `${path.resolve(dataDir)}:${sessionId}`;
 }
 
-async function loadTranscript(sessionId: string): Promise<string> {
-  return readTailFile(transcriptPathForSession(sessionId), config.nativeHistoryBytes).catch(() => "");
+function transcriptPathForSession(dataDir: string, sessionId: string): string {
+  return path.join(dataDir, "transcripts", `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.ansi`);
+}
+
+async function loadTranscript(dataDir: string, sessionId: string): Promise<string> {
+  return readTailFile(transcriptPathForSession(dataDir, sessionId), config.nativeHistoryBytes).catch(() => "");
 }
 
 function queueTranscriptWrite(entry: NativeEntry, data: string): void {

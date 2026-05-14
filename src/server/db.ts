@@ -48,7 +48,7 @@ function normalizeBackend(value: TerminalBackend | undefined): TerminalBackend {
 export class SessionStore {
   private readonly dbPath: string;
 
-  constructor(private readonly dataDir: string) {
+  constructor(readonly dataDir: string) {
     this.dbPath = path.join(dataDir, "sessions.json");
   }
 

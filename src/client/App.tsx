@@ -129,13 +129,18 @@ function useMediaQuery(query: string): boolean {
   return matches;
 }
 
-function loadPanelSettings(): PanelSettings {
+function userStorageKey(base: string, userName: string): string {
+  const safeUser = userName.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "_") || "user";
+  return `${base}.${safeUser}`;
+}
+
+function loadPanelSettings(storageKey = SETTINGS_STATE_KEY): PanelSettings {
   if (typeof window === "undefined") {
     return DEFAULT_SETTINGS;
   }
 
   try {
-    const stored = window.localStorage.getItem(SETTINGS_STATE_KEY);
+    const stored = window.localStorage.getItem(storageKey);
     if (!stored) {
       return DEFAULT_SETTINGS;
     }
@@ -156,7 +161,7 @@ function loadPanelSettings(): PanelSettings {
   }
 }
 
-function loadFilterState(): FilterState {
+function loadFilterState(storageKey = FILTER_STATE_KEY): FilterState {
   if (typeof window === "undefined") {
     return {
       query: "",
@@ -167,7 +172,7 @@ function loadFilterState(): FilterState {
   }
 
   try {
-    const stored = window.localStorage.getItem(FILTER_STATE_KEY);
+    const stored = window.localStorage.getItem(storageKey);
     if (!stored) {
       throw new Error("missing stored filters");
     }
@@ -375,6 +380,7 @@ export function App() {
   const previewsRef = useRef<Record<string, SessionPreview>>({});
   const previewInFlightRef = useRef<Set<string>>(new Set());
   const lastFullPreviewAtRef = useRef<Record<string, number>>({});
+  const userStorageReadyRef = useRef<string | null>(null);
   const isMobile = useMediaQuery(MOBILE_QUERY);
 
   const loadSessions = useCallback(async () => {
@@ -398,8 +404,30 @@ export function App() {
   }, [previews]);
 
   useEffect(() => {
+    if (!auth) {
+      userStorageReadyRef.current = null;
+      return;
+    }
+    const userName = auth.name;
+    userStorageReadyRef.current = null;
+    const nextFilters = loadFilterState(userStorageKey(FILTER_STATE_KEY, userName));
+    const nextSettings = loadPanelSettings(userStorageKey(SETTINGS_STATE_KEY, userName));
+    setQuery(nextFilters.query);
+    setGroupFilter(nextFilters.groupFilter);
+    setTagFilter(nextFilters.tagFilter);
+    setShowArchived(nextFilters.showArchived);
+    setSettings(nextSettings);
+    window.setTimeout(() => {
+      userStorageReadyRef.current = userName;
+    }, 0);
+  }, [auth]);
+
+  useEffect(() => {
+    if (!auth || userStorageReadyRef.current !== auth.name) {
+      return;
+    }
     window.localStorage.setItem(
-      FILTER_STATE_KEY,
+      userStorageKey(FILTER_STATE_KEY, auth.name),
       JSON.stringify({
         query,
         groupFilter,
@@ -407,11 +435,14 @@ export function App() {
         showArchived
       })
     );
-  }, [groupFilter, query, showArchived, tagFilter]);
+  }, [auth, groupFilter, query, showArchived, tagFilter]);
 
   useEffect(() => {
-    window.localStorage.setItem(SETTINGS_STATE_KEY, JSON.stringify(settings));
-  }, [settings]);
+    if (!auth || userStorageReadyRef.current !== auth.name) {
+      return;
+    }
+    window.localStorage.setItem(userStorageKey(SETTINGS_STATE_KEY, auth.name), JSON.stringify(settings));
+  }, [auth, settings]);
 
   useEffect(() => {
     const applyTheme = () => {
@@ -752,7 +783,7 @@ export function App() {
           <MonitorUp size={24} />
           <div>
             <h1>Terminal Web Monitor</h1>
-            <span>{sessions.length} sessions</span>
+            <span>{sessions.length} sessions · {auth.name}</span>
           </div>
         </div>
         <div className="topbar-actions">

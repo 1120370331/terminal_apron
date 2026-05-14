@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server as SocketServer } from "socket.io";
-import { config } from "./config.js";
+import { config, dataDirForUser } from "./config.js";
 import { SessionStore } from "./db.js";
 import {
   authConfig,
@@ -43,6 +43,7 @@ import { NativeSessionManager } from "./nativeSessions.js";
 import { renderPreviewGrid } from "./previewGrid.js";
 import type {
   CreateSessionInput,
+  AuthUser,
   SystemMetrics,
   TerminalPreviewGrid,
   TerminalSession,
@@ -57,11 +58,25 @@ const io = new SocketServer(server, {
     credentials: true
   }
 });
-const store = new SessionStore(config.dataDir);
+const stores = new Map<string, Promise<SessionStore>>();
 const nativeSessions = new NativeSessionManager();
 const DEFAULT_PREVIEW_MAX_CHARS = 120_000;
 
 app.use(express.json({ limit: "1mb" }));
+
+async function storeForUser(user: AuthUser): Promise<SessionStore> {
+  const userDataDir = path.resolve(dataDirForUser(user.name));
+  let storePromise = stores.get(userDataDir);
+  if (!storePromise) {
+    storePromise = (async () => {
+      const store = new SessionStore(userDataDir);
+      await store.init();
+      return store;
+    })();
+    stores.set(userDataDir, storePromise);
+  }
+  return storePromise;
+}
 
 app.get("/api/auth/config", (_req, res) => {
   res.json(authConfig());
@@ -145,13 +160,14 @@ app.get("/api/system/metrics", (_req, res) => {
 });
 
 app.get("/api/sessions", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const includeArchived = req.query.archived === "true";
   const sessions = await store.all();
   const visible = includeArchived ? sessions : sessions.filter((session) => !session.archived);
   const enriched = await Promise.all(
     visible.map(async (session) => ({
       ...session,
-      runtime: await getRuntime(session).catch(() => ({
+        runtime: await getRuntime(session, store.dataDir).catch(() => ({
         exists: false,
         backend: "native",
         persistent: false,
@@ -167,15 +183,17 @@ app.get("/api/sessions", async (req, res) => {
 });
 
 app.post("/api/sessions", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const session = await store.create(req.body as CreateSessionInput);
-  await ensureSession(session);
+  await ensureSession(session, store.dataDir);
   res.status(201).json({
     ...session,
-    runtime: await getRuntime(session)
+    runtime: await getRuntime(session, store.dataDir)
   });
 });
 
 app.post("/api/sessions/:id/duplicate", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const source = await store.get(req.params.id);
   if (!source) {
     res.status(404).json({ error: "session not found" });
@@ -206,11 +224,12 @@ app.post("/api/sessions/:id/duplicate", async (req, res) => {
   const copied = updated || duplicate;
   res.status(201).json({
     ...copied,
-    runtime: await getRuntime(copied)
+    runtime: await getRuntime(copied, store.dataDir)
   });
 });
 
 app.patch("/api/sessions/:id", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const updated = await store.update(req.params.id, req.body as UpdateSessionInput);
   if (!updated) {
     res.status(404).json({ error: "session not found" });
@@ -218,24 +237,26 @@ app.patch("/api/sessions/:id", async (req, res) => {
   }
   res.json({
     ...updated,
-    runtime: await getRuntime(updated).catch(() => undefined)
+    runtime: await getRuntime(updated, store.dataDir).catch(() => undefined)
   });
 });
 
 app.post("/api/sessions/:id/ensure", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const session = await store.get(req.params.id);
   if (!session) {
     res.status(404).json({ error: "session not found" });
     return;
   }
-  await ensureSession(session);
+  await ensureSession(session, store.dataDir);
   res.json({
     ...session,
-    runtime: await getRuntime(session)
+    runtime: await getRuntime(session, store.dataDir)
   });
 });
 
 app.post("/api/sessions/:id/input", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const session = await store.get(req.params.id);
   if (!session) {
     res.status(404).json({ error: "session not found" });
@@ -252,14 +273,14 @@ app.post("/api/sessions/:id/input", async (req, res) => {
     return;
   }
 
-  await sendSessionInput(session, data, enter !== false);
+  await sendSessionInput(session, data, enter !== false, store.dataDir);
   const previewLines = parsePreviewLines(req.body?.lines);
-  const previewText = await captureSessionPreview(session, previewLines, false).catch(() => "");
+  const previewText = await captureSessionPreview(session, store.dataDir, previewLines, false).catch(() => "");
   const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.body?.maxChars));
   const grid = await renderSessionPreviewGrid(session, compactPreview, previewLines, false).catch(() => undefined);
   res.json({
     ok: true,
-    runtime: await getRuntime(session),
+    runtime: await getRuntime(session, store.dataDir),
     preview: compactPreview,
     grid,
     signature: previewSignature(compactPreview, grid)
@@ -267,6 +288,7 @@ app.post("/api/sessions/:id/input", async (req, res) => {
 });
 
 app.post("/api/sessions/:id/archive", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const updated = await store.update(req.params.id, { archived: true });
   if (!updated) {
     res.status(404).json({ error: "session not found" });
@@ -276,30 +298,33 @@ app.post("/api/sessions/:id/archive", async (req, res) => {
 });
 
 app.post("/api/sessions/:id/restore", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const updated = await store.update(req.params.id, { archived: false });
   if (!updated) {
     res.status(404).json({ error: "session not found" });
     return;
   }
-  await ensureSession(updated);
+  await ensureSession(updated, store.dataDir);
   res.json({
     ...updated,
-    runtime: await getRuntime(updated)
+    runtime: await getRuntime(updated, store.dataDir)
   });
 });
 
 app.post("/api/sessions/:id/kill", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const session = await store.get(req.params.id);
   if (!session) {
     res.status(404).json({ error: "session not found" });
     return;
   }
-  await killSession(session);
+  await killSession(session, store.dataDir);
   const stopped = await store.markStopped(session.id);
   res.json(stopped);
 });
 
 app.get("/api/sessions/:id/preview", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
   const session = await store.get(req.params.id);
   if (!session) {
     res.status(404).json({ error: "session not found" });
@@ -307,7 +332,7 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
   }
   const previewLines = parsePreviewLines(req.query.lines);
   const previewFull = parsePreviewFull(req.query.full);
-  const previewText = await captureSessionPreview(session, previewLines, previewFull).catch(() => "");
+  const previewText = await captureSessionPreview(session, store.dataDir, previewLines, previewFull).catch(() => "");
   const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.query.maxChars));
   const grid = await renderSessionPreviewGrid(session, compactPreview, previewLines, previewFull).catch(() => undefined);
   res.json({
@@ -319,7 +344,7 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
   });
 });
 
-registerTerminalSockets(io, store, nativeSessions);
+registerTerminalSockets(io, storeForUser, nativeSessions);
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDir =
@@ -335,14 +360,14 @@ app.use((req, res, next) => {
   res.sendFile(path.join(clientDir, "index.html"));
 });
 
-await store.init();
+await storeForUser({ name: config.adminUser, method: "password" });
 server.listen(config.port, config.host, () => {
   console.log(`terminal-web-monitor listening on http://${config.host}:${config.port}`);
   console.log(`data dir: ${config.dataDir}`);
   console.log(`auth modes: ${authConfig().methods.join(", ")}`);
 });
 
-async function ensureSession(session: TerminalSession) {
+async function ensureSession(session: TerminalSession, dataDir = config.dataDir) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
     await ensureTmuxSession(session);
@@ -352,10 +377,10 @@ async function ensureSession(session: TerminalSession) {
     await ensureZellijSession(session);
     return;
   }
-  await nativeSessions.ensure(session);
+  await nativeSessions.ensure(session, dataDir);
 }
 
-async function getRuntime(session: TerminalSession) {
+async function getRuntime(session: TerminalSession, dataDir = config.dataDir) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
     return runtimeInfo(session);
@@ -363,18 +388,18 @@ async function getRuntime(session: TerminalSession) {
   if (backend === "zellij") {
     return zellijRuntimeInfo(session);
   }
-  return nativeSessions.runtime(session);
+  return nativeSessions.runtime(session, dataDir);
 }
 
-async function captureSessionPreview(session: TerminalSession, lines = 500, full = true) {
+async function captureSessionPreview(session: TerminalSession, dataDir: string, lines = 500, full = true) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
     return capturePreview(session, lines);
   }
   if (backend === "zellij") {
-    return captureZellijPreview(session, lines, full);
+    return captureZellijPreview(session, lines, full, dataDir);
   }
-  return nativeSessions.preview(session, lines);
+  return nativeSessions.preview(session, lines, dataDir);
 }
 
 async function renderSessionPreviewGrid(
@@ -398,7 +423,7 @@ async function renderSessionPreviewGrid(
   return renderPreviewGrid(previewText);
 }
 
-async function killSession(session: TerminalSession) {
+async function killSession(session: TerminalSession, dataDir = config.dataDir) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
     await killTmuxSession(session);
@@ -408,13 +433,14 @@ async function killSession(session: TerminalSession) {
     await killZellijSession(session);
     return;
   }
-  await nativeSessions.kill(session);
+  await nativeSessions.kill(session, dataDir);
 }
 
 async function sendSessionInput(
   session: TerminalSession,
   data: string,
-  enter: boolean
+  enter: boolean,
+  dataDir = config.dataDir
 ) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
@@ -425,7 +451,7 @@ async function sendSessionInput(
     await sendZellijInput(session, data, enter);
     return;
   }
-  await nativeSessions.write(session, data, enter);
+  await nativeSessions.write(session, data, enter, dataDir);
 }
 
 function nextCopyName(name: string, existingNames: string[]): string {

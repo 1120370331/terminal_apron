@@ -6,7 +6,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import type { NextFunction, Request, Response } from "express";
 import type { AuthConfig, AuthUser } from "../shared/types.js";
-import { config } from "./config.js";
+import { config, configuredUser } from "./config.js";
 
 interface Challenge {
   id: string;
@@ -116,17 +116,17 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 export function authConfig(): AuthConfig {
   const methods = config.authModes.filter((method) => {
     if (method === "password") {
-      return Boolean(config.adminPassword);
+      return config.users.some((user) => Boolean(user.password));
     }
     if (method === "ssh") {
-      return fs.existsSync(config.authorizedKeysFile);
+      return config.users.some((user) => user.publicKeys.length > 0 || Boolean(user.authorizedKeysFile && fs.existsSync(user.authorizedKeysFile)));
     }
     return true;
   });
 
   return {
     methods: methods.length ? methods : ["none"],
-    user: config.adminUser
+    user: config.users.length === 1 ? config.users[0].name : config.adminUser
   };
 }
 
@@ -152,10 +152,11 @@ export async function verifyPassword(username: string, password: string): Promis
   if (!authConfig().methods.includes("password")) {
     return null;
   }
-  if (username !== config.adminUser || password !== config.adminPassword) {
+  const user = configuredUser(username);
+  if (!user?.password || !constantTimeStringEqual(password, user.password)) {
     return null;
   }
-  return { name: username, method: "password" };
+  return { name: user.name, method: "password" };
 }
 
 export function createSshChallenge(username: string): Challenge {
@@ -189,9 +190,13 @@ export async function verifySshLogin(input: {
   if (username !== challenge.username) {
     return null;
   }
+  const user = configuredUser(username);
+  if (!user) {
+    return null;
+  }
 
   const publicKey = normalizePublicKey(input.publicKey);
-  if (!publicKey || !(await authorizedKeyExists(publicKey))) {
+  if (!publicKey || !(await authorizedKeyExists(user, publicKey))) {
     return null;
   }
 
@@ -206,7 +211,7 @@ export async function verifySshLogin(input: {
       challenge.value
     );
     challenges.delete(input.challengeId);
-    return { name: username, method: "ssh" };
+    return { name: user.name, method: "ssh" };
   } catch {
     return null;
   } finally {
@@ -232,13 +237,32 @@ function normalizePublicKey(value: string): string | null {
   return `${parts[index]} ${parts[index + 1]}`;
 }
 
-async function authorizedKeyExists(publicKey: string): Promise<boolean> {
-  const raw = await fsp.readFile(config.authorizedKeysFile, "utf8");
+async function authorizedKeyExists(
+  user: { publicKeys: string[]; authorizedKeysFile?: string },
+  publicKey: string
+): Promise<boolean> {
+  const configuredKeys = user.publicKeys.some((line) => normalizePublicKey(line) === publicKey);
+  if (configuredKeys) {
+    return true;
+  }
+  if (!user.authorizedKeysFile) {
+    return false;
+  }
+  const raw = await fsp.readFile(user.authorizedKeysFile, "utf8").catch(() => "");
   return raw
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"))
     .some((line) => normalizePublicKey(line) === publicKey);
+}
+
+function constantTimeStringEqual(actual: string, expected: string): boolean {
+  const actualBuffer = Buffer.from(actual);
+  const expectedBuffer = Buffer.from(expected);
+  if (actualBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
 function decodeSignature(value: string): Buffer | string {

@@ -39,12 +39,29 @@ TWM_ADMIN_USER=admin
 TWM_ADMIN_PASSWORD=change-this-password
 TWM_COOKIE_SECURE=false
 
+# 可选：多用户。admin 继续使用 ./data，其他用户使用 ./data/users/<name>。
+# TWM_USERS_JSON='[{"name":"alice","password":"alice-pass"},{"name":"bob","authorizedKeysFile":"~/.ssh/bob_authorized_keys"}]'
+# TWM_USERS_FILE=./users.json
+
 TWM_NATIVE_HISTORY_BYTES=8000000
 TWM_PREVIEW_MAX_LINES=5000
 TWM_ZELLIJ_SCROLLBACK=50000
 ```
 
 `TWM_SESSION_BACKEND` 保留配置项，但正式后端会归一为 `zellij`。旧 session 里的 `auto`、`native`、`tmux` 会被迁移为 `zellij`。
+
+### 多用户隔离
+
+可以继续用原来的 `TWM_ADMIN_USER` / `TWM_ADMIN_PASSWORD`，也可以通过 `TWM_USERS_JSON` 或 `TWM_USERS_FILE` 添加用户：
+
+```json
+[
+  { "name": "alice", "password": "alice-pass" },
+  { "name": "bob", "authorizedKeysFile": "~/.ssh/bob_authorized_keys" }
+]
+```
+
+每个登录用户有独立的 session 列表、布局、transcripts 和浏览器端筛选/显示配置。为了兼容现有部署，`admin` 仍使用 `TWM_DATA_DIR` 根目录；其他用户默认使用 `TWM_DATA_DIR/users/<name>/`。命令执行的系统权限仍然跟随 Web 服务进程用户，不会因为登录用户名改变而切换 OS 用户。
 
 ## 启动
 

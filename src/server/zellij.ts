@@ -112,14 +112,15 @@ export async function killZellijSession(session: Pick<TerminalSession, "tmuxName
 export async function captureZellijPreview(
   session: Pick<TerminalSession, "id" | "tmuxName">,
   lines = 500,
-  full = true
+  full = true,
+  dataDir = config.dataDir
 ): Promise<string> {
   if (!full) {
-    return captureZellijViewportPreview(session, lines);
+    return captureZellijViewportPreview(session, lines, dataDir);
   }
 
   if (!(await hasZellijSession(session.tmuxName))) {
-    return renderPlainTranscript(await loadZellijTranscript(session.id), lines);
+    return renderPlainTranscript(await loadZellijTranscript(dataDir, session.id), lines);
   }
 
   const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
@@ -134,14 +135,15 @@ export async function captureZellijPreview(
     timeoutMs: 5000
   }).catch(() => ({ stdout: "", stderr: "" }));
   const rendered = tailRawLines(result.stdout, Math.max(20, Math.min(lines, config.previewMaxLines)));
-  return rendered.trim() ? rendered : renderPlainTranscript(await loadZellijTranscript(session.id), lines);
+  return rendered.trim() ? rendered : renderPlainTranscript(await loadZellijTranscript(dataDir, session.id), lines);
 }
 
 async function captureZellijViewportPreview(
   session: Pick<TerminalSession, "id" | "tmuxName">,
-  lines: number
+  lines: number,
+  dataDir: string
 ): Promise<string> {
-  const cacheKey = `${session.tmuxName}:${lines}`;
+  const cacheKey = `${path.resolve(dataDir)}:${session.tmuxName}:${lines}`;
   const cached = viewportPreviewCache.get(cacheKey);
   const now = Date.now();
   if (cached && now - cached.capturedAt < VIEWPORT_PREVIEW_TTL_MS) {
@@ -154,7 +156,7 @@ async function captureZellijViewportPreview(
     return cached.inFlight;
   }
 
-  const inFlight = captureZellijViewportPreviewFresh(session, lines)
+  const inFlight = captureZellijViewportPreviewFresh(session, lines, dataDir)
     .then((value) => {
       viewportPreviewCache.set(cacheKey, { value, capturedAt: Date.now() });
       return value;
@@ -178,7 +180,8 @@ async function captureZellijViewportPreview(
 
 async function captureZellijViewportPreviewFresh(
   session: Pick<TerminalSession, "id" | "tmuxName">,
-  lines: number
+  lines: number,
+  dataDir: string
 ): Promise<string> {
   const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
   const args = ["--session", session.tmuxName, "action", "dump-screen", "--ansi"];
@@ -189,7 +192,7 @@ async function captureZellijViewportPreviewFresh(
     timeoutMs: 2500
   }).catch(() => ({ stdout: "", stderr: "" }));
   const rendered = result.stdout || "";
-  return rendered.trim() ? rendered : renderPlainTranscript(await loadZellijTranscript(session.id), lines);
+  return rendered.trim() ? rendered : renderPlainTranscript(await loadZellijTranscript(dataDir, session.id), lines);
 }
 
 export async function zellijPreviewSize(
@@ -212,8 +215,8 @@ export async function zellijPreviewSize(
   return { cols, rows };
 }
 
-export function appendZellijTranscript(sessionId: string, data: string): Promise<void> {
-  return appendTranscript(zellijTranscriptPath(sessionId), data, config.nativeHistoryBytes);
+export function appendZellijTranscript(sessionId: string, data: string, dataDir = config.dataDir): Promise<void> {
+  return appendTranscript(zellijTranscriptPath(dataDir, sessionId), data, config.nativeHistoryBytes);
 }
 
 export async function sendZellijInput(
@@ -384,12 +387,12 @@ async function activeTerminalPane(sessionName: string): Promise<ZellijPane | nul
   );
 }
 
-async function loadZellijTranscript(sessionId: string): Promise<string> {
-  return readTailFile(zellijTranscriptPath(sessionId), config.nativeHistoryBytes).catch(() => "");
+async function loadZellijTranscript(dataDir: string, sessionId: string): Promise<string> {
+  return readTailFile(zellijTranscriptPath(dataDir, sessionId), config.nativeHistoryBytes).catch(() => "");
 }
 
-function zellijTranscriptPath(sessionId: string): string {
-  return path.join(config.dataDir, "transcripts", `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.ansi`);
+function zellijTranscriptPath(dataDir: string, sessionId: string): string {
+  return path.join(dataDir, "transcripts", `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.ansi`);
 }
 
 async function appendTranscript(filePath: string, data: string, maxBytes: number): Promise<void> {
