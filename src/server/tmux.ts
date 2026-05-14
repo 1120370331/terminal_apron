@@ -79,14 +79,19 @@ export async function capturePreview(session: Pick<TerminalSession, "tmuxName">,
 export async function sendTmuxInput(
   session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
   data: string,
-  enter = false
+  enter = false,
+  submitKey: "enter" | "enhanced-enter" = "enter"
 ): Promise<void> {
   await ensureTmuxSession(session);
   const bufferName = `twm_input_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   await runTmux(["set-buffer", "-b", bufferName, data], 5000);
   await runTmux(["paste-buffer", "-d", "-b", bufferName, "-t", session.tmuxName], 5000);
   if (enter) {
-    await runTmux(["send-keys", "-t", session.tmuxName, "Enter"], 5000);
+    if (submitKey === "enhanced-enter") {
+      await runTmux(["send-keys", "-t", session.tmuxName, "Escape", "[", "1", "3", "u"], 5000);
+    } else {
+      await runTmux(["send-keys", "-t", session.tmuxName, "Enter"], 5000);
+    }
   }
 }
 
