@@ -91,7 +91,13 @@ export const api = {
       method: "POST"
     }),
   sendInput: (id: string, input: { data: string; enter?: boolean; submitKey?: "enter" }) =>
-    request<{ ok: boolean; runtime?: TerminalSession["runtime"]; preview?: string; grid?: SessionPreview["grid"] }>(`/api/sessions/${id}/input`, {
+    request<{
+      ok: boolean;
+      runtime?: TerminalSession["runtime"];
+      preview?: string;
+      grid?: SessionPreview["grid"];
+      signature?: string;
+    }>(`/api/sessions/${id}/input`, {
       method: "POST",
       body: JSON.stringify(input)
     }),
@@ -107,6 +113,6 @@ export const api = {
     request<TerminalSession>(`/api/sessions/${id}/kill`, {
       method: "POST"
     }),
-  preview: (id: string, lines = 500, maxChars = 500_000) =>
-    request<SessionPreview>(`/api/sessions/${id}/preview?lines=${lines}&maxChars=${maxChars}&full=true`)
+  preview: (id: string, lines = 500, maxChars = 500_000, full = true) =>
+    request<SessionPreview>(`/api/sessions/${id}/preview?lines=${lines}&maxChars=${maxChars}&full=${full}`)
 };

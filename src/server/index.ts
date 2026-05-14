@@ -1,5 +1,6 @@
 import express from "express";
 import http from "node:http";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -40,7 +41,13 @@ import { nodePtyHealth } from "./pty.js";
 import { backendHealth, resolveBackend } from "./backend.js";
 import { NativeSessionManager } from "./nativeSessions.js";
 import { renderPreviewGrid } from "./previewGrid.js";
-import type { CreateSessionInput, SystemMetrics, TerminalSession, UpdateSessionInput } from "../shared/types.js";
+import type {
+  CreateSessionInput,
+  SystemMetrics,
+  TerminalPreviewGrid,
+  TerminalSession,
+  UpdateSessionInput
+} from "../shared/types.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -249,11 +256,13 @@ app.post("/api/sessions/:id/input", async (req, res) => {
   const previewLines = parsePreviewLines(req.body?.lines);
   const previewText = await captureSessionPreview(session, previewLines, false).catch(() => "");
   const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.body?.maxChars));
+  const grid = await renderSessionPreviewGrid(session, compactPreview, previewLines, false).catch(() => undefined);
   res.json({
     ok: true,
     runtime: await getRuntime(session),
     preview: compactPreview,
-    grid: await renderSessionPreviewGrid(session, compactPreview, previewLines, false).catch(() => undefined)
+    grid,
+    signature: previewSignature(compactPreview, grid)
   });
 });
 
@@ -300,10 +309,12 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
   const previewFull = parsePreviewFull(req.query.full);
   const previewText = await captureSessionPreview(session, previewLines, previewFull).catch(() => "");
   const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.query.maxChars));
+  const grid = await renderSessionPreviewGrid(session, compactPreview, previewLines, previewFull).catch(() => undefined);
   res.json({
     sessionId: session.id,
     text: compactPreview,
-    grid: await renderSessionPreviewGrid(session, compactPreview, previewLines, previewFull).catch(() => undefined),
+    grid,
+    signature: previewSignature(compactPreview, grid),
     capturedAt: new Date().toISOString()
   });
 });
@@ -476,6 +487,32 @@ function compactPreviewPayload(value: string, maxChars: number): string {
     tail = tail.slice(firstLineBreak + 1);
   }
   return `\u001b[0m${tail}`;
+}
+
+function previewSignature(text: string, grid?: TerminalPreviewGrid): string {
+  const hash = crypto.createHash("sha1");
+  hash.update(text);
+  if (grid) {
+    hash.update(`\ncols=${grid.cols};rows=${grid.rows.length}`);
+    for (const row of grid.rows) {
+      hash.update("\n");
+      for (const segment of row.segments) {
+        hash.update(segment.text);
+        hash.update("\u001f");
+        hash.update(String(segment.cols));
+        hash.update("\u001f");
+        hash.update(segment.fg ?? "");
+        hash.update("\u001f");
+        hash.update(segment.bg ?? "");
+        hash.update("\u001f");
+        hash.update(segment.bold ? "1" : "0");
+        hash.update(segment.italic ? "1" : "0");
+        hash.update(segment.underline ? "1" : "0");
+        hash.update(segment.dim ? "1" : "0");
+      }
+    }
+  }
+  return hash.digest("hex");
 }
 
 interface CpuSnapshot {

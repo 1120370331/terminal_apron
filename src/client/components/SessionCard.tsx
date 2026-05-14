@@ -69,7 +69,7 @@ function SessionCardComponent({
     }
 
     if (historyPaused) {
-      if (preview?.text !== displayedPreview?.text) {
+      if (previewSignature(preview) !== previewSignature(displayedPreview)) {
         setHasPendingPreview(true);
       }
       return;
@@ -290,11 +290,39 @@ function areSessionCardPropsEqual(previous: Props, next: Props): boolean {
 }
 
 function previewSignature(preview?: SessionPreview): string {
+  if (!preview) {
+    return "";
+  }
+  if (preview.signature) {
+    return preview.signature;
+  }
   return [
     preview?.text ?? "",
-    String(preview?.grid?.cols ?? ""),
-    String(preview?.grid?.rows.length ?? "")
+    gridSignature(preview.grid)
   ].join("\u001f");
+}
+
+function gridSignature(grid?: TerminalPreviewGrid): string {
+  if (!grid) {
+    return "";
+  }
+  const rows = grid.rows.map((row) =>
+    row.segments
+      .map((segment) =>
+        [
+          segment.text,
+          segment.cols,
+          segment.fg ?? "",
+          segment.bg ?? "",
+          segment.bold ? "1" : "",
+          segment.italic ? "1" : "",
+          segment.underline ? "1" : "",
+          segment.dim ? "1" : ""
+        ].join("\u001e")
+      )
+      .join("\u001d")
+  );
+  return [grid.cols, grid.rows.length, ...rows].join("\u001c");
 }
 
 function sessionCardSignature(session: TerminalSession): string {

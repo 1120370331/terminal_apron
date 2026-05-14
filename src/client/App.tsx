@@ -19,7 +19,14 @@ import {
   SlidersHorizontal,
   Sun
 } from "lucide-react";
-import type { AuthUser, HealthStatus, SessionPreview, SystemMetrics, TerminalSession } from "../shared/types";
+import type {
+  AuthUser,
+  HealthStatus,
+  SessionPreview,
+  SystemMetrics,
+  TerminalPreviewGrid,
+  TerminalSession
+} from "../shared/types";
 import { api, ApiError } from "./api";
 import { Login } from "./components/Login";
 import { SessionCard } from "./components/SessionCard";
@@ -37,6 +44,7 @@ const SYSTEM_METRICS_REFRESH_MS = 1000;
 const SYSTEM_METRICS_HISTORY_LIMIT = 120;
 const DEFAULT_PREVIEW_LINES = 600;
 const MAX_LIST_PREVIEW_LINES = 1200;
+const FULL_PREVIEW_REFRESH_MS = 10_000;
 const MOBILE_QUERY = "(max-width: 720px)";
 const GRID_COLUMNS = 12;
 const CARD_COLUMNS = 4;
@@ -226,16 +234,61 @@ function emptyPreview(sessionId: string): SessionPreview {
   return {
     sessionId,
     text: "",
+    signature: "",
     capturedAt: new Date(0).toISOString()
   };
 }
 
 function samePreview(previous: SessionPreview | undefined, next: SessionPreview): boolean {
-  return (
-    previous?.text === next.text &&
-    previous.grid?.cols === next.grid?.cols &&
-    previous.grid?.rows.length === next.grid?.rows.length
+  return previewContentSignature(previous) === previewContentSignature(next);
+}
+
+function previewContentSignature(preview?: SessionPreview): string {
+  if (!preview) {
+    return "";
+  }
+  return preview.signature || [preview.text, gridContentSignature(preview.grid)].join("\u001f");
+}
+
+function gridContentSignature(grid?: TerminalPreviewGrid): string {
+  if (!grid) {
+    return "";
+  }
+  const rows = grid.rows.map((row) =>
+    row.segments
+      .map((segment) =>
+        [
+          segment.text,
+          segment.cols,
+          segment.fg ?? "",
+          segment.bg ?? "",
+          segment.bold ? "1" : "",
+          segment.italic ? "1" : "",
+          segment.underline ? "1" : "",
+          segment.dim ? "1" : ""
+        ].join("\u001e")
+      )
+      .join("\u001d")
   );
+  return [grid.cols, grid.rows.length, ...rows].join("\u001c");
+}
+
+function mergeFastPreview(previous: SessionPreview | undefined, next: SessionPreview, rowsToKeep: number): SessionPreview {
+  if (!previous?.grid || !next.grid) {
+    return next;
+  }
+
+  const fastRows = next.grid.rows;
+  const historyRowsToKeep = Math.max(0, rowsToKeep - fastRows.length);
+  const historyRows = historyRowsToKeep > 0 ? previous.grid.rows.slice(-historyRowsToKeep) : [];
+  return {
+    ...next,
+    text: previous.text,
+    grid: {
+      cols: next.grid.cols || previous.grid.cols,
+      rows: [...historyRows, ...fastRows].slice(-rowsToKeep)
+    }
+  };
 }
 
 function buildSessionLayout(session: TerminalSession, index: number, settings: PanelSettings): Layout {
@@ -319,6 +372,9 @@ export function App() {
   const [localLayout, setLocalLayout] = useState<Layout[]>([]);
   const layoutDirtyRef = useRef(false);
   const layoutSaveSeqRef = useRef(0);
+  const previewsRef = useRef<Record<string, SessionPreview>>({});
+  const previewInFlightRef = useRef<Set<string>>(new Set());
+  const lastFullPreviewAtRef = useRef<Record<string, number>>({});
   const isMobile = useMediaQuery(MOBILE_QUERY);
 
   const loadSessions = useCallback(async () => {
@@ -336,6 +392,10 @@ export function App() {
     void api.me().then(setAuth).catch(() => setAuth(null));
     void api.health().then(setHealth).catch(() => setHealth(null));
   }, []);
+
+  useEffect(() => {
+    previewsRef.current = previews;
+  }, [previews]);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -434,64 +494,94 @@ export function App() {
     });
   }, [groupFilter, query, sessions, tagFilter]);
 
+  const previewTargets = useMemo(
+    () =>
+      filtered.slice(0, settings.maxPreviewCards).map((session) => ({
+        id: session.id,
+        exists: Boolean(session.runtime?.exists)
+      })),
+    [filtered, settings.maxPreviewCards]
+  );
+  const previewTargetKey = useMemo(
+    () => previewTargets.map((target) => `${target.id}:${target.exists ? "1" : "0"}`).join("|"),
+    [previewTargets]
+  );
+
   useEffect(() => {
-    if (!auth || filtered.length === 0) {
+    if (!auth || previewTargets.length === 0) {
       return;
     }
 
     let cancelled = false;
-    let loading = false;
-    const previewConcurrency = 4;
-    const loadPreviews = async () => {
-      if (loading) {
+    const timers: number[] = [];
+    const visibleIds = new Set(previewTargets.map((target) => target.id));
+    setPreviews((current) => {
+      let next = current;
+      for (const target of previewTargets) {
+        if (target.exists) {
+          continue;
+        }
+        if (current[target.id]?.text === "") {
+          continue;
+        }
+        next = next === current ? { ...current } : next;
+        next[target.id] = emptyPreview(target.id);
+      }
+      return next;
+    });
+
+    const pollPreview = async (sessionId: string) => {
+      if (previewInFlightRef.current.has(sessionId)) {
         return;
       }
-      loading = true;
-      const visible = filtered.slice(0, settings.maxPreviewCards);
-      for (const session of visible) {
-        if (!session.runtime?.exists) {
+
+      previewInFlightRef.current.add(sessionId);
+      try {
+        const now = Date.now();
+        const previous = previewsRef.current[sessionId];
+        const lastFullAt = lastFullPreviewAtRef.current[sessionId] ?? 0;
+        const shouldLoadFull = Boolean(previous?.grid) && now - lastFullAt >= FULL_PREVIEW_REFRESH_MS;
+        const preview = await api.preview(sessionId, settings.previewLines, 500_000, shouldLoadFull);
+        if (cancelled || !visibleIds.has(sessionId)) {
+          return;
+        }
+
+        if (shouldLoadFull) {
+          lastFullPreviewAtRef.current[sessionId] = Date.now();
+        }
+
+        setPreviews((current) => {
+          const nextPreview = shouldLoadFull
+            ? preview
+            : mergeFastPreview(current[sessionId], preview, settings.previewLines);
+          return samePreview(current[sessionId], nextPreview) ? current : { ...current, [sessionId]: nextPreview };
+        });
+      } catch {
+        if (!cancelled) {
           setPreviews((current) =>
-            current[session.id]?.text === "" ? current : { ...current, [session.id]: emptyPreview(session.id) }
+            current[sessionId]?.text === "" ? current : { ...current, [sessionId]: emptyPreview(sessionId) }
           );
         }
-      }
-      const targets = visible.filter((session) => session.runtime?.exists);
-      let cursor = 0;
-      const loadOne = async () => {
-        while (!cancelled && cursor < targets.length) {
-          const session = targets[cursor];
-          cursor += 1;
-          try {
-            const preview = await api.preview(session.id, settings.previewLines);
-            if (!cancelled) {
-              setPreviews((current) =>
-                samePreview(current[session.id], preview) ? current : { ...current, [session.id]: preview }
-              );
-            }
-          } catch {
-            if (!cancelled) {
-              setPreviews((current) =>
-                current[session.id]?.text === "" ? current : { ...current, [session.id]: emptyPreview(session.id) }
-              );
-            }
-          }
-        }
-      };
-
-      try {
-        await Promise.all(Array.from({ length: Math.min(previewConcurrency, targets.length) }, loadOne));
       } finally {
-        loading = false;
+        previewInFlightRef.current.delete(sessionId);
       }
     };
 
-    void loadPreviews();
-    const timer = window.setInterval(loadPreviews, settings.previewRefreshMs);
+    for (const target of previewTargets) {
+      if (!target.exists) {
+        previewInFlightRef.current.delete(target.id);
+        delete lastFullPreviewAtRef.current[target.id];
+        continue;
+      }
+      void pollPreview(target.id);
+      timers.push(window.setInterval(() => void pollPreview(target.id), settings.previewRefreshMs));
+    }
+
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      timers.forEach((timer) => window.clearInterval(timer));
     };
-  }, [auth, filtered, settings.maxPreviewCards, settings.previewLines, settings.previewRefreshMs]);
+  }, [auth, previewTargetKey, settings.previewLines, settings.previewRefreshMs]);
 
   const desktopLayout = useMemo(
     () => filtered.map((session, index) => buildSessionLayout(session, index, settings)),
@@ -598,7 +688,8 @@ export function App() {
             [session.id]: {
               ...emptyPreview(session.id),
               text: result.preview || current[session.id]?.text || "",
-              grid: result.grid
+              grid: result.grid,
+              signature: result.signature
             }
           }));
         }

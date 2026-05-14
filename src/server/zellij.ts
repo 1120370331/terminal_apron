@@ -33,7 +33,7 @@ interface ZellijPane {
 }
 
 const ZELLIJ_SINGLE_PANE_LAYOUT = ["layout {", "    pane", "}"].join("\n");
-const VIEWPORT_PREVIEW_TTL_MS = 1500;
+const VIEWPORT_PREVIEW_TTL_MS = 600;
 const VIEWPORT_PREVIEW_STALE_MS = 30_000;
 
 interface PreviewCacheEntry {

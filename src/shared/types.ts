@@ -79,6 +79,7 @@ export interface SessionPreview {
   sessionId: string;
   text: string;
   grid?: TerminalPreviewGrid;
+  signature?: string;
   capturedAt: string;
 }
 
