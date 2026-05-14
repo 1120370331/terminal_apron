@@ -143,7 +143,7 @@ export class NativeSessionManager {
     }
   }
 
-  async preview(session: TerminalSession, lines = 42): Promise<string> {
+  async preview(session: TerminalSession, lines = 500): Promise<string> {
     const entry = this.sessions.get(session.id);
     if (!entry) {
       return "";
