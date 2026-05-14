@@ -66,12 +66,12 @@ export async function killTmuxSession(session: Pick<TerminalSession, "tmuxName">
   await runTmux(["kill-session", "-t", session.tmuxName], 5000);
 }
 
-export async function capturePreview(session: Pick<TerminalSession, "tmuxName">, lines = 42): Promise<string> {
+export async function capturePreview(session: Pick<TerminalSession, "tmuxName">, lines = 500): Promise<string> {
   if (!(await hasSession(session.tmuxName))) {
     return "";
   }
 
-  const start = `-${Math.max(5, Math.min(lines, 200))}`;
+  const start = `-${Math.max(5, Math.min(lines, 1000))}`;
   const result = await runTmux(["capture-pane", "-p", "-J", "-S", start, "-t", session.tmuxName], 5000);
   return result.stdout.replace(/\s+$/g, "");
 }
