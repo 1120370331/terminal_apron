@@ -32,6 +32,7 @@ import {
   killZellijSession,
   sendZellijInput,
   zellijHealth,
+  zellijPreviewSize,
   zellijRuntimeInfo
 } from "./zellij.js";
 import { registerTerminalSockets } from "./terminalSocket.js";
@@ -245,13 +246,14 @@ app.post("/api/sessions/:id/input", async (req, res) => {
   }
 
   await sendSessionInput(session, data, enter !== false);
-  const previewText = await captureSessionPreview(session, parsePreviewLines(req.body?.lines), false).catch(() => "");
+  const previewLines = parsePreviewLines(req.body?.lines);
+  const previewText = await captureSessionPreview(session, previewLines, false).catch(() => "");
   const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.body?.maxChars));
   res.json({
     ok: true,
     runtime: await getRuntime(session),
     preview: compactPreview,
-    grid: await renderPreviewGrid(compactPreview).catch(() => undefined)
+    grid: await renderSessionPreviewGrid(session, compactPreview, previewLines, false).catch(() => undefined)
   });
 });
 
@@ -294,16 +296,14 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
     res.status(404).json({ error: "session not found" });
     return;
   }
-  const previewText = await captureSessionPreview(
-    session,
-    parsePreviewLines(req.query.lines),
-    parsePreviewFull(req.query.full)
-  ).catch(() => "");
+  const previewLines = parsePreviewLines(req.query.lines);
+  const previewFull = parsePreviewFull(req.query.full);
+  const previewText = await captureSessionPreview(session, previewLines, previewFull).catch(() => "");
   const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.query.maxChars));
   res.json({
     sessionId: session.id,
     text: compactPreview,
-    grid: await renderPreviewGrid(compactPreview).catch(() => undefined),
+    grid: await renderSessionPreviewGrid(session, compactPreview, previewLines, previewFull).catch(() => undefined),
     capturedAt: new Date().toISOString()
   });
 });
@@ -364,6 +364,27 @@ async function captureSessionPreview(session: TerminalSession, lines = 500, full
     return captureZellijPreview(session, lines, full);
   }
   return nativeSessions.preview(session, lines);
+}
+
+async function renderSessionPreviewGrid(
+  session: TerminalSession,
+  previewText: string,
+  lines: number,
+  full: boolean
+) {
+  const backend = await resolveBackend(session);
+  if (backend === "zellij") {
+    const size = await zellijPreviewSize(session).catch(() => undefined);
+    if (size) {
+      return renderPreviewGrid(previewText, {
+        cols: size.cols,
+        rows: full ? lines : size.rows,
+        preserveViewport: true,
+        padRows: !full
+      });
+    }
+  }
+  return renderPreviewGrid(previewText);
 }
 
 async function killSession(session: TerminalSession) {

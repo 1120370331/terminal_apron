@@ -292,6 +292,14 @@ select {
   background: var(--hover-bg);
 }
 
+.primary-button:disabled,
+.secondary-button:disabled,
+.toggle:disabled,
+.icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
 .icon-button.danger {
   color: var(--danger);
 }
@@ -338,6 +346,16 @@ select {
 
 .session-grid {
   margin-top: 14px;
+}
+
+.mobile-session-list {
+  display: grid;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.mobile-session-item {
+  min-width: 0;
 }
 
 .system-monitor {
@@ -569,7 +587,7 @@ select {
 
 .terminal-grid-preview {
   line-height: 0;
-  overflow-x: hidden;
+  overflow-x: auto;
 }
 
 .terminal-preview-canvas {
@@ -967,7 +985,7 @@ select {
 
 @media (max-width: 720px) {
   .app-shell {
-    padding: 10px;
+    padding: 8px;
   }
 
   .topbar,
@@ -982,6 +1000,27 @@ select {
     width: 100%;
   }
 
+  .topbar-actions {
+    flex-wrap: wrap;
+  }
+
+  .desktop-only-action {
+    display: none;
+  }
+
+  .toolbar {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .toolbar > *,
+  .toolbar select,
+  .searchbox {
+    width: 100%;
+    min-width: 0;
+  }
+
   .terminal-actions {
     flex-wrap: wrap;
   }
@@ -994,6 +1033,39 @@ select {
   .session-footer {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .mobile-session-list .session-card {
+    height: auto;
+    min-height: 0;
+  }
+
+  .mobile-session-list .drag-handle {
+    display: none;
+  }
+
+  .mobile-session-list .preview-wrap {
+    flex: 0 0 auto;
+    min-height: 360px;
+    max-height: 58vh;
+  }
+
+  .mobile-session-list .preview {
+    min-height: 360px;
+    max-height: 58vh;
+  }
+
+  .mobile-session-list .terminal-grid-preview {
+    overflow: auto;
+  }
+
+  .quick-input,
+  .card-actions {
+    width: 100%;
+  }
+
+  .card-actions {
+    justify-content: flex-end;
   }
 
   .metric-grid {

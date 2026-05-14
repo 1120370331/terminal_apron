@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { WidthProvider, Responsive, type Layout } from "react-grid-layout";
 import {
   Archive,
@@ -6,6 +6,7 @@ import {
   Boxes,
   Cpu,
   Laptop,
+  LayoutGrid,
   LogOut,
   MemoryStick,
   MonitorUp,
@@ -36,6 +37,9 @@ const SYSTEM_METRICS_REFRESH_MS = 1000;
 const SYSTEM_METRICS_HISTORY_LIMIT = 120;
 const DEFAULT_PREVIEW_LINES = 600;
 const MAX_LIST_PREVIEW_LINES = 1200;
+const MOBILE_QUERY = "(max-width: 720px)";
+const GRID_COLUMNS = 12;
+const CARD_COLUMNS = 4;
 type ThemeMode = "system" | "light" | "dark";
 
 interface PanelSettings {
@@ -96,6 +100,25 @@ function nextThemeMode(mode: ThemeMode): ThemeMode {
     return "light";
   }
   return "system";
+}
+
+function useMediaQuery(query: string): boolean {
+  const getMatches = () => (typeof window === "undefined" ? false : window.matchMedia(query).matches);
+  const [matches, setMatches] = useState(getMatches);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const media = window.matchMedia(query);
+    const updateMatches = () => setMatches(media.matches);
+    updateMatches();
+    media.addEventListener("change", updateMatches);
+    return () => media.removeEventListener("change", updateMatches);
+  }, [query]);
+
+  return matches;
 }
 
 function loadPanelSettings(): PanelSettings {
@@ -215,6 +238,67 @@ function samePreview(previous: SessionPreview | undefined, next: SessionPreview)
   );
 }
 
+function buildSessionLayout(session: TerminalSession, index: number, settings: PanelSettings): Layout {
+  return {
+    i: session.id,
+    x: session.layout?.x ?? (index % 3) * CARD_COLUMNS,
+    y: session.layout?.y ?? Math.floor(index / 3) * settings.defaultCardRows,
+    w: session.layout?.w ?? CARD_COLUMNS,
+    h: Math.max(session.layout?.h ?? settings.defaultCardRows, settings.minCardRows),
+    minW: session.layout?.minW ?? 3,
+    minH: Math.max(session.layout?.minH ?? settings.minCardRows, settings.minCardRows)
+  };
+}
+
+function buildOrganizedLayout(sessions: TerminalSession[], settings: PanelSettings): Layout[] {
+  const cardsPerRow = Math.max(1, Math.floor(GRID_COLUMNS / CARD_COLUMNS));
+  return sessions.map((session, index) => ({
+    i: session.id,
+    x: (index % cardsPerRow) * CARD_COLUMNS,
+    y: Math.floor(index / cardsPerRow) * settings.defaultCardRows,
+    w: CARD_COLUMNS,
+    h: Math.max(settings.defaultCardRows, settings.minCardRows),
+    minW: 3,
+    minH: settings.minCardRows
+  }));
+}
+
+function sameLayoutIds(previous: Layout[], next: Layout[]): boolean {
+  if (previous.length !== next.length) {
+    return false;
+  }
+  return previous.every((item, index) => item.i === next[index]?.i);
+}
+
+function sameLayout(previous: Layout[], next: Layout[]): boolean {
+  if (previous.length !== next.length) {
+    return false;
+  }
+  return previous.every((item, index) => {
+    const nextItem = next[index];
+    return (
+      item.i === nextItem?.i &&
+      item.x === nextItem.x &&
+      item.y === nextItem.y &&
+      item.w === nextItem.w &&
+      item.h === nextItem.h &&
+      item.minW === nextItem.minW &&
+      item.minH === nextItem.minH
+    );
+  });
+}
+
+function layoutToSessionLayout(item: Layout) {
+  return {
+    x: item.x,
+    y: item.y,
+    w: item.w,
+    h: item.h,
+    minW: item.minW,
+    minH: item.minH
+  };
+}
+
 export function App() {
   const initialFilters = useMemo(loadFilterState, []);
   const initialSettings = useMemo(loadPanelSettings, []);
@@ -232,6 +316,10 @@ export function App() {
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
   const [loading, setLoading] = useState(false);
+  const [localLayout, setLocalLayout] = useState<Layout[]>([]);
+  const layoutDirtyRef = useRef(false);
+  const layoutSaveSeqRef = useRef(0);
+  const isMobile = useMediaQuery(MOBILE_QUERY);
 
   const loadSessions = useCallback(async () => {
     try {
@@ -405,44 +493,138 @@ export function App() {
     };
   }, [auth, filtered, settings.maxPreviewCards, settings.previewLines, settings.previewRefreshMs]);
 
-  const layouts = useMemo(
-    () => ({
-      lg: filtered.map((session, index) => ({
-        i: session.id,
-        x: session.layout?.x ?? (index % 3) * 4,
-        y: session.layout?.y ?? Math.floor(index / 3) * 4,
-        w: session.layout?.w ?? 4,
-        h: Math.max(session.layout?.h ?? settings.defaultCardRows, settings.minCardRows),
-        minW: session.layout?.minW ?? 3,
-        minH: Math.max(session.layout?.minH ?? settings.minCardRows, settings.minCardRows)
-      }))
-    }),
+  const desktopLayout = useMemo(
+    () => filtered.map((session, index) => buildSessionLayout(session, index, settings)),
     [filtered, settings.defaultCardRows, settings.minCardRows]
   );
 
+  useEffect(() => {
+    setLocalLayout((current) => {
+      if (layoutDirtyRef.current && sameLayoutIds(current, desktopLayout)) {
+        return current;
+      }
+
+      layoutDirtyRef.current = false;
+      return sameLayout(current, desktopLayout) ? current : desktopLayout;
+    });
+  }, [desktopLayout]);
+
+  const gridLayout = localLayout.length === filtered.length ? localLayout : desktopLayout;
+  const layouts = useMemo(() => ({ lg: gridLayout }), [gridLayout]);
+
   const saveLayout = useCallback(
-    (layout: Layout[]) => {
+    async (layout: Layout[]) => {
+      const saveSeq = ++layoutSaveSeqRef.current;
       const byId = new Map(layout.map((item) => [item.i, item]));
-      void Promise.all(
-        filtered.map((session) => {
-          const item = byId.get(session.id);
-          if (!item) {
-            return Promise.resolve();
-          }
-          return api.updateSession(session.id, {
-            layout: {
-              x: item.x,
-              y: item.y,
-              w: item.w,
-              h: item.h,
-              minW: item.minW,
-              minH: item.minH
+      try {
+        await Promise.all(
+          filtered.map((session) => {
+            const item = byId.get(session.id);
+            if (!item) {
+              return Promise.resolve();
             }
-          });
-        })
-      ).then(loadSessions);
+            return api.updateSession(session.id, {
+              layout: layoutToSessionLayout(item)
+            });
+          })
+        );
+        if (saveSeq !== layoutSaveSeqRef.current) {
+          return;
+        }
+        setSessions((current) =>
+          current.map((session) => {
+            const item = byId.get(session.id);
+            return item ? { ...session, layout: layoutToSessionLayout(item) } : session;
+          })
+        );
+        layoutDirtyRef.current = false;
+      } catch (error) {
+        console.error("Failed to save terminal layout", error);
+      }
     },
-    [filtered, loadSessions]
+    [filtered]
+  );
+
+  const handleLayoutMove = useCallback(
+    (layout: Layout[]) => {
+      if (isMobile) {
+        return;
+      }
+      layoutDirtyRef.current = true;
+      setLocalLayout(layout);
+    },
+    [isMobile]
+  );
+
+  const handleLayoutStop = useCallback(
+    (layout: Layout[]) => {
+      if (isMobile) {
+        return;
+      }
+      layoutDirtyRef.current = true;
+      setLocalLayout(layout);
+      void saveLayout(layout);
+    },
+    [isMobile, saveLayout]
+  );
+
+  const organizeLayout = useCallback(() => {
+    if (isMobile) {
+      return;
+    }
+
+    const organized = buildOrganizedLayout(filtered, settings);
+    layoutDirtyRef.current = true;
+    setLocalLayout(organized);
+    void saveLayout(organized);
+  }, [filtered, isMobile, saveLayout, settings]);
+
+  const renderSessionCard = (session: TerminalSession) => (
+    <SessionCard
+      session={session}
+      preview={previews[session.id]}
+      onOpen={() => setActiveTerminal(session)}
+      onEdit={() => setEditorSession(session)}
+      onDuplicate={async () => {
+        await api.duplicateSession(session.id);
+        await loadSessions();
+      }}
+      onQuickInput={async (value) => {
+        const input = { data: value, enter: true, submitKey: "enter" as const };
+        const result = await api.sendInput(session.id, input);
+        if (result.preview !== undefined) {
+          setPreviews((current) => ({
+            ...current,
+            [session.id]: {
+              ...emptyPreview(session.id),
+              text: result.preview || current[session.id]?.text || "",
+              grid: result.grid
+            }
+          }));
+        }
+        await loadSessions();
+        window.setTimeout(() => {
+          void api
+            .preview(session.id, settings.previewLines)
+            .then((preview) => setPreviews((current) => ({ ...current, [session.id]: preview })))
+            .catch(() => undefined);
+        }, 900);
+      }}
+      onArchive={async () => {
+        await api.archiveSession(session.id);
+        await loadSessions();
+      }}
+      onRestore={async () => {
+        await api.restoreSession(session.id);
+        await loadSessions();
+      }}
+      onKill={async () => {
+        if (window.confirm(`Stop ${session.name} terminal session?`)) {
+          await api.killSession(session.id);
+          await loadSessions();
+        }
+      }}
+    />
   );
 
   const refresh = async () => {
@@ -492,7 +674,7 @@ export function App() {
           >
             <ThemeModeIcon mode={settings.themeMode} />
           </button>
-          <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} title="配置">
+          <button className="icon-button desktop-only-action" type="button" onClick={() => setSettingsOpen(true)} title="配置">
             <Settings size={18} />
           </button>
           <button className="icon-button" type="button" onClick={refresh} title="刷新">
@@ -535,7 +717,17 @@ export function App() {
           <Archive size={16} />
           归档
         </button>
-        <label className="density">
+        <button
+          className="secondary-button desktop-only-action"
+          type="button"
+          onClick={organizeLayout}
+          disabled={filtered.length === 0}
+          title="一键整理当前列表"
+        >
+          <LayoutGrid size={16} />
+          整理
+        </button>
+        <label className="density desktop-only-action">
           <SlidersHorizontal size={16} />
           <input
             type="range"
@@ -563,67 +755,32 @@ export function App() {
             新建 terminal
           </button>
         </section>
+      ) : isMobile ? (
+        <section className="mobile-session-list" aria-label="terminal sessions">
+          {filtered.map((session) => (
+            <div className="mobile-session-item" key={session.id}>
+              {renderSessionCard(session)}
+            </div>
+          ))}
+        </section>
       ) : (
         <ResponsiveGrid
           className="session-grid"
           layouts={layouts}
-          breakpoints={{ lg: 1200, md: 960, sm: 720, xs: 480, xxs: 0 }}
-          cols={{ lg: 12, md: 10, sm: 6, xs: 4, xxs: 2 }}
+          breakpoints={{ lg: 0 }}
+          cols={{ lg: GRID_COLUMNS }}
           rowHeight={settings.rowHeight}
           margin={[14, 14]}
+          compactType={null}
           draggableHandle=".drag-handle"
-          onDragStop={saveLayout}
-          onResizeStop={saveLayout}
+          onDrag={handleLayoutMove}
+          onResize={handleLayoutMove}
+          onDragStop={handleLayoutStop}
+          onResizeStop={handleLayoutStop}
         >
           {filtered.map((session) => (
             <div key={session.id}>
-              <SessionCard
-                session={session}
-                preview={previews[session.id]}
-                onOpen={() => setActiveTerminal(session)}
-                onEdit={() => setEditorSession(session)}
-                onDuplicate={async () => {
-                  await api.duplicateSession(session.id);
-                  await loadSessions();
-                }}
-                onQuickInput={async (value) => {
-                  const input = { data: value, enter: true, submitKey: "enter" as const };
-                  const result = await api.sendInput(session.id, input);
-                  if (result.preview !== undefined) {
-                    setPreviews((current) => ({
-                      ...current,
-                      [session.id]: {
-                        ...emptyPreview(session.id),
-                        text: result.preview || current[session.id]?.text || "",
-                        grid: result.grid
-                      }
-                    }));
-                  }
-                  await loadSessions();
-                  window.setTimeout(() => {
-                    void api
-                      .preview(session.id, settings.previewLines)
-                      .then((preview) =>
-                        setPreviews((current) => ({ ...current, [session.id]: preview }))
-                      )
-                      .catch(() => undefined);
-                  }, 900);
-                }}
-                onArchive={async () => {
-                  await api.archiveSession(session.id);
-                  await loadSessions();
-                }}
-                onRestore={async () => {
-                  await api.restoreSession(session.id);
-                  await loadSessions();
-                }}
-                onKill={async () => {
-                  if (window.confirm(`停止 ${session.name} 的 terminal 会话？`)) {
-                    await api.killSession(session.id);
-                    await loadSessions();
-                  }
-                }}
-              />
+              {renderSessionCard(session)}
             </div>
           ))}
         </ResponsiveGrid>

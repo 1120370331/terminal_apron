@@ -2,10 +2,11 @@ import Headless from "@xterm/headless";
 import type { IBufferCell, Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { TerminalPreviewGrid, TerminalPreviewRow, TerminalPreviewSegment } from "../shared/types.js";
 
-const PREVIEW_MIN_COLS = 80;
-const PREVIEW_MAX_COLS = 220;
-const PREVIEW_RENDER_MAX_COLS = 120;
-const PREVIEW_ROWS = 360;
+const PREVIEW_MIN_COLS = 20;
+const PREVIEW_DEFAULT_COLS = 120;
+const PREVIEW_MAX_COLS = 600;
+const PREVIEW_DEFAULT_ROWS = 80;
+const PREVIEW_MAX_ROWS = 1200;
 const ANSI_PATTERN = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)|\u001b\[[0-?]*[ -/]*[@-~]/g;
 const PALETTE = [
   "#2e3436",
@@ -26,23 +27,38 @@ const PALETTE = [
   "#eeeeec"
 ];
 
-export async function renderPreviewGrid(data: string): Promise<TerminalPreviewGrid | undefined> {
+interface RenderPreviewGridOptions {
+  cols?: number;
+  rows?: number;
+  preserveViewport?: boolean;
+  padRows?: boolean;
+}
+
+export async function renderPreviewGrid(
+  data: string,
+  options: RenderPreviewGridOptions = {}
+): Promise<TerminalPreviewGrid | undefined> {
   if (!data) {
     return undefined;
   }
 
-  const cols = detectPreviewColumns(data);
+  const cols = clampNumber(options.cols, detectPreviewColumns(data), PREVIEW_MIN_COLS, PREVIEW_MAX_COLS);
+  const rowsToKeep = clampNumber(options.rows, PREVIEW_DEFAULT_ROWS, 10, PREVIEW_MAX_ROWS);
+  if (options.preserveViewport) {
+    return renderDumpScreenGrid(data, cols, rowsToKeep, Boolean(options.padRows));
+  }
+
   const screen = new Headless.Terminal({
     allowProposedApi: true,
     cols,
-    rows: PREVIEW_ROWS,
-    scrollback: PREVIEW_ROWS
+    rows: rowsToKeep,
+    scrollback: rowsToKeep
   });
 
   try {
     await writeHeadless(screen, data);
     const buffer = screen.buffer.active;
-    const start = Math.max(0, buffer.length - PREVIEW_ROWS);
+    const start = Math.max(0, buffer.length - rowsToKeep);
     const rows: TerminalPreviewRow[] = [];
     const cell = buffer.getNullCell();
 
@@ -54,23 +70,76 @@ export async function renderPreviewGrid(data: string): Promise<TerminalPreviewGr
       rows.push(renderLine(line, cell));
     }
 
-    while (rows.length && isEmptyRow(rows[0])) {
-      rows.shift();
+    if (!options.preserveViewport) {
+      while (rows.length && isEmptyRow(rows[0])) {
+        rows.shift();
+      }
+      while (rows.length && isEmptyRow(rows[rows.length - 1])) {
+        rows.pop();
+      }
     }
-    while (rows.length && isEmptyRow(rows[rows.length - 1])) {
-      rows.pop();
-    }
-
-    const contentCols = rows.reduce((max, row) => Math.max(max, rowColumns(row)), 0);
-    const renderCols = Math.max(PREVIEW_MIN_COLS, Math.min(PREVIEW_RENDER_MAX_COLS, contentCols || cols, cols));
 
     return {
-      cols: renderCols,
-      rows: rows.map((row) => clipRow(row, renderCols))
+      cols,
+      rows
     };
   } finally {
     screen.dispose();
   }
+}
+
+function renderDumpScreenGrid(data: string, cols: number, rowsToKeep: number, padRows: boolean): TerminalPreviewGrid {
+  let rawRows = data.split(/\r?\n/);
+  if (rawRows.length > rowsToKeep) {
+    rawRows = rawRows.slice(-rowsToKeep);
+  }
+  while (padRows && rawRows.length < rowsToKeep) {
+    rawRows.push("");
+  }
+
+  return {
+    cols,
+    rows: rawRows.map((line) => ({
+      segments: trimTrailingDefaultSpaces(parseAnsiLine(line))
+    }))
+  };
+}
+
+function parseAnsiLine(line: string): TerminalPreviewSegment[] {
+  const segments: TerminalPreviewSegment[] = [];
+  let style: Omit<TerminalPreviewSegment, "text" | "cols"> = {};
+  let cursor = 0;
+
+  const pushText = (text: string) => {
+    if (!text) {
+      return;
+    }
+    const segment = {
+      text,
+      cols: visibleColumns(text),
+      ...style
+    };
+    const previous = segments[segments.length - 1];
+    if (previous && segmentKey(previous) === segmentKey(segment)) {
+      previous.text += segment.text;
+      previous.cols += segment.cols;
+    } else {
+      segments.push(segment);
+    }
+  };
+
+  for (const match of line.matchAll(ANSI_PATTERN)) {
+    const index = match.index ?? 0;
+    pushText(line.slice(cursor, index));
+    const sequence = match[0];
+    if (sequence.startsWith("\u001b[") && sequence.endsWith("m")) {
+      style = applySgr(style, sequence);
+    }
+    cursor = index + sequence.length;
+  }
+
+  pushText(line.slice(cursor));
+  return segments;
 }
 
 function renderLine(line: { length: number; getCell: (index: number, cell?: IBufferCell) => IBufferCell | undefined }, cell: IBufferCell): TerminalPreviewRow {
@@ -100,7 +169,7 @@ function renderLine(line: { length: number; getCell: (index: number, cell?: IBuf
   }
 
   return {
-    segments: lastNonEmptySegment >= 0 ? trimDefaultPadding(segments.slice(0, lastNonEmptySegment + 1)) : []
+    segments: lastNonEmptySegment >= 0 ? trimTrailingDefaultSpaces(segments.slice(0, lastNonEmptySegment + 1)) : []
   };
 }
 
@@ -174,22 +243,68 @@ function segmentKey(segment: TerminalPreviewSegment): string {
   ].join("|");
 }
 
-function trimDefaultPadding(segments: TerminalPreviewSegment[]): TerminalPreviewSegment[] {
-  return trimLeadingDefaultSpaces(trimTrailingDefaultSpaces(segments));
-}
+function applySgr(
+  current: Omit<TerminalPreviewSegment, "text" | "cols">,
+  sequence: string
+): Omit<TerminalPreviewSegment, "text" | "cols"> {
+  const next: Omit<TerminalPreviewSegment, "text" | "cols"> = { ...current };
+  const body = sequence.slice(2, -1);
+  const codes = body.length ? body.split(";").map((item) => Number(item || 0)) : [0];
 
-function trimLeadingDefaultSpaces(segments: TerminalPreviewSegment[]): TerminalPreviewSegment[] {
-  const first = segments[0];
-  if (!first || first.bg || first.text.trimStart() === first.text) {
-    return segments;
+  for (let index = 0; index < codes.length; index += 1) {
+    const code = codes[index];
+    if (code === 0) {
+      return {};
+    }
+    if (code === 1) {
+      next.bold = true;
+    } else if (code === 2) {
+      next.dim = true;
+    } else if (code === 3) {
+      next.italic = true;
+    } else if (code === 4) {
+      next.underline = true;
+    } else if (code === 22) {
+      delete next.bold;
+      delete next.dim;
+    } else if (code === 23) {
+      delete next.italic;
+    } else if (code === 24) {
+      delete next.underline;
+    } else if (code >= 30 && code <= 37) {
+      next.fg = PALETTE[code - 30];
+    } else if (code === 39) {
+      delete next.fg;
+    } else if (code >= 40 && code <= 47) {
+      next.bg = PALETTE[code - 40];
+    } else if (code === 49) {
+      delete next.bg;
+    } else if (code >= 90 && code <= 97) {
+      next.fg = PALETTE[8 + code - 90];
+    } else if (code >= 100 && code <= 107) {
+      next.bg = PALETTE[8 + code - 100];
+    } else if ((code === 38 || code === 48) && codes[index + 1] === 5) {
+      const color = ansiPaletteColor(codes[index + 2]);
+      if (color) {
+        if (code === 38) {
+          next.fg = color;
+        } else {
+          next.bg = color;
+        }
+      }
+      index += 2;
+    } else if ((code === 38 || code === 48) && codes[index + 1] === 2) {
+      const color = rgb(clampByte(codes[index + 2]), clampByte(codes[index + 3]), clampByte(codes[index + 4]));
+      if (code === 38) {
+        next.fg = color;
+      } else {
+        next.bg = color;
+      }
+      index += 4;
+    }
   }
 
-  const trimmed = first.text.trimStart();
-  if (!trimmed) {
-    return trimLeadingDefaultSpaces(segments.slice(1));
-  }
-
-  return [{ ...first, text: trimmed, cols: visibleColumns(trimmed) }, ...segments.slice(1)];
+  return next;
 }
 
 function trimTrailingDefaultSpaces(segments: TerminalPreviewSegment[]): TerminalPreviewSegment[] {
@@ -206,46 +321,6 @@ function trimTrailingDefaultSpaces(segments: TerminalPreviewSegment[]): Terminal
   return [...segments.slice(0, -1), { ...last, text: trimmed, cols: visibleColumns(trimmed) }];
 }
 
-function clipRow(row: TerminalPreviewRow, cols: number): TerminalPreviewRow {
-  const segments: TerminalPreviewSegment[] = [];
-  let used = 0;
-  for (const segment of row.segments) {
-    if (used >= cols) {
-      break;
-    }
-    const available = cols - used;
-    if (segment.cols <= available) {
-      segments.push(segment);
-      used += segment.cols;
-      continue;
-    }
-    const text = sliceColumns(segment.text, available);
-    if (text) {
-      segments.push({ ...segment, text, cols: visibleColumns(text) });
-    }
-    break;
-  }
-  return { segments };
-}
-
-function rowColumns(row: TerminalPreviewRow): number {
-  return row.segments.reduce((total, segment) => total + segment.cols, 0);
-}
-
-function sliceColumns(value: string, maxCols: number): string {
-  let output = "";
-  let used = 0;
-  for (const char of Array.from(value)) {
-    const width = charColumns(char);
-    if (used + width > maxCols) {
-      break;
-    }
-    output += char;
-    used += width;
-  }
-  return output;
-}
-
 function visibleColumns(value: string): number {
   return Array.from(value).reduce((count, char) => count + charColumns(char), 0);
 }
@@ -256,7 +331,7 @@ function detectPreviewColumns(value: string): number {
   for (const line of plain.split(/\r?\n/)) {
     maxColumns = Math.max(maxColumns, visibleColumns(line.trimEnd()));
   }
-  return Math.max(PREVIEW_MIN_COLS, Math.min(PREVIEW_MAX_COLS, maxColumns || 120));
+  return Math.max(PREVIEW_MIN_COLS, Math.min(PREVIEW_MAX_COLS, maxColumns || PREVIEW_DEFAULT_COLS));
 }
 
 function charColumns(char: string): number {
@@ -267,6 +342,13 @@ function charColumns(char: string): number {
   return codePoint > 0xff ? 2 : 1;
 }
 
+function clampByte(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(255, Math.floor(value)));
+}
+
 function isEmptyRow(row: TerminalPreviewRow): boolean {
   return row.segments.length === 0 || row.segments.every((segment) => !segment.bg && !segment.text.trim());
 }
@@ -275,4 +357,12 @@ function writeHeadless(screen: HeadlessTerminal, data: string): Promise<void> {
   return new Promise<void>((resolve) => {
     screen.write(data, resolve);
   });
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
 }

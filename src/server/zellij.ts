@@ -20,6 +20,10 @@ interface ZellijPane {
   is_focused?: boolean;
   is_plugin?: boolean;
   exited?: boolean;
+  pane_rows?: number;
+  pane_content_rows?: number;
+  pane_columns?: number;
+  pane_content_columns?: number;
   pane_cwd?: string;
   current_working_directory?: string;
   command?: string | string[] | { name?: string; args?: string[] };
@@ -129,7 +133,7 @@ export async function captureZellijPreview(
   const result = await runZellij(args, {
     timeoutMs: 5000
   }).catch(() => ({ stdout: "", stderr: "" }));
-  const rendered = tailLines(result.stdout.replace(/\s+$/g, ""), Math.max(20, Math.min(lines, config.previewMaxLines)));
+  const rendered = tailRawLines(result.stdout, Math.max(20, Math.min(lines, config.previewMaxLines)));
   return rendered.trim() ? rendered : renderPlainTranscript(await loadZellijTranscript(session.id), lines);
 }
 
@@ -176,11 +180,36 @@ async function captureZellijViewportPreviewFresh(
   session: Pick<TerminalSession, "id" | "tmuxName">,
   lines: number
 ): Promise<string> {
-  const result = await runZellij(["--session", session.tmuxName, "action", "dump-screen", "--ansi"], {
+  const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
+  const args = ["--session", session.tmuxName, "action", "dump-screen", "--ansi"];
+  if (paneId) {
+    args.push("--pane-id", paneId);
+  }
+  const result = await runZellij(args, {
     timeoutMs: 2500
   }).catch(() => ({ stdout: "", stderr: "" }));
-  const rendered = tailLines(result.stdout.replace(/\s+$/g, ""), Math.max(20, Math.min(lines, config.previewMaxLines)));
+  const rendered = result.stdout || "";
   return rendered.trim() ? rendered : renderPlainTranscript(await loadZellijTranscript(session.id), lines);
+}
+
+export async function zellijPreviewSize(
+  session: Pick<TerminalSession, "tmuxName">
+): Promise<{ cols: number; rows: number } | undefined> {
+  if (!(await hasZellijSession(session.tmuxName))) {
+    return undefined;
+  }
+
+  const pane = await activeTerminalPane(session.tmuxName).catch(() => null);
+  if (!pane) {
+    return undefined;
+  }
+
+  const cols = clampSize(pane.pane_content_columns ?? pane.pane_columns, 20, 600);
+  const rows = clampSize(pane.pane_content_rows ?? pane.pane_rows, 10, 300);
+  if (!cols || !rows) {
+    return undefined;
+  }
+  return { cols, rows };
 }
 
 export function appendZellijTranscript(sessionId: string, data: string): Promise<void> {
@@ -337,15 +366,22 @@ function windowlessKill(term: { kill: () => void }): void {
 }
 
 async function activeTerminalPaneId(sessionName: string): Promise<string | null> {
-  const panes = await listZellijPanes(sessionName);
-  const pane = panes.find((item) => !item.is_plugin && (item.focused || item.is_focused)) ??
-    panes.find((item) => !item.is_plugin && !item.exited) ??
-    panes.find((item) => !item.is_plugin);
+  const pane = await activeTerminalPane(sessionName);
   if (!pane) {
     return null;
   }
   const id = pane.pane_id ?? pane.id;
   return typeof id === "number" ? `terminal_${id}` : null;
+}
+
+async function activeTerminalPane(sessionName: string): Promise<ZellijPane | null> {
+  const panes = await listZellijPanes(sessionName);
+  return (
+    panes.find((item) => !item.is_plugin && (item.focused || item.is_focused)) ??
+    panes.find((item) => !item.is_plugin && !item.exited) ??
+    panes.find((item) => !item.is_plugin) ??
+    null
+  );
 }
 
 async function loadZellijTranscript(sessionId: string): Promise<string> {
@@ -422,6 +458,11 @@ function tailLines(value: string, linesToKeep: number): string {
   return lines.slice(-linesToKeep).join("\n").trimEnd();
 }
 
+function tailRawLines(value: string, linesToKeep: number): string {
+  const lines = value.split(/\r?\n/);
+  return lines.slice(-linesToKeep).join("\n");
+}
+
 async function renderPlainTranscript(value: string, lines: number): Promise<string> {
   if (!value) {
     return "";
@@ -472,4 +513,12 @@ function formatCommand(command: ZellijPane["command"]): string {
 
 function quoteCommand(value: string): string {
   return /[\s"'`]/.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value;
+}
+
+function clampSize(value: unknown, min: number, max: number): number | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
 }

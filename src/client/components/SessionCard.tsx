@@ -329,15 +329,8 @@ function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid)
   const cellWidth = Math.max(7, Math.ceil(context.measureText("M").width * 100) / 100);
   const naturalWidth = Math.max(1, grid.cols * cellWidth);
   const naturalHeight = Math.max(lineHeight, grid.rows.length * lineHeight);
-  const parent = canvas.parentElement;
-  const parentStyle = parent ? window.getComputedStyle(parent) : null;
-  const horizontalPadding = parentStyle
-    ? Number.parseFloat(parentStyle.paddingLeft || "0") + Number.parseFloat(parentStyle.paddingRight || "0")
-    : 0;
-  const availableWidth = parent ? Math.max(1, parent.clientWidth - horizontalPadding) : naturalWidth;
-  const scale = Math.min(1, availableWidth / naturalWidth);
-  const width = Math.max(1, Math.floor(naturalWidth * scale));
-  const height = Math.max(lineHeight, Math.ceil(naturalHeight * scale));
+  const width = naturalWidth;
+  const height = naturalHeight;
   const dpr = window.devicePixelRatio || 1;
 
   canvas.width = Math.ceil(width * dpr);
@@ -345,7 +338,7 @@ function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid)
   canvas.style.width = `${width}px`;
   canvas.style.height = `${height}px`;
 
-  context.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
   context.fillStyle = "#111614";
   context.fillRect(0, 0, naturalWidth, naturalHeight);
 
