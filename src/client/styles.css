@@ -360,7 +360,7 @@ select {
 
 .preview {
   flex: 1;
-  min-height: 160px;
+  min-height: 500px;
   margin: 0 10px;
   padding: 10px;
   overflow: auto;
