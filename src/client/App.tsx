@@ -19,17 +19,58 @@ import { SessionEditor } from "./components/SessionEditor";
 import { TerminalDock } from "./components/TerminalDock";
 
 const ResponsiveGrid = WidthProvider(Responsive);
+const FILTER_STATE_KEY = "terminal-web-monitor.filters.v1";
+
+interface FilterState {
+  query: string;
+  groupFilter: string;
+  tagFilter: string;
+  showArchived: boolean;
+}
+
+function loadFilterState(): FilterState {
+  if (typeof window === "undefined") {
+    return {
+      query: "",
+      groupFilter: "all",
+      tagFilter: "all",
+      showArchived: false
+    };
+  }
+
+  try {
+    const stored = window.localStorage.getItem(FILTER_STATE_KEY);
+    if (!stored) {
+      throw new Error("missing stored filters");
+    }
+    const parsed = JSON.parse(stored) as Partial<FilterState>;
+    return {
+      query: typeof parsed.query === "string" ? parsed.query : "",
+      groupFilter: typeof parsed.groupFilter === "string" ? parsed.groupFilter : "all",
+      tagFilter: typeof parsed.tagFilter === "string" ? parsed.tagFilter : "all",
+      showArchived: typeof parsed.showArchived === "boolean" ? parsed.showArchived : false
+    };
+  } catch {
+    return {
+      query: "",
+      groupFilter: "all",
+      tagFilter: "all",
+      showArchived: false
+    };
+  }
+}
 
 export function App() {
+  const initialFilters = useMemo(loadFilterState, []);
   const [auth, setAuth] = useState<AuthUser | null | undefined>(undefined);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const [health, setHealth] = useState<HealthStatus | null>(null);
-  const [query, setQuery] = useState("");
-  const [groupFilter, setGroupFilter] = useState("all");
-  const [tagFilter, setTagFilter] = useState("all");
-  const [showArchived, setShowArchived] = useState(false);
-  const [rowHeight, setRowHeight] = useState(72);
+  const [query, setQuery] = useState(initialFilters.query);
+  const [groupFilter, setGroupFilter] = useState(initialFilters.groupFilter);
+  const [tagFilter, setTagFilter] = useState(initialFilters.tagFilter);
+  const [showArchived, setShowArchived] = useState(initialFilters.showArchived);
+  const [rowHeight, setRowHeight] = useState(88);
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
   const [loading, setLoading] = useState(false);
@@ -48,6 +89,18 @@ export function App() {
     void api.me().then(setAuth).catch(() => setAuth(null));
     void api.health().then(setHealth).catch(() => setHealth(null));
   }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      FILTER_STATE_KEY,
+      JSON.stringify({
+        query,
+        groupFilter,
+        tagFilter,
+        showArchived
+      })
+    );
+  }, [groupFilter, query, showArchived, tagFilter]);
 
   useEffect(() => {
     if (!auth) {
@@ -122,9 +175,9 @@ export function App() {
         x: session.layout?.x ?? (index % 3) * 4,
         y: session.layout?.y ?? Math.floor(index / 3) * 4,
         w: session.layout?.w ?? 4,
-        h: session.layout?.h ?? 4,
+        h: session.layout?.h ?? 5,
         minW: session.layout?.minW ?? 3,
-        minH: session.layout?.minH ?? 3
+        minH: session.layout?.minH ?? 4
       }))
     }),
     [filtered]
@@ -233,8 +286,8 @@ export function App() {
           <SlidersHorizontal size={16} />
           <input
             type="range"
-            min="56"
-            max="96"
+            min="72"
+            max="132"
             step="4"
             value={rowHeight}
             onChange={(event) => setRowHeight(Number(event.target.value))}
@@ -279,7 +332,10 @@ export function App() {
                   await loadSessions();
                 }}
                 onQuickInput={async (value) => {
-                  const result = await api.sendInput(session.id, { data: value, enter: true });
+                  const result = await api.sendInput(session.id, {
+                    data: `${value}\u001b[13u`,
+                    enter: false
+                  });
                   if (result.preview !== undefined) {
                     setPreviews((current) => ({ ...current, [session.id]: result.preview || current[session.id] || "" }));
                   }
