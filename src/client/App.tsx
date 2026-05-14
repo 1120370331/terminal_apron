@@ -20,6 +20,9 @@ import { TerminalDock } from "./components/TerminalDock";
 
 const ResponsiveGrid = WidthProvider(Responsive);
 const FILTER_STATE_KEY = "terminal-web-monitor.filters.v1";
+const DEFAULT_ROW_HEIGHT = 100;
+const DEFAULT_CARD_ROWS = 7;
+const MIN_CARD_ROWS = 7;
 
 interface FilterState {
   query: string;
@@ -70,7 +73,7 @@ export function App() {
   const [groupFilter, setGroupFilter] = useState(initialFilters.groupFilter);
   const [tagFilter, setTagFilter] = useState(initialFilters.tagFilter);
   const [showArchived, setShowArchived] = useState(initialFilters.showArchived);
-  const [rowHeight, setRowHeight] = useState(88);
+  const [rowHeight, setRowHeight] = useState(DEFAULT_ROW_HEIGHT);
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
   const [loading, setLoading] = useState(false);
@@ -175,9 +178,9 @@ export function App() {
         x: session.layout?.x ?? (index % 3) * 4,
         y: session.layout?.y ?? Math.floor(index / 3) * 4,
         w: session.layout?.w ?? 4,
-        h: session.layout?.h ?? 5,
+        h: Math.max(session.layout?.h ?? DEFAULT_CARD_ROWS, MIN_CARD_ROWS),
         minW: session.layout?.minW ?? 3,
-        minH: session.layout?.minH ?? 4
+        minH: Math.max(session.layout?.minH ?? MIN_CARD_ROWS, MIN_CARD_ROWS)
       }))
     }),
     [filtered]
@@ -286,8 +289,8 @@ export function App() {
           <SlidersHorizontal size={16} />
           <input
             type="range"
-            min="72"
-            max="132"
+            min="100"
+            max="180"
             step="4"
             value={rowHeight}
             onChange={(event) => setRowHeight(Number(event.target.value))}
