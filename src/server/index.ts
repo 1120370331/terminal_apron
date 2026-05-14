@@ -38,7 +38,7 @@ import { registerTerminalSockets } from "./terminalSocket.js";
 import { nodePtyHealth } from "./pty.js";
 import { backendHealth, resolveBackend } from "./backend.js";
 import { NativeSessionManager } from "./nativeSessions.js";
-import type { CreateSessionInput, TerminalSession, UpdateSessionInput } from "../shared/types.js";
+import type { CreateSessionInput, SystemMetrics, TerminalSession, UpdateSessionInput } from "../shared/types.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -129,6 +129,10 @@ app.get("/api/health", async (_req, res) => {
 });
 
 app.use("/api", requireAuth);
+
+app.get("/api/system/metrics", (_req, res) => {
+  res.json(readSystemMetrics());
+});
 
 app.get("/api/sessions", async (req, res) => {
   const includeArchived = req.query.archived === "true";
@@ -415,4 +419,68 @@ function parsePreviewLines(value: unknown): number {
     return 500;
   }
   return Math.max(20, Math.min(config.previewMaxLines, Math.floor(parsed)));
+}
+
+interface CpuSnapshot {
+  idle: number;
+  total: number;
+}
+
+let previousCpuSnapshot: CpuSnapshot | null = null;
+
+function readSystemMetrics(): SystemMetrics {
+  const cpus = os.cpus();
+  const currentCpu = readCpuSnapshot(cpus);
+  const previousCpu = previousCpuSnapshot;
+  previousCpuSnapshot = currentCpu;
+
+  const idleDelta = previousCpu ? currentCpu.idle - previousCpu.idle : 0;
+  const totalDelta = previousCpu ? currentCpu.total - previousCpu.total : 0;
+  const usagePercent =
+    totalDelta > 0 ? clampPercent((1 - Math.max(0, idleDelta) / Math.max(1, totalDelta)) * 100) : 0;
+  const totalMemory = os.totalmem();
+  const freeMemory = os.freemem();
+  const usedMemory = Math.max(0, totalMemory - freeMemory);
+  const processMemory = process.memoryUsage();
+
+  return {
+    capturedAt: new Date().toISOString(),
+    uptimeSec: os.uptime(),
+    cpu: {
+      usagePercent,
+      cores: cpus.length,
+      model: cpus[0]?.model ?? process.arch,
+      loadAverage: os.loadavg()
+    },
+    memory: {
+      totalBytes: totalMemory,
+      freeBytes: freeMemory,
+      usedBytes: usedMemory,
+      usagePercent: totalMemory > 0 ? clampPercent((usedMemory / totalMemory) * 100) : 0,
+      processRssBytes: processMemory.rss,
+      processHeapUsedBytes: processMemory.heapUsed,
+      processHeapTotalBytes: processMemory.heapTotal
+    }
+  };
+}
+
+function readCpuSnapshot(cpus: os.CpuInfo[]): CpuSnapshot {
+  return cpus.reduce<CpuSnapshot>(
+    (snapshot, cpu) => {
+      const times = cpu.times;
+      const total = times.user + times.nice + times.sys + times.idle + times.irq;
+      return {
+        idle: snapshot.idle + times.idle,
+        total: snapshot.total + total
+      };
+    },
+    { idle: 0, total: 0 }
+  );
+}
+
+function clampPercent(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, Math.round(value * 10) / 10));
 }

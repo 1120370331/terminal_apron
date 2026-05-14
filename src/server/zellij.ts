@@ -28,6 +28,8 @@ interface ZellijPane {
   title?: string;
 }
 
+const ZELLIJ_SINGLE_PANE_LAYOUT = ["layout {", "    pane", "}"].join("\n");
+
 function runZellij(args: string[], options: RunOptions = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = execFile(
@@ -174,7 +176,7 @@ export async function zellijRuntimeInfo(session: TerminalSession): Promise<Sessi
 }
 
 export function zellijAttachArgs(session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">): string[] {
-  return ["--layout-string", "layout { pane }", "attach", "--create", session.tmuxName, ...zellijOptions(session)];
+  return ["--layout-string", ZELLIJ_SINGLE_PANE_LAYOUT, "attach", "--create", session.tmuxName, ...zellijOptions(session)];
 }
 
 export function zellijAttachCommand(session: Pick<TerminalSession, "tmuxName">): string {

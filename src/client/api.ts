@@ -4,6 +4,7 @@ import type {
   CreateSessionInput,
   HealthStatus,
   SessionPreview,
+  SystemMetrics,
   TerminalSession,
   UpdateSessionInput
 } from "../shared/types";
@@ -47,6 +48,7 @@ export const api = {
   authConfig: () => request<AuthConfig>("/api/auth/config"),
   me: () => request<AuthUser>("/api/me"),
   health: () => request<HealthStatus>("/api/health"),
+  systemMetrics: () => request<SystemMetrics>("/api/system/metrics"),
   login: (username: string, password: string) =>
     request<AuthUser>("/api/auth/login", {
       method: "POST",

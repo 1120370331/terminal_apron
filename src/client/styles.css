@@ -2,20 +2,76 @@
   color-scheme: light;
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #f4f6f2;
-  color: #1f2522;
+  background: var(--page-bg);
+  color: var(--text);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  --page-bg: #f4f6f2;
+  --page-gradient: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0) 220px);
+  --panel: rgba(255, 255, 255, 0.94);
   --surface: #ffffff;
   --surface-soft: #f8faf7;
   --border: #dce2da;
+  --text: #1f2522;
+  --text-strong: #27302b;
   --text-muted: #63706a;
   --text-faint: #85918b;
   --accent: #2f80ed;
+  --accent-soft: #eaf3ff;
   --success: #00a676;
   --warning: #b7791f;
   --danger: #d64545;
   --shadow: 0 14px 34px rgba(27, 36, 30, 0.12);
+  --card-shadow: 0 8px 22px rgba(30, 36, 32, 0.08);
+  --control-text: #1f2522;
+  --button-text: #2e3833;
+  --secondary-text: #27302b;
+  --hover-bg: #f7faf7;
+  --hover-border: #b6c1bb;
+  --path-text: #47534d;
+  --tag-bg: #f2f7f5;
+  --tag-border: #d9e2df;
+  --tag-text: #53615a;
+  --modal-backdrop: rgba(24, 30, 27, 0.42);
+  --form-error-bg: #fff1f1;
+  --form-error-border: #f1b9b9;
+  --form-error-text: #a73535;
+  --metric-chart-grid: rgba(99, 112, 106, 0.16);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --page-bg: #101412;
+  --page-gradient: linear-gradient(180deg, rgba(53, 65, 58, 0.38), rgba(16, 20, 18, 0) 240px);
+  --panel: rgba(24, 31, 27, 0.94);
+  --surface: #18201c;
+  --surface-soft: #121916;
+  --border: #2d3933;
+  --text: #e7eee9;
+  --text-strong: #f3f7f4;
+  --text-muted: #a8b6ae;
+  --text-faint: #738079;
+  --accent: #65a8ff;
+  --accent-soft: #13283f;
+  --success: #28c78e;
+  --warning: #e0ad55;
+  --danger: #ff6b6b;
+  --shadow: 0 18px 38px rgba(0, 0, 0, 0.34);
+  --card-shadow: 0 10px 24px rgba(0, 0, 0, 0.26);
+  --control-text: #edf3ef;
+  --button-text: #e4ece7;
+  --secondary-text: #e4ece7;
+  --hover-bg: #202a25;
+  --hover-border: #435149;
+  --path-text: #b7c3bd;
+  --tag-bg: #17231e;
+  --tag-border: #304038;
+  --tag-text: #b8c6bf;
+  --modal-backdrop: rgba(0, 0, 0, 0.58);
+  --form-error-bg: #3a1919;
+  --form-error-border: #7d3535;
+  --form-error-text: #ffb5b5;
+  --metric-chart-grid: rgba(168, 182, 174, 0.16);
 }
 
 * {
@@ -26,9 +82,8 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0) 220px),
-    #f4f6f2;
+  background: var(--page-gradient), var(--page-bg);
+  color: var(--text);
 }
 
 button,
@@ -60,7 +115,7 @@ button {
 .modal-panel,
 .login-panel {
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.94);
+  background: var(--panel);
 }
 
 .topbar {
@@ -150,7 +205,7 @@ select,
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
-  color: #1f2522;
+  color: var(--control-text);
 }
 
 select {
@@ -207,13 +262,13 @@ select {
   padding: 0 13px;
   border: 1px solid var(--border);
   background: var(--surface);
-  color: #27302b;
+  color: var(--secondary-text);
 }
 
 .toggle.active {
   border-color: #a7c7f4;
-  background: #eaf3ff;
-  color: #1f6fd2;
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .icon-button {
@@ -221,7 +276,7 @@ select {
   height: 40px;
   border: 1px solid var(--border);
   background: var(--surface);
-  color: #2e3833;
+  color: var(--button-text);
 }
 
 .icon-button.small {
@@ -233,8 +288,8 @@ select {
 .icon-button:hover,
 .secondary-button:hover,
 .toggle:hover {
-  border-color: #b6c1bb;
-  background: #f7faf7;
+  border-color: var(--hover-border);
+  background: var(--hover-bg);
 }
 
 .icon-button.danger {
@@ -269,8 +324,126 @@ select {
   border-color: #f0d7a2;
 }
 
+[data-theme="dark"] .health-pill.ok {
+  color: #8ef0bc;
+  background: #0f2b20;
+  border-color: #1f6848;
+}
+
+[data-theme="dark"] .health-pill.warn {
+  color: #ffd27d;
+  background: #33250d;
+  border-color: #74531d;
+}
+
 .session-grid {
   margin-top: 14px;
+}
+
+.system-monitor {
+  margin-top: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: var(--card-shadow);
+}
+
+.system-monitor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.system-monitor-header h2 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 16px;
+}
+
+.system-monitor-header span,
+.system-monitor-meta,
+.metric-detail {
+  color: var(--text-muted);
+}
+
+.system-monitor-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding: 12px;
+}
+
+.metric-tile {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.metric-heading,
+.metric-icon {
+  display: flex;
+  align-items: center;
+}
+
+.metric-heading {
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.metric-icon {
+  color: var(--accent);
+}
+
+.metric-tile strong {
+  color: var(--text-strong);
+  font-size: 26px;
+  line-height: 1.1;
+}
+
+.metric-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.wave-chart {
+  width: 100%;
+  height: 64px;
+  margin-top: 4px;
+  border-top: 1px solid var(--metric-chart-grid);
+  background:
+    linear-gradient(to right, var(--metric-chart-grid) 1px, transparent 1px) 0 0 / 25% 100%,
+    linear-gradient(to bottom, var(--metric-chart-grid) 1px, transparent 1px) 0 0 / 100% 50%;
+}
+
+.wave-line {
+  fill: none;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.wave-fill {
+  stroke: none;
 }
 
 .session-card {
@@ -281,7 +454,7 @@ select {
   min-height: var(--session-card-min-height, 620px);
   overflow: hidden;
   border-radius: 8px;
-  box-shadow: 0 8px 22px rgba(30, 36, 32, 0.08);
+  box-shadow: var(--card-shadow);
 }
 
 .session-card.archived {
@@ -355,7 +528,7 @@ select {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #47534d;
+  color: var(--path-text);
   font-size: 12px;
 }
 
@@ -435,12 +608,13 @@ select {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-soft);
+  color: var(--control-text);
   outline: 0;
 }
 
 .quick-input input:focus {
   border-color: #a7c7f4;
-  background: #fff;
+  background: var(--surface);
 }
 
 .session-footer {
@@ -464,10 +638,10 @@ select {
   height: 24px;
   padding: 0 7px;
   overflow: hidden;
-  border: 1px solid #d9e2df;
+  border: 1px solid var(--tag-border);
   border-radius: 999px;
-  background: #f2f7f5;
-  color: #53615a;
+  background: var(--tag-bg);
+  color: var(--tag-text);
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -488,7 +662,7 @@ select {
 
 .empty-state h2 {
   margin: 0;
-  color: #27302b;
+  color: var(--text-strong);
   font-size: 18px;
 }
 
@@ -499,7 +673,7 @@ select {
   display: grid;
   place-items: center;
   padding: 20px;
-  background: rgba(24, 30, 27, 0.42);
+  background: var(--modal-backdrop);
 }
 
 .modal-panel {
@@ -535,7 +709,7 @@ select {
 .ssh-login label {
   display: grid;
   gap: 6px;
-  color: #3b4640;
+  color: var(--text-strong);
   font-size: 13px;
   font-weight: 650;
 }
@@ -578,7 +752,7 @@ select {
 .settings-form label {
   display: grid;
   gap: 6px;
-  color: #3b4640;
+  color: var(--text-strong);
   font-size: 13px;
   font-weight: 650;
 }
@@ -631,7 +805,7 @@ select {
 
 .ssh-login-title {
   gap: 7px;
-  color: #34413a;
+  color: var(--text-strong);
   font-weight: 700;
 }
 
@@ -647,10 +821,10 @@ select {
 .form-error {
   margin-top: 12px;
   padding: 10px;
-  border: 1px solid #f1b9b9;
+  border: 1px solid var(--form-error-border);
   border-radius: 8px;
-  background: #fff1f1;
-  color: #a73535;
+  background: var(--form-error-bg);
+  color: var(--form-error-text);
   font-size: 13px;
 }
 
@@ -767,6 +941,10 @@ select {
   border-color: rgba(31, 37, 34, 0.42);
 }
 
+[data-theme="dark"] .react-resizable-handle::after {
+  border-color: rgba(220, 232, 224, 0.42);
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -802,5 +980,9 @@ select {
   .session-footer {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .metric-grid {
+    grid-template-columns: 1fr;
   }
 }

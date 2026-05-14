@@ -113,3 +113,23 @@ export interface HealthStatus {
   };
   dataDir: string;
 }
+
+export interface SystemMetrics {
+  capturedAt: string;
+  uptimeSec: number;
+  cpu: {
+    usagePercent: number;
+    cores: number;
+    model: string;
+    loadAverage: number[];
+  };
+  memory: {
+    totalBytes: number;
+    freeBytes: number;
+    usedBytes: number;
+    usagePercent: number;
+    processRssBytes: number;
+    processHeapUsedBytes: number;
+    processHeapTotalBytes: number;
+  };
+}

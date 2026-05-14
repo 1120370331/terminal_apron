@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { WidthProvider, Responsive, type Layout } from "react-grid-layout";
 import {
   Archive,
+  Activity,
   Boxes,
+  Cpu,
   Laptop,
   LogOut,
+  MemoryStick,
   MonitorUp,
   Moon,
   Plus,
@@ -15,7 +18,7 @@ import {
   SlidersHorizontal,
   Sun
 } from "lucide-react";
-import type { AuthUser, HealthStatus, TerminalSession } from "../shared/types";
+import type { AuthUser, HealthStatus, SystemMetrics, TerminalSession } from "../shared/types";
 import { api, ApiError } from "./api";
 import { Login } from "./components/Login";
 import { SessionCard } from "./components/SessionCard";
@@ -28,6 +31,9 @@ const SETTINGS_STATE_KEY = "terminal-web-monitor.settings.v1";
 const DEFAULT_ROW_HEIGHT = 100;
 const DEFAULT_CARD_ROWS = 7;
 const MIN_CARD_ROWS = 7;
+const SESSION_REFRESH_MS = 1000;
+const SYSTEM_METRICS_REFRESH_MS = 1000;
+const SYSTEM_METRICS_HISTORY_LIMIT = 120;
 type ThemeMode = "system" | "light" | "dark";
 
 interface PanelSettings {
@@ -55,7 +61,7 @@ const DEFAULT_SETTINGS: PanelSettings = {
   minCardRows: MIN_CARD_ROWS,
   previewMinHeight: 500,
   previewLines: 2000,
-  previewRefreshMs: 4500,
+  previewRefreshMs: 1000,
   maxPreviewCards: 24,
   inlineSubmitKey: "enter",
   themeMode: "system"
@@ -156,6 +162,7 @@ export function App() {
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const [health, setHealth] = useState<HealthStatus | null>(null);
+  const [metricsHistory, setMetricsHistory] = useState<SystemMetrics[]>([]);
   const [query, setQuery] = useState(initialFilters.query);
   const [groupFilter, setGroupFilter] = useState(initialFilters.groupFilter);
   const [tagFilter, setTagFilter] = useState(initialFilters.tagFilter);
@@ -222,9 +229,36 @@ export function App() {
     void loadSessions();
     const timer = window.setInterval(() => {
       void loadSessions();
-    }, 5000);
+    }, SESSION_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [auth, loadSessions]);
+
+  useEffect(() => {
+    if (!auth) {
+      return;
+    }
+
+    let cancelled = false;
+    const loadMetrics = async () => {
+      try {
+        const metrics = await api.systemMetrics();
+        if (!cancelled) {
+          setMetricsHistory((current) => [...current.slice(-(SYSTEM_METRICS_HISTORY_LIMIT - 1)), metrics]);
+        }
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401) {
+          setAuth(null);
+        }
+      }
+    };
+
+    void loadMetrics();
+    const timer = window.setInterval(loadMetrics, SYSTEM_METRICS_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [auth]);
 
   const groups = useMemo(
     () => ["all", ...Array.from(new Set(sessions.map((session) => session.group))).sort()],
@@ -463,7 +497,7 @@ export function App() {
                   await loadSessions();
                 }}
                 onQuickInput={async (value) => {
-                  const input = { data: value, enter: true, submitKey: "enter" as const };
+                  const input = { data: value, enter: true, submitKey: settings.inlineSubmitKey };
                   const result = await api.sendInput(session.id, input);
                   if (result.preview !== undefined) {
                     setPreviews((current) => ({ ...current, [session.id]: result.preview || current[session.id] || "" }));
@@ -497,6 +531,8 @@ export function App() {
           ))}
         </ResponsiveGrid>
       )}
+
+      <SystemMonitor history={metricsHistory} />
 
       {editorSession && (
         <SessionEditor
@@ -561,6 +597,14 @@ function SettingsModal({
           </button>
         </header>
         <div className="settings-form">
+          <label>
+            <span>Theme mode</span>
+            <select value={settings.themeMode} onChange={(event) => update("themeMode", parseThemeMode(event.target.value))}>
+              <option value="system">Follow system</option>
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+            </select>
+          </label>
           <label>
             <span>网格行高</span>
             <input
@@ -669,6 +713,141 @@ function SettingsModal({
       </section>
     </div>
   );
+}
+
+function SystemMonitor({ history }: { history: SystemMetrics[] }) {
+  const latest = history[history.length - 1] ?? null;
+  const cpuSamples = history.map((item) => item.cpu.usagePercent);
+  const memorySamples = history.map((item) => item.memory.usagePercent);
+  const processSamples = history.map((item) =>
+    item.memory.processHeapTotalBytes > 0
+      ? (item.memory.processHeapUsedBytes / item.memory.processHeapTotalBytes) * 100
+      : 0
+  );
+
+  return (
+    <section className="system-monitor">
+      <header className="system-monitor-header">
+        <div>
+          <h2>System Monitor</h2>
+          <span>{latest ? `Updated ${new Date(latest.capturedAt).toLocaleTimeString()}` : "Waiting for metrics"}</span>
+        </div>
+        <div className="system-monitor-meta">
+          <Activity size={16} />
+          <span>{latest ? formatUptime(latest.uptimeSec) : "uptime --"}</span>
+        </div>
+      </header>
+      <div className="metric-grid">
+        <MetricTile
+          icon={<Cpu size={18} />}
+          label="CPU"
+          value={latest ? `${formatPercent(latest.cpu.usagePercent)}%` : "--"}
+          detail={latest ? `${latest.cpu.cores} cores · ${latest.cpu.model}` : "No sample yet"}
+          color="#2f80ed"
+          samples={cpuSamples}
+        />
+        <MetricTile
+          icon={<MemoryStick size={18} />}
+          label="Memory"
+          value={latest ? `${formatPercent(latest.memory.usagePercent)}%` : "--"}
+          detail={
+            latest
+              ? `${formatBytes(latest.memory.usedBytes)} / ${formatBytes(latest.memory.totalBytes)}`
+              : "No sample yet"
+          }
+          color="#00a676"
+          samples={memorySamples}
+        />
+        <MetricTile
+          icon={<Activity size={18} />}
+          label="Node Heap"
+          value={latest ? `${formatBytes(latest.memory.processHeapUsedBytes)}` : "--"}
+          detail={latest ? `RSS ${formatBytes(latest.memory.processRssBytes)}` : "No sample yet"}
+          color="#b7791f"
+          samples={processSamples}
+        />
+      </div>
+    </section>
+  );
+}
+
+function MetricTile({
+  icon,
+  label,
+  value,
+  detail,
+  samples,
+  color
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  detail: string;
+  samples: number[];
+  color: string;
+}) {
+  return (
+    <article className="metric-tile">
+      <div className="metric-heading">
+        <span className="metric-icon">{icon}</span>
+        <span>{label}</span>
+      </div>
+      <strong>{value}</strong>
+      <span className="metric-detail" title={detail}>
+        {detail}
+      </span>
+      <WaveChart samples={samples} color={color} />
+    </article>
+  );
+}
+
+function WaveChart({ samples, color }: { samples: number[]; color: string }) {
+  const values = samples.length ? samples : [0];
+  const points = values
+    .map((value, index) => {
+      const x = values.length === 1 ? 100 : (index / (values.length - 1)) * 100;
+      const y = 38 - (Math.max(0, Math.min(100, value)) / 100) * 34;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(" ");
+  const area = `0,40 ${points} 100,40`;
+
+  return (
+    <svg className="wave-chart" viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">
+      <polyline className="wave-fill" points={area} style={{ fill: `${color}22` }} />
+      <polyline className="wave-line" points={points} style={{ stroke: color }} />
+    </svg>
+  );
+}
+
+function formatBytes(value: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let next = Math.max(0, value);
+  let unitIndex = 0;
+  while (next >= 1024 && unitIndex < units.length - 1) {
+    next /= 1024;
+    unitIndex += 1;
+  }
+  const digits = next >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${next.toFixed(digits)} ${units[unitIndex]}`;
+}
+
+function formatPercent(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(value >= 10 ? 0 : 1) : "0";
+}
+
+function formatUptime(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (days > 0) {
+    return `${days}d ${hours}h uptime`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes}m uptime`;
+  }
+  return `${minutes}m uptime`;
 }
 
 function HealthPill({ health }: { health: HealthStatus | null }) {
