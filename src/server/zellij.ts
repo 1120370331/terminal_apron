@@ -310,6 +310,8 @@ function zellijOptions(session: Pick<TerminalSession, "cwd" | "shell">): string[
     String(config.zellijScrollback),
     "--show-startup-tips",
     "false",
+    "--simplified-ui",
+    "true",
     "--pane-frames",
     "false"
   ];

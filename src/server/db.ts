@@ -151,7 +151,7 @@ export class SessionStore {
 
   private async read(): Promise<StoreShape> {
     await this.initDirectoryOnly();
-    const raw = await fs.readFile(this.dbPath, "utf8");
+    const raw = (await fs.readFile(this.dbPath, "utf8")).replace(/^\uFEFF/, "");
     const parsed = JSON.parse(raw) as StoreShape;
     return {
       version: 1,

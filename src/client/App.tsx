@@ -3,14 +3,17 @@ import { WidthProvider, Responsive, type Layout } from "react-grid-layout";
 import {
   Archive,
   Boxes,
+  Laptop,
   LogOut,
   MonitorUp,
+  Moon,
   Plus,
   RefreshCw,
   Search,
   Settings,
   ShieldCheck,
-  SlidersHorizontal
+  SlidersHorizontal,
+  Sun
 } from "lucide-react";
 import type { AuthUser, HealthStatus, TerminalSession } from "../shared/types";
 import { api, ApiError } from "./api";
@@ -25,6 +28,7 @@ const SETTINGS_STATE_KEY = "terminal-web-monitor.settings.v1";
 const DEFAULT_ROW_HEIGHT = 100;
 const DEFAULT_CARD_ROWS = 7;
 const MIN_CARD_ROWS = 7;
+type ThemeMode = "system" | "light" | "dark";
 
 interface PanelSettings {
   rowHeight: number;
@@ -35,6 +39,7 @@ interface PanelSettings {
   previewRefreshMs: number;
   maxPreviewCards: number;
   inlineSubmitKey: "enhanced-enter" | "enter";
+  themeMode: ThemeMode;
 }
 
 interface FilterState {
@@ -52,7 +57,8 @@ const DEFAULT_SETTINGS: PanelSettings = {
   previewLines: 2000,
   previewRefreshMs: 4500,
   maxPreviewCards: 24,
-  inlineSubmitKey: "enter"
+  inlineSubmitKey: "enter",
+  themeMode: "system"
 };
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
@@ -61,6 +67,27 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
     return fallback;
   }
   return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function parseThemeMode(value: unknown): ThemeMode {
+  return value === "light" || value === "dark" || value === "system" ? value : DEFAULT_SETTINGS.themeMode;
+}
+
+function resolveThemeMode(mode: ThemeMode): "light" | "dark" {
+  if (mode !== "system" || typeof window === "undefined") {
+    return mode === "dark" ? "dark" : "light";
+  }
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function nextThemeMode(mode: ThemeMode): ThemeMode {
+  if (mode === "system") {
+    return "dark";
+  }
+  if (mode === "dark") {
+    return "light";
+  }
+  return "system";
 }
 
 function loadPanelSettings(): PanelSettings {
@@ -82,7 +109,8 @@ function loadPanelSettings(): PanelSettings {
       previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, 5000),
       previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000),
       maxPreviewCards: clampNumber(parsed.maxPreviewCards, DEFAULT_SETTINGS.maxPreviewCards, 1, 100),
-      inlineSubmitKey: parsed.inlineSubmitKey === "enhanced-enter" ? "enhanced-enter" : "enter"
+      inlineSubmitKey: parsed.inlineSubmitKey === "enhanced-enter" ? "enhanced-enter" : "enter",
+      themeMode: parseThemeMode(parsed.themeMode)
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -168,6 +196,24 @@ export function App() {
   useEffect(() => {
     window.localStorage.setItem(SETTINGS_STATE_KEY, JSON.stringify(settings));
   }, [settings]);
+
+  useEffect(() => {
+    const applyTheme = () => {
+      const resolved = resolveThemeMode(settings.themeMode);
+      document.documentElement.dataset.theme = resolved;
+      document.documentElement.dataset.themeMode = settings.themeMode;
+      document.documentElement.style.colorScheme = resolved;
+    };
+
+    applyTheme();
+    if (settings.themeMode !== "system") {
+      return;
+    }
+
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    media.addEventListener("change", applyTheme);
+    return () => media.removeEventListener("change", applyTheme);
+  }, [settings.themeMode]);
 
   useEffect(() => {
     if (!auth) {
@@ -314,6 +360,14 @@ export function App() {
         </div>
         <div className="topbar-actions">
           <HealthPill health={health} />
+          <button
+            className="icon-button"
+            type="button"
+            onClick={() => setSettings((current) => ({ ...current, themeMode: nextThemeMode(current.themeMode) }))}
+            title={`Theme: ${settings.themeMode}`}
+          >
+            <ThemeModeIcon mode={settings.themeMode} />
+          </button>
           <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} title="配置">
             <Settings size={18} />
           </button>
@@ -625,4 +679,14 @@ function HealthPill({ health }: { health: HealthStatus | null }) {
       {ok ? health?.backend.default ?? "ready" : "setup"}
     </div>
   );
+}
+
+function ThemeModeIcon({ mode }: { mode: ThemeMode }) {
+  if (mode === "dark") {
+    return <Moon size={18} />;
+  }
+  if (mode === "light") {
+    return <Sun size={18} />;
+  }
+  return <Laptop size={18} />;
 }

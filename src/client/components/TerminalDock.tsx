@@ -15,6 +15,7 @@ export function TerminalDock({ session, onClose }: Props) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<Socket | null>(null);
+  const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const [attachCommand, setAttachCommand] = useState<string | null>(null);
   const [backend, setBackend] = useState(session.runtime?.backend ?? session.backend);
   const [status, setStatus] = useState("connecting");
@@ -43,6 +44,9 @@ export function TerminalDock({ session, onClose }: Props) {
     terminal.loadAddon(fit);
     terminal.open(host);
     fit.fit();
+    terminal.clear();
+    terminal.refresh(0, terminal.rows - 1);
+    sizeRef.current = { cols: terminal.cols, rows: terminal.rows };
 
     const socket = io({
       withCredentials: true,
@@ -59,7 +63,7 @@ export function TerminalDock({ session, onClose }: Props) {
 
     socket.on("connect", () => {
       setStatus("connected");
-      socket.emit("terminal:resize", { cols: terminal.cols, rows: terminal.rows });
+      emitResize(socket, terminal, true);
     });
     socket.on("terminal:ready", (payload: { attachCommand: string | null; backend?: string }) => {
       setAttachCommand(payload.attachCommand);
@@ -85,16 +89,38 @@ export function TerminalDock({ session, onClose }: Props) {
       socket.emit("terminal:input", data);
     });
 
-    const resize = () => {
+    const resize = (force = false) => {
       fit.fit();
-      socket.emit("terminal:resize", { cols: terminal.cols, rows: terminal.rows });
+      emitResize(socket, terminal, force);
+      terminal.refresh(0, Math.max(0, terminal.rows - 1));
     };
-    const observer = new ResizeObserver(resize);
+    const scheduleResize = () => {
+      window.requestAnimationFrame(() => {
+        resize();
+        window.setTimeout(() => resize(true), 80);
+      });
+    };
+    let lastMeasured = "";
+    const checkMeasuredSize = () => {
+      const measured = `${host.clientWidth}x${host.clientHeight}@${window.devicePixelRatio}`;
+      if (measured !== lastMeasured) {
+        lastMeasured = measured;
+        scheduleResize();
+      }
+    };
+    const observer = new ResizeObserver(scheduleResize);
     observer.observe(host);
-    window.setTimeout(resize, 120);
+    window.addEventListener("resize", scheduleResize);
+    window.visualViewport?.addEventListener("resize", scheduleResize);
+    const sizeTimer = window.setInterval(checkMeasuredSize, 500);
+    window.setTimeout(() => resize(true), 120);
+    window.setTimeout(() => resize(true), 350);
 
     return () => {
       observer.disconnect();
+      window.removeEventListener("resize", scheduleResize);
+      window.visualViewport?.removeEventListener("resize", scheduleResize);
+      window.clearInterval(sizeTimer);
       disposable.dispose();
       socket.disconnect();
       terminal.dispose();
@@ -133,4 +159,14 @@ export function TerminalDock({ session, onClose }: Props) {
       <div className="terminal-host" ref={hostRef} />
     </div>
   );
+
+  function emitResize(socket: Socket, terminal: Terminal, force = false) {
+    const next = { cols: terminal.cols, rows: terminal.rows };
+    const previous = sizeRef.current;
+    if (!force && previous?.cols === next.cols && previous?.rows === next.rows) {
+      return;
+    }
+    sizeRef.current = next;
+    socket.emit("terminal:resize", next);
+  }
 }
