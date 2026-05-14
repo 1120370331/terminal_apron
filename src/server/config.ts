@@ -41,6 +41,7 @@ const dataDir = path.resolve(process.env.TWM_DATA_DIR ?? path.join(process.cwd()
 const authorizedKeysFile = expandHome(
   process.env.TWM_AUTHORIZED_KEYS_FILE ?? path.join("~", ".ssh", "authorized_keys")
 );
+const zellijBin = resolveBinaryPath(process.env.TWM_ZELLIJ_BIN ?? "zellij");
 
 const explicitAuthModes = splitModes(process.env.TWM_AUTH_MODE);
 const inferredAuthModes: AuthMethod[] = process.env.TWM_ADMIN_PASSWORD
@@ -54,7 +55,7 @@ export const config = {
   port: Number(process.env.TWM_PORT ?? process.env.PORT ?? 3131),
   dataDir,
   tmuxBin: process.env.TWM_TMUX_BIN ?? "tmux",
-  zellijBin: process.env.TWM_ZELLIJ_BIN ?? "zellij",
+  zellijBin,
   sessionBackend: parseBackend(process.env.TWM_SESSION_BACKEND),
   adminUser: process.env.TWM_ADMIN_USER ?? "admin",
   adminPassword: process.env.TWM_ADMIN_PASSWORD ?? "",
@@ -74,4 +75,12 @@ function parseBackend(value: string | undefined): TerminalBackend {
     return value;
   }
   return "auto";
+}
+
+function resolveBinaryPath(value: string): string {
+  const expanded = expandHome(value.trim() || "zellij");
+  if (path.isAbsolute(expanded) || expanded.startsWith(".") || expanded.includes("/") || expanded.includes("\\")) {
+    return path.resolve(expanded);
+  }
+  return expanded;
 }
