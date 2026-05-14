@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
 import { WidthProvider, Responsive, type Layout } from "react-grid-layout";
 import {
   Archive,
@@ -8,6 +8,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Settings,
   ShieldCheck,
   SlidersHorizontal
 } from "lucide-react";
@@ -20,15 +21,72 @@ import { TerminalDock } from "./components/TerminalDock";
 
 const ResponsiveGrid = WidthProvider(Responsive);
 const FILTER_STATE_KEY = "terminal-web-monitor.filters.v1";
+const SETTINGS_STATE_KEY = "terminal-web-monitor.settings.v1";
 const DEFAULT_ROW_HEIGHT = 100;
 const DEFAULT_CARD_ROWS = 7;
 const MIN_CARD_ROWS = 7;
+
+interface PanelSettings {
+  rowHeight: number;
+  defaultCardRows: number;
+  minCardRows: number;
+  previewMinHeight: number;
+  previewLines: number;
+  previewRefreshMs: number;
+  maxPreviewCards: number;
+  inlineSubmitKey: "enhanced-enter" | "enter";
+}
 
 interface FilterState {
   query: string;
   groupFilter: string;
   tagFilter: string;
   showArchived: boolean;
+}
+
+const DEFAULT_SETTINGS: PanelSettings = {
+  rowHeight: DEFAULT_ROW_HEIGHT,
+  defaultCardRows: DEFAULT_CARD_ROWS,
+  minCardRows: MIN_CARD_ROWS,
+  previewMinHeight: 500,
+  previewLines: 500,
+  previewRefreshMs: 4500,
+  maxPreviewCards: 24,
+  inlineSubmitKey: "enhanced-enter"
+};
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function loadPanelSettings(): PanelSettings {
+  if (typeof window === "undefined") {
+    return DEFAULT_SETTINGS;
+  }
+
+  try {
+    const stored = window.localStorage.getItem(SETTINGS_STATE_KEY);
+    if (!stored) {
+      return DEFAULT_SETTINGS;
+    }
+    const parsed = JSON.parse(stored) as Partial<PanelSettings>;
+    return {
+      rowHeight: clampNumber(parsed.rowHeight, DEFAULT_SETTINGS.rowHeight, 80, 220),
+      defaultCardRows: clampNumber(parsed.defaultCardRows, DEFAULT_SETTINGS.defaultCardRows, 3, 14),
+      minCardRows: clampNumber(parsed.minCardRows, DEFAULT_SETTINGS.minCardRows, 3, 14),
+      previewMinHeight: clampNumber(parsed.previewMinHeight, DEFAULT_SETTINGS.previewMinHeight, 160, 1400),
+      previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, 1000),
+      previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000),
+      maxPreviewCards: clampNumber(parsed.maxPreviewCards, DEFAULT_SETTINGS.maxPreviewCards, 1, 100),
+      inlineSubmitKey: parsed.inlineSubmitKey === "enter" ? "enter" : "enhanced-enter"
+    };
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
 }
 
 function loadFilterState(): FilterState {
@@ -65,6 +123,7 @@ function loadFilterState(): FilterState {
 
 export function App() {
   const initialFilters = useMemo(loadFilterState, []);
+  const initialSettings = useMemo(loadPanelSettings, []);
   const [auth, setAuth] = useState<AuthUser | null | undefined>(undefined);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [previews, setPreviews] = useState<Record<string, string>>({});
@@ -73,7 +132,8 @@ export function App() {
   const [groupFilter, setGroupFilter] = useState(initialFilters.groupFilter);
   const [tagFilter, setTagFilter] = useState(initialFilters.tagFilter);
   const [showArchived, setShowArchived] = useState(initialFilters.showArchived);
-  const [rowHeight, setRowHeight] = useState(DEFAULT_ROW_HEIGHT);
+  const [settings, setSettings] = useState<PanelSettings>(initialSettings);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
   const [loading, setLoading] = useState(false);
@@ -104,6 +164,10 @@ export function App() {
       })
     );
   }, [groupFilter, query, showArchived, tagFilter]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SETTINGS_STATE_KEY, JSON.stringify(settings));
+  }, [settings]);
 
   useEffect(() => {
     if (!auth) {
@@ -149,9 +213,9 @@ export function App() {
     let cancelled = false;
     const loadPreviews = async () => {
       const entries = await Promise.all(
-        filtered.slice(0, 24).map(async (session) => {
+        filtered.slice(0, settings.maxPreviewCards).map(async (session) => {
           try {
-            const preview = await api.preview(session.id);
+            const preview = await api.preview(session.id, settings.previewLines);
             return [session.id, preview.text] as const;
           } catch {
             return [session.id, ""] as const;
@@ -164,12 +228,12 @@ export function App() {
     };
 
     void loadPreviews();
-    const timer = window.setInterval(loadPreviews, 4500);
+    const timer = window.setInterval(loadPreviews, settings.previewRefreshMs);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [auth, filtered]);
+  }, [auth, filtered, settings.maxPreviewCards, settings.previewLines, settings.previewRefreshMs]);
 
   const layouts = useMemo(
     () => ({
@@ -178,12 +242,12 @@ export function App() {
         x: session.layout?.x ?? (index % 3) * 4,
         y: session.layout?.y ?? Math.floor(index / 3) * 4,
         w: session.layout?.w ?? 4,
-        h: Math.max(session.layout?.h ?? DEFAULT_CARD_ROWS, MIN_CARD_ROWS),
+        h: Math.max(session.layout?.h ?? settings.defaultCardRows, settings.minCardRows),
         minW: session.layout?.minW ?? 3,
-        minH: Math.max(session.layout?.minH ?? MIN_CARD_ROWS, MIN_CARD_ROWS)
+        minH: Math.max(session.layout?.minH ?? settings.minCardRows, settings.minCardRows)
       }))
     }),
-    [filtered]
+    [filtered, settings.defaultCardRows, settings.minCardRows]
   );
 
   const saveLayout = useCallback(
@@ -233,8 +297,12 @@ export function App() {
     return <Login onAuthenticated={setAuth} />;
   }
 
+  const shellStyle = {
+    "--session-preview-min-height": `${settings.previewMinHeight}px`
+  } as CSSProperties;
+
   return (
-    <main className="app-shell">
+    <main className="app-shell" style={shellStyle}>
       <header className="topbar">
         <div className="brand">
           <MonitorUp size={24} />
@@ -245,6 +313,9 @@ export function App() {
         </div>
         <div className="topbar-actions">
           <HealthPill health={health} />
+          <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} title="配置">
+            <Settings size={18} />
+          </button>
           <button className="icon-button" type="button" onClick={refresh} title="刷新">
             <RefreshCw size={18} className={loading ? "spin" : ""} />
           </button>
@@ -292,8 +363,10 @@ export function App() {
             min="100"
             max="180"
             step="4"
-            value={rowHeight}
-            onChange={(event) => setRowHeight(Number(event.target.value))}
+            value={settings.rowHeight}
+            onChange={(event) =>
+              setSettings((current) => ({ ...current, rowHeight: Number(event.target.value) }))
+            }
           />
         </label>
         <button className="primary-button" type="button" onClick={() => setEditorSession("new")}>
@@ -317,7 +390,7 @@ export function App() {
           layouts={layouts}
           breakpoints={{ lg: 1200, md: 960, sm: 720, xs: 480, xxs: 0 }}
           cols={{ lg: 12, md: 10, sm: 6, xs: 4, xxs: 2 }}
-          rowHeight={rowHeight}
+          rowHeight={settings.rowHeight}
           margin={[14, 14]}
           draggableHandle=".drag-handle"
           onDragStop={saveLayout}
@@ -335,17 +408,18 @@ export function App() {
                   await loadSessions();
                 }}
                 onQuickInput={async (value) => {
-                  const result = await api.sendInput(session.id, {
-                    data: `${value}\u001b[13u`,
-                    enter: false
-                  });
+                  const input =
+                    settings.inlineSubmitKey === "enhanced-enter"
+                      ? { data: `${value}\u001b[13u`, enter: false }
+                      : { data: value, enter: true, submitKey: "enter" as const };
+                  const result = await api.sendInput(session.id, input);
                   if (result.preview !== undefined) {
                     setPreviews((current) => ({ ...current, [session.id]: result.preview || current[session.id] || "" }));
                   }
                   await loadSessions();
                   window.setTimeout(() => {
                     void api
-                      .preview(session.id)
+                      .preview(session.id, settings.previewLines)
                       .then((preview) =>
                         setPreviews((current) => ({ ...current, [session.id]: preview.text }))
                       )
@@ -397,7 +471,151 @@ export function App() {
           }}
         />
       )}
+
+      {settingsOpen && (
+        <SettingsModal
+          settings={settings}
+          onChange={setSettings}
+          onClose={() => setSettingsOpen(false)}
+          onReset={() => setSettings(DEFAULT_SETTINGS)}
+        />
+      )}
     </main>
+  );
+}
+
+function SettingsModal({
+  settings,
+  onChange,
+  onClose,
+  onReset
+}: {
+  settings: PanelSettings;
+  onChange: (settings: PanelSettings) => void;
+  onClose: () => void;
+  onReset: () => void;
+}) {
+  const update = <K extends keyof PanelSettings>(key: K, value: PanelSettings[K]) => {
+    onChange({ ...settings, [key]: value });
+  };
+
+  return (
+    <div className="modal-backdrop">
+      <section className="modal-panel settings-panel">
+        <header className="modal-header">
+          <h2>全局配置</h2>
+          <button className="icon-button small" type="button" onClick={onClose} title="关闭">
+            ×
+          </button>
+        </header>
+        <div className="settings-form">
+          <label>
+            <span>网格行高</span>
+            <input
+              type="number"
+              min="80"
+              max="220"
+              step="4"
+              value={settings.rowHeight}
+              onChange={(event) => update("rowHeight", clampNumber(event.target.value, DEFAULT_SETTINGS.rowHeight, 80, 220))}
+            />
+          </label>
+          <label>
+            <span>默认卡片行数</span>
+            <input
+              type="number"
+              min="3"
+              max="14"
+              value={settings.defaultCardRows}
+              onChange={(event) =>
+                update("defaultCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.defaultCardRows, 3, 14))
+              }
+            />
+          </label>
+          <label>
+            <span>最小卡片行数</span>
+            <input
+              type="number"
+              min="3"
+              max="14"
+              value={settings.minCardRows}
+              onChange={(event) =>
+                update("minCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.minCardRows, 3, 14))
+              }
+            />
+          </label>
+          <label>
+            <span>输出区最小高度 px</span>
+            <input
+              type="number"
+              min="160"
+              max="1400"
+              step="20"
+              value={settings.previewMinHeight}
+              onChange={(event) =>
+                update("previewMinHeight", clampNumber(event.target.value, DEFAULT_SETTINGS.previewMinHeight, 160, 1400))
+              }
+            />
+          </label>
+          <label>
+            <span>预览保留行数</span>
+            <input
+              type="number"
+              min="20"
+              max="1000"
+              step="20"
+              value={settings.previewLines}
+              onChange={(event) =>
+                update("previewLines", clampNumber(event.target.value, DEFAULT_SETTINGS.previewLines, 20, 1000))
+              }
+            />
+          </label>
+          <label>
+            <span>预览刷新间隔 ms</span>
+            <input
+              type="number"
+              min="1000"
+              max="30000"
+              step="500"
+              value={settings.previewRefreshMs}
+              onChange={(event) =>
+                update("previewRefreshMs", clampNumber(event.target.value, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000))
+              }
+            />
+          </label>
+          <label>
+            <span>最多刷新卡片数</span>
+            <input
+              type="number"
+              min="1"
+              max="100"
+              value={settings.maxPreviewCards}
+              onChange={(event) =>
+                update("maxPreviewCards", clampNumber(event.target.value, DEFAULT_SETTINGS.maxPreviewCards, 1, 100))
+              }
+            />
+          </label>
+          <label>
+            <span>列表发送按键</span>
+            <select
+              value={settings.inlineSubmitKey}
+              onChange={(event) => update("inlineSubmitKey", event.target.value === "enter" ? "enter" : "enhanced-enter")}
+            >
+              <option value="enhanced-enter">Enhanced Enter</option>
+              <option value="enter">Enter</option>
+            </select>
+          </label>
+        </div>
+        <footer className="modal-actions">
+          <button className="secondary-button" type="button" onClick={onReset}>
+            重置
+          </button>
+          <button className="primary-button" type="button" onClick={onClose}>
+            完成
+          </button>
+        </footer>
+      </section>
+    </div>
   );
 }
 
