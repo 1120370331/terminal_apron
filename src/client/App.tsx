@@ -207,6 +207,14 @@ function emptyPreview(sessionId: string): SessionPreview {
   };
 }
 
+function samePreview(previous: SessionPreview | undefined, next: SessionPreview): boolean {
+  return (
+    previous?.text === next.text &&
+    previous.grid?.cols === next.grid?.cols &&
+    previous.grid?.rows.length === next.grid?.rows.length
+  );
+}
+
 export function App() {
   const initialFilters = useMemo(loadFilterState, []);
   const initialSettings = useMemo(loadPanelSettings, []);
@@ -369,7 +377,7 @@ export function App() {
             const preview = await api.preview(session.id, settings.previewLines);
             if (!cancelled) {
               setPreviews((current) =>
-                current[session.id]?.text === preview.text ? current : { ...current, [session.id]: preview }
+                samePreview(current[session.id], preview) ? current : { ...current, [session.id]: preview }
               );
             }
           } catch {
@@ -586,7 +594,8 @@ export function App() {
                       ...current,
                       [session.id]: {
                         ...emptyPreview(session.id),
-                        text: result.preview || current[session.id]?.text || ""
+                        text: result.preview || current[session.id]?.text || "",
+                        grid: result.grid
                       }
                     }));
                   }

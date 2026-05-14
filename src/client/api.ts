@@ -91,7 +91,7 @@ export const api = {
       method: "POST"
     }),
   sendInput: (id: string, input: { data: string; enter?: boolean; submitKey?: "enter" }) =>
-    request<{ ok: boolean; runtime?: TerminalSession["runtime"]; preview?: string }>(`/api/sessions/${id}/input`, {
+    request<{ ok: boolean; runtime?: TerminalSession["runtime"]; preview?: string; grid?: SessionPreview["grid"] }>(`/api/sessions/${id}/input`, {
       method: "POST",
       body: JSON.stringify(input)
     }),

@@ -568,21 +568,13 @@ select {
 }
 
 .terminal-grid-preview {
-  line-height: 1.35;
+  line-height: 0;
+  overflow-x: hidden;
 }
 
-.terminal-grid-row {
-  height: 1.35em;
-  white-space: nowrap;
-}
-
-.terminal-grid-segment {
-  display: inline-block;
-  width: calc(var(--segment-cols) * var(--terminal-cell-width));
-  min-height: 1.35em;
-  overflow: hidden;
-  vertical-align: top;
-  white-space: pre;
+.terminal-preview-canvas {
+  display: block;
+  max-width: none;
 }
 
 .preview-latest {

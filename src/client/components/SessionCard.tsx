@@ -2,6 +2,7 @@ import {
   FormEvent,
   WheelEvent,
   memo,
+  useCallback,
   useEffect,
   useDeferredValue,
   useLayoutEffect,
@@ -54,7 +55,13 @@ function SessionCardComponent({
   const [historyPaused, setHistoryPaused] = useState(false);
   const [hasPendingPreview, setHasPendingPreview] = useState(false);
   const previewRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const deferredPreview = useDeferredValue(displayedPreview);
+  const output = deferredPreview?.text || (isLive ? "" : "terminal is not running");
+  const grid = deferredPreview?.grid;
+  const compactOutput = useMemo(() => compactPreview(output), [output]);
+  const renderedOutput = useMemo(() => renderAnsi(compactOutput), [compactOutput]);
 
   useEffect(() => {
     if (!preview && !displayedPreview) {
@@ -74,12 +81,44 @@ function SessionCardComponent({
 
   useLayoutEffect(() => {
     const previewElement = previewRef.current;
-    if (!previewElement || !stickToBottomRef.current) {
+    if (!previewElement || !stickToBottomRef.current || grid) {
       return;
     }
 
     previewElement.scrollTop = previewElement.scrollHeight;
-  }, [displayedPreview]);
+  }, [displayedPreview, grid]);
+
+  const redrawPreviewCanvas = useCallback(() => {
+    if (!grid || !canvasRef.current) {
+      return;
+    }
+    drawPreviewCanvas(canvasRef.current, grid);
+    const previewElement = previewRef.current;
+    if (previewElement && stickToBottomRef.current) {
+      previewElement.scrollTop = previewElement.scrollHeight;
+    }
+  }, [grid]);
+
+  useLayoutEffect(() => {
+    if (!grid) {
+      return;
+    }
+
+    redrawPreviewCanvas();
+    const previewElement = previewRef.current;
+    if (!previewElement || typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", redrawPreviewCanvas);
+      return () => window.removeEventListener("resize", redrawPreviewCanvas);
+    }
+
+    const observer = new ResizeObserver(() => redrawPreviewCanvas());
+    observer.observe(previewElement);
+    window.addEventListener("resize", redrawPreviewCanvas);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", redrawPreviewCanvas);
+    };
+  }, [grid, redrawPreviewCanvas]);
 
   const trackPreviewScroll = () => {
     const target = previewRef.current;
@@ -142,12 +181,6 @@ function SessionCardComponent({
     }
   };
 
-  const deferredPreview = useDeferredValue(displayedPreview);
-  const output = deferredPreview?.text || (isLive ? "" : "terminal is not running");
-  const grid = deferredPreview?.grid;
-  const compactOutput = useMemo(() => compactPreview(output), [output]);
-  const renderedOutput = useMemo(() => renderAnsi(compactOutput), [compactOutput]);
-
   return (
     <article className={session.archived ? "session-card archived" : "session-card"}>
       <div className="session-accent" style={{ background: session.color }} />
@@ -177,7 +210,7 @@ function SessionCardComponent({
           onMouseDown={(event) => event.stopPropagation()}
           onTouchStart={(event) => event.stopPropagation()}
         >
-          {grid ? renderGrid(grid) : renderedOutput}
+          {grid ? <canvas className="terminal-preview-canvas" ref={canvasRef} /> : renderedOutput}
         </div>
         {historyPaused && hasPendingPreview && (
           <button
@@ -253,7 +286,15 @@ function SessionCardComponent({
 export const SessionCard = memo(SessionCardComponent, areSessionCardPropsEqual);
 
 function areSessionCardPropsEqual(previous: Props, next: Props): boolean {
-  return previous.preview?.text === next.preview?.text && sessionCardSignature(previous.session) === sessionCardSignature(next.session);
+  return previewSignature(previous.preview) === previewSignature(next.preview) && sessionCardSignature(previous.session) === sessionCardSignature(next.session);
+}
+
+function previewSignature(preview?: SessionPreview): string {
+  return [
+    preview?.text ?? "",
+    String(preview?.grid?.cols ?? ""),
+    String(preview?.grid?.rows.length ?? "")
+  ].join("\u001f");
 }
 
 function sessionCardSignature(session: TerminalSession): string {
@@ -275,32 +316,102 @@ function sessionCardSignature(session: TerminalSession): string {
   ].join("\u001f");
 }
 
-function renderGrid(grid: TerminalPreviewGrid): ReactNode[] {
-  return grid.rows.map((row, rowIndex) => (
-    <div className="terminal-grid-row" key={rowIndex}>
-      {row.segments.length
-        ? row.segments.map((segment, segmentIndex) => renderGridSegment(segment, segmentIndex))
-        : "\u00a0"}
-    </div>
-  ));
+function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid): void {
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return;
+  }
+
+  const fontSize = 12;
+  const lineHeight = Math.ceil(fontSize * 1.35);
+  const fontFamily = '"Cascadia Mono", "SFMono-Regular", Consolas, "Noto Sans Mono CJK SC", "Microsoft YaHei Mono", NSimSun, monospace';
+  context.font = `${fontSize}px ${fontFamily}`;
+  const cellWidth = Math.max(7, Math.ceil(context.measureText("M").width * 100) / 100);
+  const naturalWidth = Math.max(1, grid.cols * cellWidth);
+  const naturalHeight = Math.max(lineHeight, grid.rows.length * lineHeight);
+  const parent = canvas.parentElement;
+  const parentStyle = parent ? window.getComputedStyle(parent) : null;
+  const horizontalPadding = parentStyle
+    ? Number.parseFloat(parentStyle.paddingLeft || "0") + Number.parseFloat(parentStyle.paddingRight || "0")
+    : 0;
+  const availableWidth = parent ? Math.max(1, parent.clientWidth - horizontalPadding) : naturalWidth;
+  const scale = Math.min(1, availableWidth / naturalWidth);
+  const width = Math.max(1, Math.floor(naturalWidth * scale));
+  const height = Math.max(lineHeight, Math.ceil(naturalHeight * scale));
+  const dpr = window.devicePixelRatio || 1;
+
+  canvas.width = Math.ceil(width * dpr);
+  canvas.height = Math.ceil(height * dpr);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+
+  context.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+  context.fillStyle = "#111614";
+  context.fillRect(0, 0, naturalWidth, naturalHeight);
+
+  for (let rowIndex = 0; rowIndex < grid.rows.length; rowIndex += 1) {
+    const row = grid.rows[rowIndex];
+    let x = 0;
+    const y = rowIndex * lineHeight;
+    for (const segment of row.segments) {
+      const segmentWidth = Math.max(cellWidth, segment.cols * cellWidth);
+      drawCanvasSegment(context, segment, x, y, segmentWidth, lineHeight, fontSize, fontFamily, cellWidth);
+      x += segmentWidth;
+    }
+  }
 }
 
-function renderGridSegment(segment: TerminalPreviewSegment, index: number): ReactNode {
-  const style = {
-    "--segment-cols": segment.cols,
-    color: segment.fg,
-    backgroundColor: segment.bg,
-    fontWeight: segment.bold ? 700 : undefined,
-    fontStyle: segment.italic ? "italic" : undefined,
-    textDecoration: segment.underline ? "underline" : undefined,
-    opacity: segment.dim ? 0.72 : undefined
-  } as CSSProperties;
+function drawCanvasSegment(
+  context: CanvasRenderingContext2D,
+  segment: TerminalPreviewSegment,
+  x: number,
+  y: number,
+  width: number,
+  lineHeight: number,
+  fontSize: number,
+  fontFamily: string,
+  cellWidth: number
+): void {
+  if (segment.bg) {
+    context.fillStyle = segment.bg;
+    context.fillRect(x, y, width, lineHeight);
+  }
+  if (!segment.text) {
+    return;
+  }
 
-  return (
-    <span className="terminal-grid-segment" key={index} style={style}>
-      {segment.text}
-    </span>
-  );
+  context.save();
+  context.beginPath();
+  context.rect(x, y, width, lineHeight);
+  context.clip();
+  context.globalAlpha = segment.dim ? 0.72 : 1;
+  context.font = `${segment.italic ? "italic " : ""}${segment.bold ? "700" : "400"} ${fontSize}px ${fontFamily}`;
+  context.textBaseline = "top";
+  context.fillStyle = segment.fg ?? "#dce9df";
+  drawCellAlignedText(context, segment.text, x, y + 1, cellWidth);
+  if (segment.underline) {
+    context.fillRect(x, y + lineHeight - 2, width, 1);
+  }
+  context.restore();
+}
+
+function drawCellAlignedText(context: CanvasRenderingContext2D, value: string, x: number, y: number, cellWidth: number): void {
+  let cursor = x;
+  for (const char of Array.from(value)) {
+    const columns = charColumns(char);
+    if (char !== " ") {
+      context.fillText(char, cursor, y);
+    }
+    cursor += columns * cellWidth;
+  }
+}
+
+function charColumns(char: string): number {
+  const codePoint = char.codePointAt(0) ?? 0;
+  if (codePoint === 0) {
+    return 0;
+  }
+  return codePoint > 0xff ? 2 : 1;
 }
 
 function compactPreview(value: string): string {

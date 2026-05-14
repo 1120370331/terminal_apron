@@ -2,8 +2,11 @@ import Headless from "@xterm/headless";
 import type { IBufferCell, Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { TerminalPreviewGrid, TerminalPreviewRow, TerminalPreviewSegment } from "../shared/types.js";
 
-const PREVIEW_COLS = 240;
-const PREVIEW_ROWS = 80;
+const PREVIEW_MIN_COLS = 80;
+const PREVIEW_MAX_COLS = 220;
+const PREVIEW_RENDER_MAX_COLS = 120;
+const PREVIEW_ROWS = 360;
+const ANSI_PATTERN = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)|\u001b\[[0-?]*[ -/]*[@-~]/g;
 const PALETTE = [
   "#2e3436",
   "#cc0000",
@@ -28,9 +31,10 @@ export async function renderPreviewGrid(data: string): Promise<TerminalPreviewGr
     return undefined;
   }
 
+  const cols = detectPreviewColumns(data);
   const screen = new Headless.Terminal({
     allowProposedApi: true,
-    cols: PREVIEW_COLS,
+    cols,
     rows: PREVIEW_ROWS,
     scrollback: PREVIEW_ROWS
   });
@@ -53,10 +57,16 @@ export async function renderPreviewGrid(data: string): Promise<TerminalPreviewGr
     while (rows.length && isEmptyRow(rows[0])) {
       rows.shift();
     }
+    while (rows.length && isEmptyRow(rows[rows.length - 1])) {
+      rows.pop();
+    }
+
+    const contentCols = rows.reduce((max, row) => Math.max(max, rowColumns(row)), 0);
+    const renderCols = Math.max(PREVIEW_MIN_COLS, Math.min(PREVIEW_RENDER_MAX_COLS, contentCols || cols, cols));
 
     return {
-      cols: PREVIEW_COLS,
-      rows
+      cols: renderCols,
+      rows: rows.map((row) => clipRow(row, renderCols))
     };
   } finally {
     screen.dispose();
@@ -68,7 +78,7 @@ function renderLine(line: { length: number; getCell: (index: number, cell?: IBuf
   let current: TerminalPreviewSegment | null = null;
   let lastNonEmptySegment = -1;
 
-  for (let col = 0; col < Math.min(line.length, PREVIEW_COLS); col += 1) {
+  for (let col = 0; col < Math.min(line.length, PREVIEW_MAX_COLS); col += 1) {
     const item = line.getCell(col, cell);
     if (!item || item.getWidth() === 0) {
       continue;
@@ -90,7 +100,7 @@ function renderLine(line: { length: number; getCell: (index: number, cell?: IBuf
   }
 
   return {
-    segments: lastNonEmptySegment >= 0 ? trimTrailingDefaultSpaces(segments.slice(0, lastNonEmptySegment + 1)) : []
+    segments: lastNonEmptySegment >= 0 ? trimDefaultPadding(segments.slice(0, lastNonEmptySegment + 1)) : []
   };
 }
 
@@ -164,6 +174,24 @@ function segmentKey(segment: TerminalPreviewSegment): string {
   ].join("|");
 }
 
+function trimDefaultPadding(segments: TerminalPreviewSegment[]): TerminalPreviewSegment[] {
+  return trimLeadingDefaultSpaces(trimTrailingDefaultSpaces(segments));
+}
+
+function trimLeadingDefaultSpaces(segments: TerminalPreviewSegment[]): TerminalPreviewSegment[] {
+  const first = segments[0];
+  if (!first || first.bg || first.text.trimStart() === first.text) {
+    return segments;
+  }
+
+  const trimmed = first.text.trimStart();
+  if (!trimmed) {
+    return trimLeadingDefaultSpaces(segments.slice(1));
+  }
+
+  return [{ ...first, text: trimmed, cols: visibleColumns(trimmed) }, ...segments.slice(1)];
+}
+
 function trimTrailingDefaultSpaces(segments: TerminalPreviewSegment[]): TerminalPreviewSegment[] {
   const last = segments[segments.length - 1];
   if (!last || last.bg || last.text.trim()) {
@@ -178,8 +206,65 @@ function trimTrailingDefaultSpaces(segments: TerminalPreviewSegment[]): Terminal
   return [...segments.slice(0, -1), { ...last, text: trimmed, cols: visibleColumns(trimmed) }];
 }
 
+function clipRow(row: TerminalPreviewRow, cols: number): TerminalPreviewRow {
+  const segments: TerminalPreviewSegment[] = [];
+  let used = 0;
+  for (const segment of row.segments) {
+    if (used >= cols) {
+      break;
+    }
+    const available = cols - used;
+    if (segment.cols <= available) {
+      segments.push(segment);
+      used += segment.cols;
+      continue;
+    }
+    const text = sliceColumns(segment.text, available);
+    if (text) {
+      segments.push({ ...segment, text, cols: visibleColumns(text) });
+    }
+    break;
+  }
+  return { segments };
+}
+
+function rowColumns(row: TerminalPreviewRow): number {
+  return row.segments.reduce((total, segment) => total + segment.cols, 0);
+}
+
+function sliceColumns(value: string, maxCols: number): string {
+  let output = "";
+  let used = 0;
+  for (const char of Array.from(value)) {
+    const width = charColumns(char);
+    if (used + width > maxCols) {
+      break;
+    }
+    output += char;
+    used += width;
+  }
+  return output;
+}
+
 function visibleColumns(value: string): number {
-  return Array.from(value).reduce((count, char) => count + (char.charCodeAt(0) > 0xff ? 2 : 1), 0);
+  return Array.from(value).reduce((count, char) => count + charColumns(char), 0);
+}
+
+function detectPreviewColumns(value: string): number {
+  const plain = value.replace(ANSI_PATTERN, "");
+  let maxColumns = 0;
+  for (const line of plain.split(/\r?\n/)) {
+    maxColumns = Math.max(maxColumns, visibleColumns(line.trimEnd()));
+  }
+  return Math.max(PREVIEW_MIN_COLS, Math.min(PREVIEW_MAX_COLS, maxColumns || 120));
+}
+
+function charColumns(char: string): number {
+  const codePoint = char.codePointAt(0) ?? 0;
+  if (codePoint === 0) {
+    return 0;
+  }
+  return codePoint > 0xff ? 2 : 1;
 }
 
 function isEmptyRow(row: TerminalPreviewRow): boolean {
