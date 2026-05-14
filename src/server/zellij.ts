@@ -29,6 +29,16 @@ interface ZellijPane {
 }
 
 const ZELLIJ_SINGLE_PANE_LAYOUT = ["layout {", "    pane", "}"].join("\n");
+const VIEWPORT_PREVIEW_TTL_MS = 1500;
+const VIEWPORT_PREVIEW_STALE_MS = 30_000;
+
+interface PreviewCacheEntry {
+  value: string;
+  capturedAt: number;
+  inFlight?: Promise<string>;
+}
+
+const viewportPreviewCache = new Map<string, PreviewCacheEntry>();
 
 function runZellij(args: string[], options: RunOptions = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -97,19 +107,77 @@ export async function killZellijSession(session: Pick<TerminalSession, "tmuxName
 
 export async function captureZellijPreview(
   session: Pick<TerminalSession, "id" | "tmuxName">,
-  lines = 500
+  lines = 500,
+  full = true
 ): Promise<string> {
+  if (!full) {
+    return captureZellijViewportPreview(session, lines);
+  }
+
   if (!(await hasZellijSession(session.tmuxName))) {
     return renderPlainTranscript(await loadZellijTranscript(session.id), lines);
   }
 
   const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
-  const args = ["--session", session.tmuxName, "action", "dump-screen", "--full", "--ansi"];
+  const args = ["--session", session.tmuxName, "action", "dump-screen", "--ansi"];
+  if (full) {
+    args.push("--full");
+  }
   if (paneId) {
     args.push("--pane-id", paneId);
   }
   const result = await runZellij(args, {
     timeoutMs: 5000
+  }).catch(() => ({ stdout: "", stderr: "" }));
+  const rendered = tailLines(result.stdout.replace(/\s+$/g, ""), Math.max(20, Math.min(lines, config.previewMaxLines)));
+  return rendered.trim() ? rendered : renderPlainTranscript(await loadZellijTranscript(session.id), lines);
+}
+
+async function captureZellijViewportPreview(
+  session: Pick<TerminalSession, "id" | "tmuxName">,
+  lines: number
+): Promise<string> {
+  const cacheKey = `${session.tmuxName}:${lines}`;
+  const cached = viewportPreviewCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.capturedAt < VIEWPORT_PREVIEW_TTL_MS) {
+    return cached.value;
+  }
+  if (cached?.inFlight) {
+    if (cached.value && now - cached.capturedAt < VIEWPORT_PREVIEW_STALE_MS) {
+      return cached.value;
+    }
+    return cached.inFlight;
+  }
+
+  const inFlight = captureZellijViewportPreviewFresh(session, lines)
+    .then((value) => {
+      viewportPreviewCache.set(cacheKey, { value, capturedAt: Date.now() });
+      return value;
+    })
+    .catch((error) => {
+      if (cached?.value) {
+        viewportPreviewCache.set(cacheKey, { value: cached.value, capturedAt: cached.capturedAt });
+        return cached.value;
+      }
+      viewportPreviewCache.delete(cacheKey);
+      throw error;
+    });
+
+  viewportPreviewCache.set(cacheKey, {
+    value: cached?.value ?? "",
+    capturedAt: cached?.capturedAt ?? 0,
+    inFlight
+  });
+  return inFlight;
+}
+
+async function captureZellijViewportPreviewFresh(
+  session: Pick<TerminalSession, "id" | "tmuxName">,
+  lines: number
+): Promise<string> {
+  const result = await runZellij(["--session", session.tmuxName, "action", "dump-screen", "--ansi"], {
+    timeoutMs: 2500
   }).catch(() => ({ stdout: "", stderr: "" }));
   const rendered = tailLines(result.stdout.replace(/\s+$/g, ""), Math.max(20, Math.min(lines, config.previewMaxLines)));
   return rendered.trim() ? rendered : renderPlainTranscript(await loadZellijTranscript(session.id), lines);

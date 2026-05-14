@@ -50,6 +50,7 @@ const io = new SocketServer(server, {
 });
 const store = new SessionStore(config.dataDir);
 const nativeSessions = new NativeSessionManager();
+const DEFAULT_PREVIEW_MAX_CHARS = 120_000;
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -243,10 +244,11 @@ app.post("/api/sessions/:id/input", async (req, res) => {
   }
 
   await sendSessionInput(session, data, enter !== false);
+  const previewText = await captureSessionPreview(session, parsePreviewLines(req.body?.lines), false).catch(() => "");
   res.json({
     ok: true,
     runtime: await getRuntime(session),
-    preview: await captureSessionPreview(session, parsePreviewLines(req.body?.lines)).catch(() => "")
+    preview: compactPreviewPayload(previewText, parsePreviewMaxChars(req.body?.maxChars))
   });
 });
 
@@ -289,9 +291,14 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
     res.status(404).json({ error: "session not found" });
     return;
   }
+  const previewText = await captureSessionPreview(
+    session,
+    parsePreviewLines(req.query.lines),
+    parsePreviewFull(req.query.full)
+  ).catch(() => "");
   res.json({
     sessionId: session.id,
-    text: await captureSessionPreview(session, parsePreviewLines(req.query.lines)).catch(() => ""),
+    text: compactPreviewPayload(previewText, parsePreviewMaxChars(req.query.maxChars)),
     capturedAt: new Date().toISOString()
   });
 });
@@ -343,13 +350,13 @@ async function getRuntime(session: TerminalSession) {
   return nativeSessions.runtime(session);
 }
 
-async function captureSessionPreview(session: TerminalSession, lines = 500) {
+async function captureSessionPreview(session: TerminalSession, lines = 500, full = true) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
     return capturePreview(session, lines);
   }
   if (backend === "zellij") {
-    return captureZellijPreview(session, lines);
+    return captureZellijPreview(session, lines, full);
   }
   return nativeSessions.preview(session, lines);
 }
@@ -418,6 +425,31 @@ function parsePreviewLines(value: unknown): number {
     return 500;
   }
   return Math.max(20, Math.min(config.previewMaxLines, Math.floor(parsed)));
+}
+
+function parsePreviewMaxChars(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_PREVIEW_MAX_CHARS;
+  }
+  return Math.max(20_000, Math.min(500_000, Math.floor(parsed)));
+}
+
+function parsePreviewFull(value: unknown): boolean {
+  return value !== "false";
+}
+
+function compactPreviewPayload(value: string, maxChars: number): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+
+  let tail = value.slice(-maxChars);
+  const firstLineBreak = tail.indexOf("\n");
+  if (firstLineBreak >= 0) {
+    tail = tail.slice(firstLineBreak + 1);
+  }
+  return `\u001b[0m${tail}`;
 }
 
 interface CpuSnapshot {

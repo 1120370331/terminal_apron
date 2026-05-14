@@ -34,6 +34,8 @@ const MIN_CARD_ROWS = 7;
 const SESSION_REFRESH_MS = 1000;
 const SYSTEM_METRICS_REFRESH_MS = 1000;
 const SYSTEM_METRICS_HISTORY_LIMIT = 120;
+const DEFAULT_PREVIEW_LINES = 600;
+const MAX_LIST_PREVIEW_LINES = 1200;
 type ThemeMode = "system" | "light" | "dark";
 
 interface PanelSettings {
@@ -60,7 +62,7 @@ const DEFAULT_SETTINGS: PanelSettings = {
   defaultCardRows: DEFAULT_CARD_ROWS,
   minCardRows: MIN_CARD_ROWS,
   previewMinHeight: 500,
-  previewLines: 2000,
+  previewLines: DEFAULT_PREVIEW_LINES,
   previewRefreshMs: 1000,
   maxPreviewCards: 24,
   inlineSubmitKey: "enter",
@@ -112,7 +114,7 @@ function loadPanelSettings(): PanelSettings {
       defaultCardRows: clampNumber(parsed.defaultCardRows, DEFAULT_SETTINGS.defaultCardRows, 3, 14),
       minCardRows: clampNumber(parsed.minCardRows, DEFAULT_SETTINGS.minCardRows, 3, 14),
       previewMinHeight: clampNumber(parsed.previewMinHeight, DEFAULT_SETTINGS.previewMinHeight, 160, 1400),
-      previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, 5000),
+      previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, MAX_LIST_PREVIEW_LINES),
       previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000),
       maxPreviewCards: clampNumber(parsed.maxPreviewCards, DEFAULT_SETTINGS.maxPreviewCards, 1, 100),
       inlineSubmitKey: "enter",
@@ -155,6 +157,48 @@ function loadFilterState(): FilterState {
   }
 }
 
+function sameSessionList(previous: TerminalSession[], next: TerminalSession[]): boolean {
+  if (previous.length !== next.length) {
+    return false;
+  }
+
+  for (let index = 0; index < previous.length; index += 1) {
+    if (sessionSignature(previous[index]) !== sessionSignature(next[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sessionSignature(session: TerminalSession): string {
+  const runtime = session.runtime;
+  const layout = session.layout;
+  return [
+    session.id,
+    session.name,
+    session.group,
+    session.tags.join(","),
+    session.cwd,
+    session.shell ?? "",
+    session.backend,
+    session.tmuxName,
+    session.color,
+    String(session.archived),
+    session.updatedAt,
+    session.archivedAt ?? "",
+    session.stoppedAt ?? "",
+    layout ? `${layout.x},${layout.y},${layout.w},${layout.h},${layout.minW ?? ""},${layout.minH ?? ""}` : "",
+    runtime?.backend ?? "",
+    String(runtime?.exists ?? ""),
+    String(runtime?.attached ?? ""),
+    runtime?.currentPath ?? "",
+    runtime?.currentCommand ?? "",
+    String(runtime?.windows ?? ""),
+    runtime?.zellijVersion ?? "",
+    runtime?.tmuxVersion ?? ""
+  ].join("\u001f");
+}
+
 export function App() {
   const initialFilters = useMemo(loadFilterState, []);
   const initialSettings = useMemo(loadPanelSettings, []);
@@ -175,7 +219,8 @@ export function App() {
 
   const loadSessions = useCallback(async () => {
     try {
-      setSessions(await api.sessions(showArchived));
+      const next = await api.sessions(showArchived);
+      setSessions((current) => (sameSessionList(current, next) ? current : next));
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
         setAuth(null);
@@ -291,19 +336,44 @@ export function App() {
     }
 
     let cancelled = false;
+    let loading = false;
+    const previewConcurrency = 4;
     const loadPreviews = async () => {
-      const entries = await Promise.all(
-        filtered.slice(0, settings.maxPreviewCards).map(async (session) => {
+      if (loading) {
+        return;
+      }
+      loading = true;
+      const visible = filtered.slice(0, settings.maxPreviewCards);
+      for (const session of visible) {
+        if (!session.runtime?.exists) {
+          setPreviews((current) => (current[session.id] === "" ? current : { ...current, [session.id]: "" }));
+        }
+      }
+      const targets = visible.filter((session) => session.runtime?.exists);
+      let cursor = 0;
+      const loadOne = async () => {
+        while (!cancelled && cursor < targets.length) {
+          const session = targets[cursor];
+          cursor += 1;
           try {
             const preview = await api.preview(session.id, settings.previewLines);
-            return [session.id, preview.text] as const;
+            if (!cancelled) {
+              setPreviews((current) =>
+                current[session.id] === preview.text ? current : { ...current, [session.id]: preview.text }
+              );
+            }
           } catch {
-            return [session.id, ""] as const;
+            if (!cancelled) {
+              setPreviews((current) => (current[session.id] === "" ? current : { ...current, [session.id]: "" }));
+            }
           }
-        })
-      );
-      if (!cancelled) {
-        setPreviews((current) => ({ ...current, ...Object.fromEntries(entries) }));
+        }
+      };
+
+      try {
+        await Promise.all(Array.from({ length: Math.min(previewConcurrency, targets.length) }, loadOne));
+      } finally {
+        loading = false;
       }
     };
 
@@ -658,11 +728,11 @@ function SettingsModal({
             <input
               type="number"
               min="20"
-              max="5000"
+              max={MAX_LIST_PREVIEW_LINES}
               step="100"
               value={settings.previewLines}
               onChange={(event) =>
-                update("previewLines", clampNumber(event.target.value, DEFAULT_SETTINGS.previewLines, 20, 5000))
+                update("previewLines", clampNumber(event.target.value, DEFAULT_SETTINGS.previewLines, 20, MAX_LIST_PREVIEW_LINES))
               }
             />
           </label>

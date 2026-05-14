@@ -1,7 +1,9 @@
 import {
   FormEvent,
   WheelEvent,
+  memo,
   useEffect,
+  useDeferredValue,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -27,8 +29,11 @@ interface Props {
 const ANSI_PATTERN = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)|\u001b\[[0-?]*[ -/]*[@-~]/g;
 const ANSI_COLORS = ["#2e3436", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf"];
 const ANSI_BRIGHT_COLORS = ["#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec"];
+const CARD_PREVIEW_MAX_LINES = 360;
+const CARD_PREVIEW_MAX_CHARS = 80_000;
+const CARD_PREVIEW_MAX_NODES = 2_000;
 
-export function SessionCard({
+function SessionCardComponent({
   session,
   preview,
   onOpen,
@@ -137,8 +142,10 @@ export function SessionCard({
     }
   };
 
-  const output = displayedPreview || (isLive ? "" : "terminal is not running");
-  const renderedOutput = useMemo(() => renderAnsi(output), [output]);
+  const deferredPreview = useDeferredValue(displayedPreview);
+  const output = deferredPreview || (isLive ? "" : "terminal is not running");
+  const compactOutput = useMemo(() => compactPreview(output), [output]);
+  const renderedOutput = useMemo(() => renderAnsi(compactOutput), [compactOutput]);
 
   return (
     <article className={session.archived ? "session-card archived" : "session-card"}>
@@ -242,6 +249,53 @@ export function SessionCard({
   );
 }
 
+export const SessionCard = memo(SessionCardComponent, areSessionCardPropsEqual);
+
+function areSessionCardPropsEqual(previous: Props, next: Props): boolean {
+  return previous.preview === next.preview && sessionCardSignature(previous.session) === sessionCardSignature(next.session);
+}
+
+function sessionCardSignature(session: TerminalSession): string {
+  const runtime = session.runtime;
+  return [
+    session.id,
+    session.name,
+    session.group,
+    session.tags.join(","),
+    session.cwd,
+    session.backend,
+    session.color,
+    String(session.archived),
+    runtime?.backend ?? "",
+    String(runtime?.exists ?? ""),
+    runtime?.currentPath ?? "",
+    runtime?.currentCommand ?? "",
+    String(runtime?.windows ?? "")
+  ].join("\u001f");
+}
+
+function compactPreview(value: string): string {
+  let output = value;
+  let truncated = false;
+
+  if (output.length > CARD_PREVIEW_MAX_CHARS) {
+    output = output.slice(-CARD_PREVIEW_MAX_CHARS);
+    const firstLineBreak = output.indexOf("\n");
+    if (firstLineBreak >= 0) {
+      output = output.slice(firstLineBreak + 1);
+    }
+    truncated = true;
+  }
+
+  const lines = output.split("\n");
+  if (lines.length > CARD_PREVIEW_MAX_LINES) {
+    output = lines.slice(-CARD_PREVIEW_MAX_LINES).join("\n");
+    truncated = true;
+  }
+
+  return truncated ? `...\n\u001b[0m${output}` : output;
+}
+
 function renderAnsi(value: string): ReactNode[] {
   const nodes: ReactNode[] = [];
   let style: CSSProperties = {};
@@ -262,6 +316,11 @@ function renderAnsi(value: string): ReactNode[] {
     const index = match.index ?? 0;
     buffer += value.slice(cursor, index);
     push();
+    if (nodes.length >= CARD_PREVIEW_MAX_NODES) {
+      buffer += stripAnsi(value.slice(index));
+      cursor = value.length;
+      break;
+    }
     const sequence = match[0];
     if (sequence.endsWith("m") && sequence.startsWith("\u001b[")) {
       style = applySgr(style, sequence);
@@ -272,6 +331,10 @@ function renderAnsi(value: string): ReactNode[] {
   buffer += value.slice(cursor);
   push();
   return nodes.length ? nodes : [value];
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(ANSI_PATTERN, "");
 }
 
 function applySgr(current: CSSProperties, sequence: string): CSSProperties {

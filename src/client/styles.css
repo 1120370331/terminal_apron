@@ -454,6 +454,8 @@ select {
   min-height: var(--session-card-min-height, 620px);
   overflow: hidden;
   border-radius: 8px;
+  content-visibility: auto;
+  contain-intrinsic-size: auto var(--session-card-min-height, 620px);
   box-shadow: var(--card-shadow);
 }
 
@@ -542,6 +544,7 @@ select {
 }
 
 .preview {
+  contain: content;
   flex: 1 1 auto;
   width: 100%;
   min-height: 0;
