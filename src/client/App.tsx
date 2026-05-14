@@ -49,7 +49,7 @@ const DEFAULT_SETTINGS: PanelSettings = {
   defaultCardRows: DEFAULT_CARD_ROWS,
   minCardRows: MIN_CARD_ROWS,
   previewMinHeight: 500,
-  previewLines: 500,
+  previewLines: 2000,
   previewRefreshMs: 4500,
   maxPreviewCards: 24,
   inlineSubmitKey: "enhanced-enter"
@@ -79,7 +79,7 @@ function loadPanelSettings(): PanelSettings {
       defaultCardRows: clampNumber(parsed.defaultCardRows, DEFAULT_SETTINGS.defaultCardRows, 3, 14),
       minCardRows: clampNumber(parsed.minCardRows, DEFAULT_SETTINGS.minCardRows, 3, 14),
       previewMinHeight: clampNumber(parsed.previewMinHeight, DEFAULT_SETTINGS.previewMinHeight, 160, 1400),
-      previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, 1000),
+      previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, 5000),
       previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000),
       maxPreviewCards: clampNumber(parsed.maxPreviewCards, DEFAULT_SETTINGS.maxPreviewCards, 1, 100),
       inlineSubmitKey: parsed.inlineSubmitKey === "enter" ? "enter" : "enhanced-enter"
@@ -298,7 +298,8 @@ export function App() {
   }
 
   const shellStyle = {
-    "--session-card-min-height": `${settings.previewMinHeight + 120}px`
+    "--session-card-min-height": `${settings.previewMinHeight + 120}px`,
+    "--session-preview-min-height": `${settings.previewMinHeight}px`
   } as CSSProperties;
 
   return (
@@ -562,11 +563,11 @@ function SettingsModal({
             <input
               type="number"
               min="20"
-              max="1000"
-              step="20"
+              max="5000"
+              step="100"
               value={settings.previewLines}
               onChange={(event) =>
-                update("previewLines", clampNumber(event.target.value, DEFAULT_SETTINGS.previewLines, 20, 1000))
+                update("previewLines", clampNumber(event.target.value, DEFAULT_SETTINGS.previewLines, 20, 5000))
               }
             />
           </label>

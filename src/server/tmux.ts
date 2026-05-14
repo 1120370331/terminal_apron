@@ -45,6 +45,9 @@ export async function hasSession(tmuxName: string): Promise<boolean> {
 
 export async function ensureTmuxSession(session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">): Promise<void> {
   if (await hasSession(session.tmuxName)) {
+    await runTmux(["set-option", "-t", session.tmuxName, "history-limit", String(config.tmuxHistoryLimit)], 5000).catch(
+      () => undefined
+    );
     return;
   }
 
@@ -57,6 +60,9 @@ export async function ensureTmuxSession(session: Pick<TerminalSession, "tmuxName
   }
 
   await runTmux(args, 10000);
+  await runTmux(["set-option", "-t", session.tmuxName, "history-limit", String(config.tmuxHistoryLimit)], 5000).catch(
+    () => undefined
+  );
 }
 
 export async function killTmuxSession(session: Pick<TerminalSession, "tmuxName">): Promise<void> {
@@ -71,7 +77,7 @@ export async function capturePreview(session: Pick<TerminalSession, "tmuxName">,
     return "";
   }
 
-  const start = `-${Math.max(5, Math.min(lines, 1000))}`;
+  const start = `-${Math.max(5, Math.min(lines, config.previewMaxLines))}`;
   const result = await runTmux(["capture-pane", "-p", "-J", "-S", start, "-t", session.tmuxName], 5000);
   return result.stdout.replace(/\s+$/g, "");
 }

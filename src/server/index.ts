@@ -376,5 +376,5 @@ function parsePreviewLines(value: unknown): number {
   if (!Number.isFinite(parsed)) {
     return 500;
   }
-  return Math.max(20, Math.min(1000, Math.floor(parsed)));
+  return Math.max(20, Math.min(config.previewMaxLines, Math.floor(parsed)));
 }

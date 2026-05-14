@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import type { Socket } from "socket.io";
 import Headless from "@xterm/headless";
 import type { Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { SessionRuntime, TerminalSession } from "../shared/types.js";
+import { config } from "./config.js";
 import { loadPty, type PtyProcess } from "./pty.js";
 
 interface NativeEntry {
@@ -16,9 +18,14 @@ interface NativeEntry {
   currentPath: string;
   command: string;
   exited: boolean;
+  transcriptPath: string;
+  transcriptQueue: Promise<void>;
+  pendingTranscriptBytes: number;
+  lastTranscriptTrimAt: number;
 }
 
-const MAX_PREVIEW_CHARS = 240_000;
+const TRANSCRIPT_TRIM_BYTES = 256_000;
+const TRANSCRIPT_TRIM_INTERVAL_MS = 5000;
 
 export class NativeSessionManager {
   private readonly sessions = new Map<string, NativeEntry>();
@@ -33,6 +40,7 @@ export class NativeSessionManager {
     const pty = await loadPty();
     const command = resolveShell(session.shell);
     const cwd = resolveCwd(session.cwd);
+    const initialOutput = await loadTranscript(session.id);
     const term = pty.spawn(command.file, command.args, {
       name: "xterm-256color",
       cols,
@@ -54,15 +62,23 @@ export class NativeSessionManager {
         allowProposedApi: true,
         cols,
         rows,
-        scrollback: 10000
+        scrollback: config.nativeScreenScrollback
       }),
       screenQueue: Promise.resolve(),
-      output: "",
+      output: initialOutput,
       clients: new Set(),
       currentPath: cwd,
       command: [command.file, ...command.args].join(" "),
-      exited: false
+      exited: false,
+      transcriptPath: transcriptPathForSession(session.id),
+      transcriptQueue: Promise.resolve(),
+      pendingTranscriptBytes: 0,
+      lastTranscriptTrimAt: Date.now()
     };
+
+    if (initialOutput) {
+      entry.screenQueue = writeHeadless(entry.screen, initialOutput);
+    }
 
     term.onData((data) => {
       entry.screenQueue = entry.screenQueue
@@ -73,7 +89,8 @@ export class NativeSessionManager {
             })
         )
         .catch(() => undefined);
-      entry.output = tail(entry.output + data, MAX_PREVIEW_CHARS);
+      entry.output = tailByUtf8Bytes(entry.output + data, config.nativeHistoryBytes);
+      queueTranscriptWrite(entry, data);
       for (const client of entry.clients) {
         client.emit("terminal:data", data);
       }
@@ -105,8 +122,9 @@ export class NativeSessionManager {
       attachCommand: null
     });
 
-    if (entry.output) {
-      socket.emit("terminal:data", entry.output);
+    const attachHistory = await loadTranscript(session.id);
+    if (attachHistory) {
+      socket.emit("terminal:data", attachHistory);
     }
 
     socket.on("terminal:input", (data: string) => {
@@ -146,7 +164,7 @@ export class NativeSessionManager {
   async preview(session: TerminalSession, lines = 500): Promise<string> {
     const entry = this.sessions.get(session.id);
     if (!entry) {
-      return "";
+      return renderPlainPreview(await loadTranscript(session.id), lines);
     }
     await entry.screenQueue;
     const buffer = entry.screen.buffer.active;
@@ -171,6 +189,61 @@ export class NativeSessionManager {
       windows: 1,
       lastAttached: null
     };
+  }
+}
+
+function writeHeadless(screen: HeadlessTerminal, data: string): Promise<void> {
+  return new Promise<void>((resolve) => {
+    screen.write(data, resolve);
+  });
+}
+
+function transcriptPathForSession(sessionId: string): string {
+  return path.join(config.dataDir, "transcripts", `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.ansi`);
+}
+
+async function loadTranscript(sessionId: string): Promise<string> {
+  return readTailFile(transcriptPathForSession(sessionId), config.nativeHistoryBytes).catch(() => "");
+}
+
+function queueTranscriptWrite(entry: NativeEntry, data: string): void {
+  entry.transcriptQueue = entry.transcriptQueue
+    .then(async () => {
+      await fs.promises.mkdir(path.dirname(entry.transcriptPath), { recursive: true });
+      await fs.promises.appendFile(entry.transcriptPath, data, "utf8");
+      entry.pendingTranscriptBytes += Buffer.byteLength(data, "utf8");
+      const now = Date.now();
+      if (
+        entry.pendingTranscriptBytes >= TRANSCRIPT_TRIM_BYTES ||
+        now - entry.lastTranscriptTrimAt >= TRANSCRIPT_TRIM_INTERVAL_MS
+      ) {
+        await trimTranscript(entry.transcriptPath, config.nativeHistoryBytes);
+        entry.pendingTranscriptBytes = 0;
+        entry.lastTranscriptTrimAt = now;
+      }
+    })
+    .catch(() => undefined);
+}
+
+async function trimTranscript(filePath: string, maxBytes: number): Promise<void> {
+  const retained = await readTailFile(filePath, maxBytes);
+  await fs.promises.writeFile(filePath, retained, "utf8");
+}
+
+async function readTailFile(filePath: string, maxBytes: number): Promise<string> {
+  const stat = await fs.promises.stat(filePath);
+  if (stat.size <= 0) {
+    return "";
+  }
+  const length = Math.min(stat.size, maxBytes);
+  const start = Math.max(0, stat.size - length);
+  const handle = await fs.promises.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const result = await handle.read(buffer, 0, length, start);
+    return buffer.subarray(0, result.bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
   }
 }
 
@@ -206,11 +279,16 @@ function splitCommand(value: string): string[] {
   return matches.map((part) => part.replace(/^["']|["']$/g, ""));
 }
 
-function tail(value: string, maxChars: number): string {
-  if (value.length <= maxChars) {
+function tailByUtf8Bytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
     return value;
   }
-  return value.slice(value.length - maxChars);
+
+  let retained = value.slice(Math.max(0, value.length - maxBytes));
+  while (Buffer.byteLength(retained, "utf8") > maxBytes) {
+    retained = retained.slice(Math.max(1, Math.ceil((Buffer.byteLength(retained, "utf8") - maxBytes) / 4)));
+  }
+  return retained;
 }
 
 function clampDimension(value: unknown, fallback: number, min: number, max: number): number {

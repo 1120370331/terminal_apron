@@ -37,7 +37,7 @@ export function TerminalDock({ session, onClose }: Props) {
         cursor: "#f2c94c",
         selectionBackground: "#2f80ed66"
       },
-      scrollback: 10000
+      scrollback: 50000
     });
     const fit = new FitAddon();
     terminal.loadAddon(fit);

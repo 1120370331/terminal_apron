@@ -1,4 +1,4 @@
-import { FormEvent, UIEvent, WheelEvent, useLayoutEffect, useRef, useState } from "react";
+import { FormEvent, UIEvent, WheelEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Archive, Copy, Edit3, ExternalLink, Grip, Play, RotateCcw, Send, Square, Tag } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
 
@@ -31,8 +31,27 @@ export function SessionCard({
   const backend = runtime?.backend ?? session.backend;
   const [quickInput, setQuickInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [displayedPreview, setDisplayedPreview] = useState(preview);
+  const [historyPaused, setHistoryPaused] = useState(false);
+  const [hasPendingPreview, setHasPendingPreview] = useState(false);
   const previewRef = useRef<HTMLPreElement | null>(null);
   const stickToBottomRef = useRef(true);
+
+  useEffect(() => {
+    if (!preview && !displayedPreview) {
+      return;
+    }
+
+    if (historyPaused) {
+      if (preview !== displayedPreview) {
+        setHasPendingPreview(true);
+      }
+      return;
+    }
+
+    setDisplayedPreview(preview);
+    setHasPendingPreview(false);
+  }, [displayedPreview, historyPaused, preview]);
 
   useLayoutEffect(() => {
     const previewElement = previewRef.current;
@@ -41,12 +60,17 @@ export function SessionCard({
     }
 
     previewElement.scrollTop = previewElement.scrollHeight;
-  }, [preview]);
+  }, [displayedPreview]);
 
   const trackPreviewScroll = (event: UIEvent<HTMLPreElement>) => {
     const target = event.currentTarget;
     const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
-    stickToBottomRef.current = distanceToBottom < 24;
+    const isAtBottom = distanceToBottom < 24;
+    stickToBottomRef.current = isAtBottom;
+    setHistoryPaused(target.scrollHeight > target.clientHeight && !isAtBottom);
+    if (isAtBottom) {
+      setHasPendingPreview(false);
+    }
   };
 
   const handlePreviewWheel = (event: WheelEvent<HTMLPreElement>) => {
@@ -64,6 +88,19 @@ export function SessionCard({
 
     event.preventDefault();
     target.scrollTop += event.deltaY;
+  };
+
+  const resumeLatestPreview = () => {
+    stickToBottomRef.current = true;
+    setHistoryPaused(false);
+    setDisplayedPreview(preview);
+    setHasPendingPreview(false);
+    window.setTimeout(() => {
+      const previewElement = previewRef.current;
+      if (previewElement) {
+        previewElement.scrollTop = previewElement.scrollHeight;
+      }
+    }, 0);
   };
 
   const submitQuickInput = async (event: FormEvent) => {
@@ -102,16 +139,29 @@ export function SessionCard({
         {livePath}
       </div>
 
-      <pre
-        className="preview"
-        ref={previewRef}
-        onScroll={trackPreviewScroll}
-        onWheel={handlePreviewWheel}
-        onMouseDown={(event) => event.stopPropagation()}
-        onTouchStart={(event) => event.stopPropagation()}
-      >
-        {preview || (isLive ? "" : "terminal is not running")}
-      </pre>
+      <div className="preview-wrap">
+        <pre
+          className="preview"
+          ref={previewRef}
+          onScroll={trackPreviewScroll}
+          onWheel={handlePreviewWheel}
+          onMouseDown={(event) => event.stopPropagation()}
+          onTouchStart={(event) => event.stopPropagation()}
+        >
+          {displayedPreview || (isLive ? "" : "terminal is not running")}
+        </pre>
+        {historyPaused && hasPendingPreview && (
+          <button
+            className="preview-latest"
+            type="button"
+            title="回到最新"
+            onClick={resumeLatestPreview}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            最新
+          </button>
+        )}
+      </div>
 
       {!session.archived && (
         <form className="quick-input" onSubmit={submitQuickInput} onMouseDown={(event) => event.stopPropagation()}>

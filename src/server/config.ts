@@ -29,6 +29,14 @@ function splitModes(value: string | undefined): AuthMethod[] | null {
   return parsed.length ? Array.from(new Set(parsed)) : null;
 }
 
+function parseBoundedInteger(value: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
 const dataDir = path.resolve(process.env.TWM_DATA_DIR ?? path.join(process.cwd(), "data"));
 const authorizedKeysFile = expandHome(
   process.env.TWM_AUTHORIZED_KEYS_FILE ?? path.join("~", ".ssh", "authorized_keys")
@@ -52,7 +60,11 @@ export const config = {
   authModes: explicitAuthModes ?? inferredAuthModes,
   authorizedKeysFile,
   cookieSecure: process.env.TWM_COOKIE_SECURE === "true",
-  sshNamespace: "terminal-web-monitor"
+  sshNamespace: "terminal-web-monitor",
+  nativeHistoryBytes: parseBoundedInteger(process.env.TWM_NATIVE_HISTORY_BYTES, 8_000_000, 240_000, 50_000_000),
+  nativeScreenScrollback: parseBoundedInteger(process.env.TWM_NATIVE_SCREEN_SCROLLBACK, 50_000, 1_000, 200_000),
+  previewMaxLines: parseBoundedInteger(process.env.TWM_PREVIEW_MAX_LINES, 5_000, 100, 20_000),
+  tmuxHistoryLimit: parseBoundedInteger(process.env.TWM_TMUX_HISTORY_LIMIT, 50_000, 1_000, 200_000)
 };
 
 function parseBackend(value: string | undefined): TerminalBackend {
