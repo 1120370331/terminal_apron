@@ -105,5 +105,5 @@ export const api = {
     request<TerminalSession>(`/api/sessions/${id}/kill`, {
       method: "POST"
     }),
-  preview: (id: string) => request<SessionPreview>(`/api/sessions/${id}/preview`)
+  preview: (id: string, lines = 500) => request<SessionPreview>(`/api/sessions/${id}/preview?lines=${lines}`)
 };
