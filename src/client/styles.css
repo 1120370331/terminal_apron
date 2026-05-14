@@ -294,8 +294,8 @@ select {
 
 .session-card-header {
   gap: 8px;
-  min-height: 48px;
-  padding: 9px 10px 6px;
+  min-height: 42px;
+  padding: 7px 10px 5px;
 }
 
 .drag-handle {
@@ -350,7 +350,7 @@ select {
 }
 
 .path-line {
-  margin: 0 12px 8px;
+  margin: 0 12px 6px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -360,7 +360,7 @@ select {
 
 .preview {
   flex: 1;
-  min-height: 0;
+  min-height: 160px;
   margin: 0 10px;
   padding: 10px;
   overflow: auto;
@@ -394,13 +394,13 @@ select {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin: 8px 10px 0;
+  margin: 6px 10px 0;
 }
 
 .quick-input input {
   width: 100%;
   min-width: 0;
-  height: 32px;
+  height: 30px;
   padding: 0 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -415,8 +415,8 @@ select {
 
 .session-footer {
   justify-content: space-between;
-  gap: 10px;
-  padding: 10px;
+  gap: 8px;
+  padding: 8px 10px;
 }
 
 .tag-row {
