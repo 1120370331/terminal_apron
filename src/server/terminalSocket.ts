@@ -8,6 +8,9 @@ import { loadPty } from "./pty.js";
 import { resolveBackend } from "./backend.js";
 import { NativeSessionManager } from "./nativeSessions.js";
 
+const MAX_TERMINAL_COLS = 4096;
+const MAX_TERMINAL_ROWS = 2048;
+
 export function registerTerminalSockets(io: Server, store: SessionStore, nativeSessions: NativeSessionManager): void {
   io.use(async (socket, next) => {
     const user = await userFromCookie(socket.handshake.headers.cookie);
@@ -38,8 +41,8 @@ async function attachTerminal(
   }
 
   try {
-    const cols = clampDimension(socket.handshake.query.cols, 120, 20, 300);
-    const rows = clampDimension(socket.handshake.query.rows, 36, 10, 120);
+    const cols = clampDimension(socket.handshake.query.cols, 120, 20, MAX_TERMINAL_COLS);
+    const rows = clampDimension(socket.handshake.query.rows, 36, 10, MAX_TERMINAL_ROWS);
     const backend = await resolveBackend(session);
     if (backend === "native") {
       await nativeSessions.attach(session, socket, cols, rows);
@@ -82,6 +85,7 @@ async function attachZellij(
     tmuxName: session.tmuxName,
     attachCommand: zellijAttachCommand(session)
   });
+  socket.emit("terminal:resized", { cols, rows, seq: 0 });
 
   let transcriptQueue = Promise.resolve();
   term.onData((data) => {
@@ -100,10 +104,11 @@ async function attachZellij(
     term.write(data);
   });
 
-  socket.on("terminal:resize", (size: { cols?: number; rows?: number }) => {
-    const nextCols = clampDimension(size.cols, cols, 20, 300);
-    const nextRows = clampDimension(size.rows, rows, 10, 120);
+  socket.on("terminal:resize", (size: { cols?: number; rows?: number; seq?: number }) => {
+    const nextCols = clampDimension(size.cols, cols, 20, MAX_TERMINAL_COLS);
+    const nextRows = clampDimension(size.rows, rows, 10, MAX_TERMINAL_ROWS);
     term.resize(nextCols, nextRows);
+    socket.emit("terminal:resized", { cols: nextCols, rows: nextRows, seq: size.seq });
   });
 
   socket.on("disconnect", () => {
@@ -137,6 +142,7 @@ async function attachTmux(
     tmuxName: session.tmuxName,
     attachCommand: `tmux attach -t ${session.tmuxName}`
   });
+  socket.emit("terminal:resized", { cols, rows, seq: 0 });
 
   term.onData((data) => {
     socket.emit("terminal:data", data);
@@ -151,10 +157,11 @@ async function attachTmux(
     term.write(data);
   });
 
-  socket.on("terminal:resize", (size: { cols?: number; rows?: number }) => {
-    const nextCols = clampDimension(size.cols, cols, 20, 300);
-    const nextRows = clampDimension(size.rows, rows, 10, 120);
+  socket.on("terminal:resize", (size: { cols?: number; rows?: number; seq?: number }) => {
+    const nextCols = clampDimension(size.cols, cols, 20, MAX_TERMINAL_COLS);
+    const nextRows = clampDimension(size.rows, rows, 10, MAX_TERMINAL_ROWS);
     term.resize(nextCols, nextRows);
+    socket.emit("terminal:resized", { cols: nextCols, rows: nextRows, seq: size.seq });
   });
 
   socket.on("disconnect", () => {

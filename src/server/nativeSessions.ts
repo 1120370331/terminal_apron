@@ -8,6 +8,9 @@ import type { SessionRuntime, TerminalSession } from "../shared/types.js";
 import { config } from "./config.js";
 import { loadPty, type PtyProcess } from "./pty.js";
 
+const MAX_TERMINAL_COLS = 4096;
+const MAX_TERMINAL_ROWS = 2048;
+
 interface NativeEntry {
   session: TerminalSession;
   term: PtyProcess;
@@ -121,6 +124,7 @@ export class NativeSessionManager {
       tmuxName: session.tmuxName,
       attachCommand: null
     });
+    socket.emit("terminal:resized", { cols, rows, seq: 0 });
 
     const attachHistory = await loadTranscript(session.id);
     if (attachHistory) {
@@ -131,11 +135,12 @@ export class NativeSessionManager {
       entry.term.write(data);
     });
 
-    socket.on("terminal:resize", (size: { cols?: number; rows?: number }) => {
-      const nextCols = clampDimension(size.cols, cols, 20, 300);
-      const nextRows = clampDimension(size.rows, rows, 10, 120);
+    socket.on("terminal:resize", (size: { cols?: number; rows?: number; seq?: number }) => {
+      const nextCols = clampDimension(size.cols, cols, 20, MAX_TERMINAL_COLS);
+      const nextRows = clampDimension(size.rows, rows, 10, MAX_TERMINAL_ROWS);
       entry.term.resize(nextCols, nextRows);
       entry.screen.resize(nextCols, nextRows);
+      socket.emit("terminal:resized", { cols: nextCols, rows: nextRows, seq: size.seq });
     });
 
     socket.on("disconnect", () => {

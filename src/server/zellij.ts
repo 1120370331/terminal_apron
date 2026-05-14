@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import Headless from "@xterm/headless";
+import type { Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { SessionRuntime, TerminalSession } from "../shared/types.js";
 import { config } from "./config.js";
 import { loadPty } from "./pty.js";
@@ -73,10 +75,12 @@ export async function ensureZellijSession(
   session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">
 ): Promise<void> {
   if (await hasZellijSession(session.tmuxName)) {
+    await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
     return;
   }
 
   await bootstrapZellijSession(session);
+  await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
 }
 
 export async function killZellijSession(session: Pick<TerminalSession, "tmuxName">): Promise<void> {
@@ -94,7 +98,7 @@ export async function captureZellijPreview(
   lines = 500
 ): Promise<string> {
   if (!(await hasZellijSession(session.tmuxName))) {
-    return tailPlainTranscript(await loadZellijTranscript(session.id), lines);
+    return renderPlainTranscript(await loadZellijTranscript(session.id), lines);
   }
 
   const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
@@ -106,7 +110,7 @@ export async function captureZellijPreview(
     timeoutMs: 5000
   }).catch(() => ({ stdout: "", stderr: "" }));
   const rendered = tailLines(result.stdout.replace(/\s+$/g, ""), Math.max(20, Math.min(lines, config.previewMaxLines)));
-  return rendered.trim() ? rendered : tailPlainTranscript(await loadZellijTranscript(session.id), lines);
+  return rendered.trim() ? rendered : renderPlainTranscript(await loadZellijTranscript(session.id), lines);
 }
 
 export function appendZellijTranscript(sessionId: string, data: string): Promise<void> {
@@ -170,7 +174,7 @@ export async function zellijRuntimeInfo(session: TerminalSession): Promise<Sessi
 }
 
 export function zellijAttachArgs(session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">): string[] {
-  return ["attach", "--create", session.tmuxName, ...zellijOptions(session)];
+  return ["--layout-string", "layout { pane }", "attach", "--create", session.tmuxName, ...zellijOptions(session)];
 }
 
 export function zellijAttachCommand(session: Pick<TerminalSession, "tmuxName">): string {
@@ -199,6 +203,28 @@ async function listZellijPanes(sessionName: string): Promise<ZellijPane[]> {
   });
   const parsed = JSON.parse(result.stdout) as unknown;
   return Array.isArray(parsed) ? (parsed as ZellijPane[]) : [];
+}
+
+async function pruneZellijUiPanes(sessionName: string): Promise<void> {
+  const panes = await listZellijPanes(sessionName);
+  for (const pane of panes) {
+    if (!pane.is_plugin) {
+      continue;
+    }
+    const id = pane.pane_id ?? pane.id;
+    if (typeof id !== "number") {
+      continue;
+    }
+    await runZellij(["--session", sessionName, "action", "close-pane", "--pane-id", `plugin_${id}`], {
+      timeoutMs: 3000
+    }).catch(() => undefined);
+  }
+}
+
+export async function normalizeZellijSessionUi(sessionName: string): Promise<void> {
+  if (await hasZellijSession(sessionName)) {
+    await pruneZellijUiPanes(sessionName);
+  }
 }
 
 async function bootstrapZellijSession(session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">): Promise<void> {
@@ -333,8 +359,35 @@ function tailLines(value: string, linesToKeep: number): string {
   return lines.slice(-linesToKeep).join("\n").trimEnd();
 }
 
-function tailPlainTranscript(value: string, lines: number): string {
-  return tailLines(value, Math.max(20, Math.min(lines, config.previewMaxLines)));
+async function renderPlainTranscript(value: string, lines: number): Promise<string> {
+  if (!value) {
+    return "";
+  }
+  const linesToKeep = Math.max(20, Math.min(lines, config.previewMaxLines));
+  const screen = new Headless.Terminal({
+    allowProposedApi: true,
+    cols: 160,
+    rows: 40,
+    scrollback: Math.max(linesToKeep, 1000)
+  });
+  try {
+    await writeHeadless(screen, value);
+    const buffer = screen.buffer.active;
+    const start = Math.max(0, buffer.length - linesToKeep);
+    const rows: string[] = [];
+    for (let index = start; index < buffer.length; index += 1) {
+      rows.push(buffer.getLine(index)?.translateToString(true) ?? "");
+    }
+    return rows.join("\n").trimEnd();
+  } finally {
+    screen.dispose();
+  }
+}
+
+function writeHeadless(screen: HeadlessTerminal, data: string): Promise<void> {
+  return new Promise<void>((resolve) => {
+    screen.write(data, resolve);
+  });
 }
 
 function stripAnsi(value: string): string {
