@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, UIEvent, useLayoutEffect, useRef, useState } from "react";
 import { Archive, Copy, Edit3, ExternalLink, Grip, Play, RotateCcw, Send, Square, Tag } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
 
@@ -31,6 +31,23 @@ export function SessionCard({
   const backend = runtime?.backend ?? session.backend;
   const [quickInput, setQuickInput] = useState("");
   const [sending, setSending] = useState(false);
+  const previewRef = useRef<HTMLPreElement | null>(null);
+  const stickToBottomRef = useRef(true);
+
+  useLayoutEffect(() => {
+    const previewElement = previewRef.current;
+    if (!previewElement || !stickToBottomRef.current) {
+      return;
+    }
+
+    previewElement.scrollTop = previewElement.scrollHeight;
+  }, [preview]);
+
+  const trackPreviewScroll = (event: UIEvent<HTMLPreElement>) => {
+    const target = event.currentTarget;
+    const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
+    stickToBottomRef.current = distanceToBottom < 24;
+  };
 
   const submitQuickInput = async (event: FormEvent) => {
     event.preventDefault();
@@ -68,7 +85,15 @@ export function SessionCard({
         {livePath}
       </div>
 
-      <pre className="preview">{preview || (isLive ? "" : "terminal is not running")}</pre>
+      <pre
+        className="preview"
+        ref={previewRef}
+        onScroll={trackPreviewScroll}
+        onMouseDown={(event) => event.stopPropagation()}
+        onTouchStart={(event) => event.stopPropagation()}
+      >
+        {preview || (isLive ? "" : "terminal is not running")}
+      </pre>
 
       {!session.archived && (
         <form className="quick-input" onSubmit={submitQuickInput} onMouseDown={(event) => event.stopPropagation()}>
