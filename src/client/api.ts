@@ -90,7 +90,7 @@ export const api = {
     request<TerminalSession>(`/api/sessions/${id}/ensure`, {
       method: "POST"
     }),
-  sendInput: (id: string, input: { data: string; enter?: boolean; submitKey?: "enter" | "enhanced-enter" }) =>
+  sendInput: (id: string, input: { data: string; enter?: boolean; submitKey?: "enter" }) =>
     request<{ ok: boolean; runtime?: TerminalSession["runtime"]; preview?: string }>(`/api/sessions/${id}/input`, {
       method: "POST",
       body: JSON.stringify(input)

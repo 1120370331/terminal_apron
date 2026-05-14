@@ -78,26 +78,21 @@ export async function capturePreview(session: Pick<TerminalSession, "tmuxName">,
   }
 
   const start = `-${Math.max(5, Math.min(lines, config.previewMaxLines))}`;
-  const result = await runTmux(["capture-pane", "-p", "-J", "-S", start, "-t", session.tmuxName], 5000);
+  const result = await runTmux(["capture-pane", "-p", "-e", "-J", "-S", start, "-t", session.tmuxName], 5000);
   return result.stdout.replace(/\s+$/g, "");
 }
 
 export async function sendTmuxInput(
   session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
   data: string,
-  enter = false,
-  submitKey: "enter" | "enhanced-enter" = "enter"
+  enter = false
 ): Promise<void> {
   await ensureTmuxSession(session);
   const bufferName = `twm_input_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   await runTmux(["set-buffer", "-b", bufferName, data], 5000);
   await runTmux(["paste-buffer", "-d", "-b", bufferName, "-t", session.tmuxName], 5000);
   if (enter) {
-    if (submitKey === "enhanced-enter") {
-      await runTmux(["send-keys", "-t", session.tmuxName, "Escape", "[", "1", "3", "u"], 5000);
-    } else {
-      await runTmux(["send-keys", "-t", session.tmuxName, "Enter"], 5000);
-    }
+    await runTmux(["send-keys", "-t", session.tmuxName, "Enter"], 5000);
   }
 }
 

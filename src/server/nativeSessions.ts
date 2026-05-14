@@ -158,11 +158,11 @@ export class NativeSessionManager {
     this.sessions.delete(session.id);
   }
 
-  async write(session: TerminalSession, data: string, enter = false, submitKey: "enter" | "enhanced-enter" = "enter"): Promise<void> {
+  async write(session: TerminalSession, data: string, enter = false): Promise<void> {
     const entry = await this.ensure(session);
     entry.term.write(data);
     if (enter) {
-      entry.term.write(submitKey === "enhanced-enter" ? "\u001b[13u" : "\r");
+      entry.term.write("\r");
     }
   }
 

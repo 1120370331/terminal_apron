@@ -104,7 +104,7 @@ export async function captureZellijPreview(
   }
 
   const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
-  const args = ["--session", session.tmuxName, "action", "dump-screen", "--full"];
+  const args = ["--session", session.tmuxName, "action", "dump-screen", "--full", "--ansi"];
   if (paneId) {
     args.push("--pane-id", paneId);
   }
@@ -122,8 +122,7 @@ export function appendZellijTranscript(sessionId: string, data: string): Promise
 export async function sendZellijInput(
   session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
   data: string,
-  enter = false,
-  submitKey: "enter" | "enhanced-enter" = "enter"
+  enter = false
 ): Promise<void> {
   await ensureZellijSession(session);
   if (!(await hasZellijSession(session.tmuxName))) {
@@ -133,12 +132,6 @@ export async function sendZellijInput(
   const target = paneId ? ["--pane-id", paneId] : [];
   await runZellij(["--session", session.tmuxName, "action", "paste", ...target, data], { timeoutMs: 5000 });
   if (!enter) {
-    return;
-  }
-  if (submitKey === "enhanced-enter") {
-    await runZellij(["--session", session.tmuxName, "action", "write", ...target, "27", "91", "49", "51", "117"], {
-      timeoutMs: 5000
-    });
     return;
   }
   await runZellij(["--session", session.tmuxName, "action", "write", ...target, "13"], { timeoutMs: 5000 });

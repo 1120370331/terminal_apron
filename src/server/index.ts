@@ -232,7 +232,7 @@ app.post("/api/sessions/:id/input", async (req, res) => {
     return;
   }
 
-  const { data, enter, submitKey } = req.body as { data?: unknown; enter?: unknown; submitKey?: unknown };
+  const { data, enter } = req.body as { data?: unknown; enter?: unknown; submitKey?: unknown };
   if (typeof data !== "string" || data.length === 0) {
     res.status(400).json({ error: "input data is required" });
     return;
@@ -242,7 +242,7 @@ app.post("/api/sessions/:id/input", async (req, res) => {
     return;
   }
 
-  await sendSessionInput(session, data, enter !== false, submitKey === "enhanced-enter" ? "enhanced-enter" : "enter");
+  await sendSessionInput(session, data, enter !== false);
   res.json({
     ok: true,
     runtime: await getRuntime(session),
@@ -370,19 +370,18 @@ async function killSession(session: TerminalSession) {
 async function sendSessionInput(
   session: TerminalSession,
   data: string,
-  enter: boolean,
-  submitKey: "enter" | "enhanced-enter"
+  enter: boolean
 ) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
-    await sendTmuxInput(session, data, enter, submitKey);
+    await sendTmuxInput(session, data, enter);
     return;
   }
   if (backend === "zellij") {
-    await sendZellijInput(session, data, enter, submitKey);
+    await sendZellijInput(session, data, enter);
     return;
   }
-  await nativeSessions.write(session, data, enter, submitKey);
+  await nativeSessions.write(session, data, enter);
 }
 
 function nextCopyName(name: string, existingNames: string[]): string {

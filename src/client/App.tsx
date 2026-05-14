@@ -44,7 +44,7 @@ interface PanelSettings {
   previewLines: number;
   previewRefreshMs: number;
   maxPreviewCards: number;
-  inlineSubmitKey: "enhanced-enter" | "enter";
+  inlineSubmitKey: "enter";
   themeMode: ThemeMode;
 }
 
@@ -115,7 +115,7 @@ function loadPanelSettings(): PanelSettings {
       previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, 5000),
       previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000),
       maxPreviewCards: clampNumber(parsed.maxPreviewCards, DEFAULT_SETTINGS.maxPreviewCards, 1, 100),
-      inlineSubmitKey: parsed.inlineSubmitKey === "enhanced-enter" ? "enhanced-enter" : "enter",
+      inlineSubmitKey: "enter",
       themeMode: parseThemeMode(parsed.themeMode)
     };
   } catch {
@@ -497,7 +497,7 @@ export function App() {
                   await loadSessions();
                 }}
                 onQuickInput={async (value) => {
-                  const input = { data: value, enter: true, submitKey: settings.inlineSubmitKey };
+                  const input = { data: value, enter: true, submitKey: "enter" as const };
                   const result = await api.sendInput(session.id, input);
                   if (result.preview !== undefined) {
                     setPreviews((current) => ({ ...current, [session.id]: result.preview || current[session.id] || "" }));
@@ -695,9 +695,8 @@ function SettingsModal({
             <span>列表发送按键</span>
             <select
               value={settings.inlineSubmitKey}
-              onChange={(event) => update("inlineSubmitKey", event.target.value === "enter" ? "enter" : "enhanced-enter")}
+              onChange={() => update("inlineSubmitKey", "enter")}
             >
-              <option value="enhanced-enter">Enhanced Enter</option>
               <option value="enter">Enter</option>
             </select>
           </label>
