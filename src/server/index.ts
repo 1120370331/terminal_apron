@@ -228,7 +228,7 @@ app.post("/api/sessions/:id/input", async (req, res) => {
   res.json({
     ok: true,
     runtime: await getRuntime(session),
-    preview: await captureSessionPreview(session).catch(() => "")
+    preview: await captureSessionPreview(session, parsePreviewLines(req.body?.lines)).catch(() => "")
   });
 });
 
@@ -273,7 +273,7 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
   }
   res.json({
     sessionId: session.id,
-    text: await captureSessionPreview(session).catch(() => ""),
+    text: await captureSessionPreview(session, parsePreviewLines(req.query.lines)).catch(() => ""),
     capturedAt: new Date().toISOString()
   });
 });
@@ -315,9 +315,9 @@ async function getRuntime(session: TerminalSession) {
   return backend === "tmux" ? runtimeInfo(session) : nativeSessions.runtime(session);
 }
 
-async function captureSessionPreview(session: TerminalSession) {
+async function captureSessionPreview(session: TerminalSession, lines = 500) {
   const backend = await resolveBackend(session);
-  return backend === "tmux" ? capturePreview(session) : nativeSessions.preview(session);
+  return backend === "tmux" ? capturePreview(session, lines) : nativeSessions.preview(session, lines);
 }
 
 async function killSession(session: TerminalSession) {
@@ -369,4 +369,12 @@ function currentProcessUser() {
     uid: user.uid,
     gid: user.gid
   };
+}
+
+function parsePreviewLines(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 500;
+  }
+  return Math.max(20, Math.min(1000, Math.floor(parsed)));
 }
