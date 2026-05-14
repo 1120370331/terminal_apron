@@ -556,6 +556,7 @@ select {
   flex: 1;
   position: relative;
   display: flex;
+  min-width: 0;
   min-height: var(--session-preview-min-height, 500px);
   margin: 0 10px;
   overflow: hidden;
@@ -587,7 +588,7 @@ select {
 
 .terminal-grid-preview {
   line-height: 0;
-  overflow-x: auto;
+  overflow: auto;
 }
 
 .terminal-preview-canvas {
@@ -936,6 +937,7 @@ select {
 .terminal-host {
   position: relative;
   flex: 1;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   padding: 8px;
@@ -947,12 +949,15 @@ select {
 }
 
 .terminal-host .xterm {
-  width: 100%;
+  width: 100% !important;
+  min-width: 0;
   height: 100%;
 }
 
 .terminal-host .xterm-screen,
 .terminal-host .xterm-viewport {
+  width: 100% !important;
+  min-width: 0;
   max-width: none;
 }
 

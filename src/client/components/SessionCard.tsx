@@ -92,8 +92,9 @@ function SessionCardComponent({
     if (!grid || !canvasRef.current) {
       return;
     }
-    drawPreviewCanvas(canvasRef.current, grid);
     const previewElement = previewRef.current;
+    const availableWidth = previewElement ? contentWidth(previewElement) : undefined;
+    drawPreviewCanvas(canvasRef.current, grid, availableWidth);
     if (previewElement && stickToBottomRef.current) {
       previewElement.scrollTop = previewElement.scrollHeight;
     }
@@ -344,7 +345,7 @@ function sessionCardSignature(session: TerminalSession): string {
   ].join("\u001f");
 }
 
-function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid): void {
+function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid, availableWidth?: number): void {
   const context = canvas.getContext("2d");
   if (!context) {
     return;
@@ -357,12 +358,13 @@ function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid)
   const cellWidth = Math.max(7, Math.ceil(context.measureText("M").width * 100) / 100);
   const naturalWidth = Math.max(1, grid.cols * cellWidth);
   const naturalHeight = Math.max(lineHeight, grid.rows.length * lineHeight);
-  const width = naturalWidth;
-  const height = naturalHeight;
+  const scale = availableWidth && availableWidth > 0 ? Math.min(1, availableWidth / naturalWidth) : 1;
+  const width = Math.max(1, naturalWidth * scale);
+  const height = Math.max(lineHeight * scale, naturalHeight * scale);
   const dpr = window.devicePixelRatio || 1;
 
-  canvas.width = Math.ceil(width * dpr);
-  canvas.height = Math.ceil(height * dpr);
+  canvas.width = Math.ceil(naturalWidth * dpr);
+  canvas.height = Math.ceil(naturalHeight * dpr);
   canvas.style.width = `${width}px`;
   canvas.style.height = `${height}px`;
 
@@ -380,6 +382,12 @@ function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid)
       x += segmentWidth;
     }
   }
+}
+
+function contentWidth(element: HTMLElement): number {
+  const style = window.getComputedStyle(element);
+  const paddingX = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight);
+  return Math.max(0, element.clientWidth - paddingX);
 }
 
 function drawCanvasSegment(
