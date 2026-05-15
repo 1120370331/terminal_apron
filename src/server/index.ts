@@ -35,7 +35,8 @@ import {
   sendZellijInput,
   zellijHealth,
   zellijPreviewSize,
-  zellijRuntimeInfo
+  zellijRuntimeInfo,
+  zellijRuntimeSnapshot
 } from "./zellij.js";
 import { registerTerminalSockets } from "./terminalSocket.js";
 import { nodePtyHealth } from "./pty.js";
@@ -170,7 +171,7 @@ app.get("/api/sessions", async (req, res) => {
   const enriched = await Promise.all(
     visible.map(async (session) => ({
       ...session,
-      runtime: await getRuntime(session, store.dataDir).catch(() => fallbackRuntime(session))
+      runtime: await getRuntimeSnapshot(session, store.dataDir).catch(() => fallbackRuntime(session))
     }))
   );
   res.json(enriched);
@@ -439,6 +440,14 @@ async function getRuntime(session: TerminalSession, dataDir = config.dataDir) {
     return zellijRuntimeInfo(session);
   }
   return nativeSessions.runtime(session, dataDir);
+}
+
+async function getRuntimeSnapshot(session: TerminalSession, dataDir = config.dataDir) {
+  const backend = await resolveBackend(session);
+  if (backend === "zellij") {
+    return zellijRuntimeSnapshot(session);
+  }
+  return getRuntime(session, dataDir);
 }
 
 async function captureSessionPreview(session: TerminalSession, dataDir: string, lines = 500, full = true) {

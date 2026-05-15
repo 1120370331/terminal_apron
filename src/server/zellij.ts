@@ -35,6 +35,9 @@ interface ZellijPane {
 const ZELLIJ_SINGLE_PANE_LAYOUT = ["layout {", "    pane", "}"].join("\n");
 const VIEWPORT_PREVIEW_TTL_MS = 600;
 const VIEWPORT_PREVIEW_STALE_MS = 30_000;
+const ZELLIJ_SESSION_LIST_TTL_MS = 750;
+const ZELLIJ_VERSION_TTL_MS = 60_000;
+const ZELLIJ_RUNTIME_CACHE_TTL_MS = 10_000;
 
 interface PreviewCacheEntry {
   value: string;
@@ -42,7 +45,16 @@ interface PreviewCacheEntry {
   inFlight?: Promise<string>;
 }
 
+interface RuntimeCacheEntry {
+  value: SessionRuntime;
+  capturedAt: number;
+  inFlight?: Promise<SessionRuntime>;
+}
+
 const viewportPreviewCache = new Map<string, PreviewCacheEntry>();
+const runtimeInfoCache = new Map<string, RuntimeCacheEntry>();
+let sessionListCache: { value: string[]; capturedAt: number; inFlight?: Promise<string[]> } | null = null;
+let zellijVersionCache: { value: string; capturedAt: number; inFlight?: Promise<string> } | null = null;
 
 function runZellij(args: string[], options: RunOptions = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -71,8 +83,26 @@ function runZellij(args: string[], options: RunOptions = {}): Promise<{ stdout: 
 }
 
 export async function zellijVersion(): Promise<string> {
-  const result = await runZellij(["--version"], { timeoutMs: 3000 });
-  return result.stdout.trim();
+  const now = Date.now();
+  if (zellijVersionCache?.value && now - zellijVersionCache.capturedAt < ZELLIJ_VERSION_TTL_MS) {
+    return zellijVersionCache.value;
+  }
+  if (zellijVersionCache?.inFlight) {
+    return zellijVersionCache.inFlight;
+  }
+
+  const inFlight = runZellij(["--version"], { timeoutMs: 3000 })
+    .then((result) => {
+      const value = result.stdout.trim();
+      zellijVersionCache = { value, capturedAt: Date.now() };
+      return value;
+    })
+    .catch((error) => {
+      zellijVersionCache = null;
+      throw error;
+    });
+  zellijVersionCache = { value: zellijVersionCache?.value ?? "", capturedAt: zellijVersionCache?.capturedAt ?? 0, inFlight };
+  return inFlight;
 }
 
 export async function zellijHealth(): Promise<{ available: boolean; version?: string; error?: string }> {
@@ -97,6 +127,8 @@ export async function ensureZellijSession(
   }
 
   await bootstrapZellijSession(session);
+  invalidateZellijSessionListCache();
+  runtimeInfoCache.delete(session.tmuxName);
   await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
   await saveZellijSessionState(session.tmuxName).catch(() => undefined);
 }
@@ -110,6 +142,8 @@ export async function killZellijSession(session: Pick<TerminalSession, "tmuxName
     runZellij(["kill-sessions", session.tmuxName], { timeoutMs: 5000 })
   );
   await runZellij(["delete-session", session.tmuxName], { timeoutMs: 5000 }).catch(() => undefined);
+  invalidateZellijSessionListCache();
+  runtimeInfoCache.delete(session.tmuxName);
 }
 
 export async function saveZellijSessionState(sessionName: string): Promise<void> {
@@ -251,6 +285,43 @@ export async function sendZellijInput(
 }
 
 export async function zellijRuntimeInfo(session: TerminalSession): Promise<SessionRuntime> {
+  const value = await zellijRuntimeInfoFresh(session);
+  runtimeInfoCache.set(session.tmuxName, { value, capturedAt: Date.now() });
+  return value;
+}
+
+export async function zellijRuntimeSnapshot(session: TerminalSession): Promise<SessionRuntime> {
+  const key = session.tmuxName;
+  const cached = runtimeInfoCache.get(key);
+  const now = Date.now();
+  if (cached && now - cached.capturedAt < ZELLIJ_RUNTIME_CACHE_TTL_MS) {
+    return cached.value;
+  }
+
+  if (!cached?.inFlight) {
+    const fallback = cached?.value ?? (await lightweightZellijRuntimeInfo(session));
+    const inFlight = zellijRuntimeInfoFresh(session)
+      .then((value) => {
+        runtimeInfoCache.set(key, { value, capturedAt: Date.now() });
+        return value;
+      })
+      .catch((error) => {
+        if (cached?.value) {
+          runtimeInfoCache.set(key, { value: cached.value, capturedAt: cached.capturedAt });
+          return cached.value;
+        }
+        runtimeInfoCache.delete(key);
+        throw error;
+      });
+
+    runtimeInfoCache.set(key, { value: fallback, capturedAt: cached?.capturedAt ?? 0, inFlight });
+    return fallback;
+  }
+
+  return cached.value;
+}
+
+async function zellijRuntimeInfoFresh(session: TerminalSession): Promise<SessionRuntime> {
   if (!(await hasZellijSession(session.tmuxName))) {
     return {
       exists: false,
@@ -281,6 +352,20 @@ export async function zellijRuntimeInfo(session: TerminalSession): Promise<Sessi
   };
 }
 
+async function lightweightZellijRuntimeInfo(session: TerminalSession): Promise<SessionRuntime> {
+  const exists = await hasZellijSession(session.tmuxName).catch(() => false);
+  return {
+    exists,
+    backend: "zellij",
+    persistent: true,
+    attached: 0,
+    currentPath: session.cwd,
+    currentCommand: "",
+    windows: exists ? 1 : 0,
+    lastAttached: null
+  };
+}
+
 export function zellijAttachArgs(session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">): string[] {
   return [
     "--layout-string",
@@ -298,19 +383,42 @@ export function zellijAttachCommand(session: Pick<TerminalSession, "tmuxName">):
 }
 
 async function listZellijSessions(): Promise<string[]> {
-  const result = await runZellij(["list-sessions"], { timeoutMs: 5000 }).catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    if (/no active zellij sessions|no active sessions|no sessions/i.test(message)) {
-      return { stdout: "", stderr: "" };
-    }
-    throw error;
-  });
+  const now = Date.now();
+  if (sessionListCache && now - sessionListCache.capturedAt < ZELLIJ_SESSION_LIST_TTL_MS) {
+    return sessionListCache.value;
+  }
+  if (sessionListCache?.inFlight) {
+    return sessionListCache.inFlight;
+  }
 
-  return result.stdout
-    .split(/\r?\n/)
-    .map(stripAnsi)
-    .map((line) => line.trim().split(/\s+/)[0])
-    .filter(Boolean);
+  const inFlight = runZellij(["list-sessions"], { timeoutMs: 5000 })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/no active zellij sessions|no active sessions|no sessions/i.test(message)) {
+        return { stdout: "", stderr: "" };
+      }
+      throw error;
+    })
+    .then((result) => {
+      const value = result.stdout
+        .split(/\r?\n/)
+        .map(stripAnsi)
+        .map((line) => line.trim().split(/\s+/)[0])
+        .filter(Boolean);
+      sessionListCache = { value, capturedAt: Date.now() };
+      return value;
+    })
+    .catch((error) => {
+      sessionListCache = null;
+      throw error;
+    });
+
+  sessionListCache = { value: sessionListCache?.value ?? [], capturedAt: sessionListCache?.capturedAt ?? 0, inFlight };
+  return inFlight;
+}
+
+function invalidateZellijSessionListCache(): void {
+  sessionListCache = null;
 }
 
 async function listZellijPanes(sessionName: string): Promise<ZellijPane[]> {

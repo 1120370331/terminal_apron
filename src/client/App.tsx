@@ -46,6 +46,9 @@ const SYSTEM_METRICS_HISTORY_LIMIT = 120;
 const DEFAULT_PREVIEW_LINES = 600;
 const MAX_LIST_PREVIEW_LINES = 1200;
 const FULL_PREVIEW_REFRESH_MS = 10_000;
+const PREVIEW_REVEAL_TIMEOUT_MS = 1500;
+const DESKTOP_INITIAL_PREVIEW_CARDS = 3;
+const MOBILE_INITIAL_PREVIEW_CARDS = 2;
 const MOBILE_QUERY = "(max-width: 720px)";
 const GRID_COLUMNS = 12;
 const CARD_COLUMNS = 4;
@@ -447,6 +450,7 @@ export function App() {
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  const [previewRevealTimedOut, setPreviewRevealTimedOut] = useState(false);
   const [loading, setLoading] = useState(false);
   const [localLayout, setLocalLayout] = useState<Layout[]>([]);
   const layoutDirtyRef = useRef(false);
@@ -615,11 +619,36 @@ export function App() {
     () => previewTargets.map((target) => `${target.id}:${target.exists ? "1" : "0"}`).join("|"),
     [previewTargets]
   );
-  const previewBatchReady = useMemo(
-    () => previewTargets.every((target) => !target.exists || Boolean(previews[target.id])),
-    [previewTargets, previews]
+  const previewRevealTargets = useMemo(
+    () => previewTargets.slice(0, isMobile ? MOBILE_INITIAL_PREVIEW_CARDS : DESKTOP_INITIAL_PREVIEW_CARDS),
+    [isMobile, previewTargets]
   );
-  const terminalListLoading = !sessionsLoaded || (filtered.length > 0 && previewTargets.length > 0 && !previewBatchReady);
+  const previewRevealTargetKey = useMemo(
+    () => previewRevealTargets.map((target) => `${target.id}:${target.exists ? "1" : "0"}`).join("|"),
+    [previewRevealTargets]
+  );
+  const previewRevealReady = useMemo(
+    () => previewRevealTargets.every((target) => !target.exists || Boolean(previews[target.id])),
+    [previewRevealTargets, previews]
+  );
+  const terminalListLoading =
+    !sessionsLoaded ||
+    (filtered.length > 0 &&
+      previewRevealTargets.length > 0 &&
+      !previewRevealReady &&
+      !previewRevealTimedOut);
+
+  useEffect(() => {
+    setPreviewRevealTimedOut(false);
+    if (!auth || !sessionsLoaded || previewRevealTargets.length === 0 || previewRevealReady) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setPreviewRevealTimedOut(true);
+    }, PREVIEW_REVEAL_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [auth, sessionsLoaded, previewRevealReady, previewRevealTargetKey, previewRevealTargets.length]);
 
   useEffect(() => {
     if (!auth || previewTargets.length === 0) {
