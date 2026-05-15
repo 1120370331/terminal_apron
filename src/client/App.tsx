@@ -446,6 +446,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [localLayout, setLocalLayout] = useState<Layout[]>([]);
   const layoutDirtyRef = useRef(false);
@@ -460,6 +461,7 @@ export function App() {
     try {
       const next = await api.sessions(showArchived);
       setSessions((current) => (sameSessionList(current, next) ? current : next));
+      setSessionsLoaded(true);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
         setAuth(null);
@@ -479,6 +481,7 @@ export function App() {
   useEffect(() => {
     if (!auth) {
       userStorageReadyRef.current = null;
+      setSessionsLoaded(false);
       return;
     }
     const userName = auth.name;
@@ -612,6 +615,11 @@ export function App() {
     () => previewTargets.map((target) => `${target.id}:${target.exists ? "1" : "0"}`).join("|"),
     [previewTargets]
   );
+  const previewBatchReady = useMemo(
+    () => previewTargets.every((target) => !target.exists || Boolean(previews[target.id])),
+    [previewTargets, previews]
+  );
+  const terminalListLoading = !sessionsLoaded || (filtered.length > 0 && previewTargets.length > 0 && !previewBatchReady);
 
   useEffect(() => {
     if (!auth || previewTargets.length === 0) {
@@ -958,7 +966,9 @@ export function App() {
         </button>
       </section>
 
-      {filtered.length === 0 ? (
+      {terminalListLoading ? (
+        <TerminalListLoader />
+      ) : filtered.length === 0 ? (
         <section className="empty-state">
           <Boxes size={42} />
           <h2>没有匹配的 terminal</h2>
@@ -1041,6 +1051,23 @@ export function App() {
         />
       )}
     </main>
+  );
+}
+
+function TerminalListLoader() {
+  return (
+    <section className="terminal-list-loader" aria-busy="true" aria-live="polite">
+      <div className="terminal-loader-mark" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </div>
+      <div className="terminal-loader-lines" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </div>
+    </section>
   );
 }
 
