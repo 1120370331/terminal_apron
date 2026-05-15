@@ -4,14 +4,16 @@ import type { CreateSessionInput, TerminalSession } from "../../shared/types";
 
 interface Props {
   session: TerminalSession | null;
+  initialGroup?: string;
+  initialTags?: string[];
   onClose: () => void;
   onSave: (input: CreateSessionInput) => Promise<void>;
 }
 
-export function SessionEditor({ session, onClose, onSave }: Props) {
+export function SessionEditor({ session, initialGroup, initialTags = [], onClose, onSave }: Props) {
   const [name, setName] = useState(session?.name ?? "");
-  const [group, setGroup] = useState(session?.group ?? "default");
-  const [tags, setTags] = useState(session?.tags.join(", ") ?? "");
+  const [group, setGroup] = useState(session?.group ?? initialGroup ?? "default");
+  const [tags, setTags] = useState(session?.tags.join(", ") ?? initialTags.join(", "));
   const [cwd, setCwd] = useState(session?.cwd ?? "");
   const [shell, setShell] = useState(session?.shell ?? "");
   const [color, setColor] = useState(session?.color ?? "#2f80ed");

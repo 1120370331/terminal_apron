@@ -577,7 +577,7 @@ select {
   background: #111614;
   color: #dce9df;
   font:
-    12px/1.35 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    14px/1.35 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   white-space: pre;
   overflow-wrap: normal;
   word-break: normal;
@@ -589,11 +589,14 @@ select {
 .terminal-grid-preview {
   line-height: 0;
   overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x pan-y;
 }
 
 .terminal-preview-canvas {
   display: block;
   max-width: none;
+  transform-origin: top left;
 }
 
 .preview-latest {
@@ -636,7 +639,7 @@ select {
 .quick-input input {
   width: 100%;
   min-width: 0;
-  height: 30px;
+  height: 34px;
   padding: 0 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -997,6 +1000,12 @@ select {
     padding: 8px;
   }
 
+  .topbar {
+    gap: 10px;
+    min-height: 0;
+    padding: 10px;
+  }
+
   .topbar,
   .terminal-header {
     align-items: flex-start;
@@ -1021,6 +1030,7 @@ select {
     display: grid;
     grid-template-columns: 1fr;
     gap: 8px;
+    padding: 10px;
   }
 
   .toolbar > *,
@@ -1044,9 +1054,23 @@ select {
     flex-direction: column;
   }
 
+  .mobile-session-list {
+    gap: 12px;
+  }
+
   .mobile-session-list .session-card {
     height: auto;
     min-height: 0;
+    content-visibility: visible;
+  }
+
+  .mobile-session-list .session-card-header {
+    min-height: 48px;
+    padding: 9px 10px 6px;
+  }
+
+  .mobile-session-list .session-title h2 {
+    font-size: 16px;
   }
 
   .mobile-session-list .drag-handle {
@@ -1055,13 +1079,18 @@ select {
 
   .mobile-session-list .preview-wrap {
     flex: 0 0 auto;
-    min-height: 360px;
-    max-height: 58vh;
+    min-height: min(460px, 62vh);
+    max-height: 62vh;
+    margin: 0 8px;
   }
 
   .mobile-session-list .preview {
-    min-height: 360px;
-    max-height: 58vh;
+    min-height: min(460px, 62vh);
+    max-height: 62vh;
+    padding: 9px;
+    font-size: 14px;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-x pan-y;
   }
 
   .mobile-session-list .terminal-grid-preview {
@@ -1071,6 +1100,28 @@ select {
   .quick-input,
   .card-actions {
     width: 100%;
+  }
+
+  .mobile-session-list .quick-input {
+    gap: 8px;
+    margin: 8px 8px 0;
+  }
+
+  .mobile-session-list .quick-input input {
+    height: 44px;
+    font-size: 16px;
+  }
+
+  .mobile-session-list .quick-input .icon-button.small {
+    width: 44px;
+    height: 44px;
+    min-height: 44px;
+  }
+
+  .mobile-session-list .card-actions .icon-button.small {
+    width: 38px;
+    height: 38px;
+    min-height: 38px;
   }
 
   .card-actions {

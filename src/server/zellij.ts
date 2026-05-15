@@ -92,11 +92,13 @@ export async function ensureZellijSession(
 ): Promise<void> {
   if (await hasZellijSession(session.tmuxName)) {
     await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
+    await saveZellijSessionState(session.tmuxName).catch(() => undefined);
     return;
   }
 
   await bootstrapZellijSession(session);
   await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
+  await saveZellijSessionState(session.tmuxName).catch(() => undefined);
 }
 
 export async function killZellijSession(session: Pick<TerminalSession, "tmuxName">): Promise<void> {
@@ -107,6 +109,14 @@ export async function killZellijSession(session: Pick<TerminalSession, "tmuxName
   await runZellij(["kill-session", session.tmuxName], { timeoutMs: 5000 }).catch(() =>
     runZellij(["kill-sessions", session.tmuxName], { timeoutMs: 5000 })
   );
+}
+
+export async function saveZellijSessionState(sessionName: string): Promise<void> {
+  if (!(await hasZellijSession(sessionName))) {
+    return;
+  }
+
+  await runZellij(["--session", sessionName, "action", "save-session"], { timeoutMs: 5000 });
 }
 
 export async function captureZellijPreview(
@@ -230,11 +240,13 @@ export async function sendZellijInput(
   }
   const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
   const target = paneId ? ["--pane-id", paneId] : [];
-  await runZellij(["--session", session.tmuxName, "action", "paste", ...target, data], { timeoutMs: 5000 });
+  await writeZellijChars(session.tmuxName, target, data);
   if (!enter) {
+    void saveZellijSessionState(session.tmuxName).catch(() => undefined);
     return;
   }
-  await runZellij(["--session", session.tmuxName, "action", "write", ...target, "13"], { timeoutMs: 5000 });
+  await sendZellijEnter(session.tmuxName, target);
+  void saveZellijSessionState(session.tmuxName).catch(() => undefined);
 }
 
 export async function zellijRuntimeInfo(session: TerminalSession): Promise<SessionRuntime> {
@@ -269,7 +281,15 @@ export async function zellijRuntimeInfo(session: TerminalSession): Promise<Sessi
 }
 
 export function zellijAttachArgs(session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">): string[] {
-  return ["--layout-string", ZELLIJ_SINGLE_PANE_LAYOUT, "attach", "--create", session.tmuxName, ...zellijOptions(session)];
+  return [
+    "--layout-string",
+    ZELLIJ_SINGLE_PANE_LAYOUT,
+    "attach",
+    "--create",
+    "--force-run-commands",
+    session.tmuxName,
+    ...zellijOptions(session)
+  ];
 }
 
 export function zellijAttachCommand(session: Pick<TerminalSession, "tmuxName">): string {
@@ -339,6 +359,7 @@ async function bootstrapZellijSession(session: Pick<TerminalSession, "tmuxName" 
 
   try {
     await waitForZellijSession(session.tmuxName, 8000);
+    await saveZellijSessionState(session.tmuxName).catch(() => undefined);
     await runZellij(["--session", session.tmuxName, "action", "detach"], { timeoutMs: 5000 }).catch(() => undefined);
   } finally {
     windowlessKill(term);
@@ -375,6 +396,28 @@ async function activeTerminalPaneId(sessionName: string): Promise<string | null>
   }
   const id = pane.pane_id ?? pane.id;
   return typeof id === "number" ? `terminal_${id}` : null;
+}
+
+async function writeZellijChars(sessionName: string, target: string[], data: string): Promise<void> {
+  for (const chunk of chunkString(data, 2000)) {
+    await runZellij(["--session", sessionName, "action", "write-chars", ...target, "--", chunk], {
+      timeoutMs: 5000
+    }).catch(() => runZellij(["--session", sessionName, "action", "paste", ...target, "--", chunk], { timeoutMs: 5000 }));
+  }
+}
+
+async function sendZellijEnter(sessionName: string, target: string[]): Promise<void> {
+  await runZellij(["--session", sessionName, "action", "send-keys", ...target, "Enter"], {
+    timeoutMs: 5000
+  }).catch(() => runZellij(["--session", sessionName, "action", "write", ...target, "13"], { timeoutMs: 5000 }));
+}
+
+function chunkString(value: string, chunkSize: number): string[] {
+  const chunks: string[] = [];
+  for (let index = 0; index < value.length; index += chunkSize) {
+    chunks.push(value.slice(index, index + chunkSize));
+  }
+  return chunks.length ? chunks : [""];
 }
 
 async function activeTerminalPane(sessionName: string): Promise<ZellijPane | null> {
@@ -432,6 +475,8 @@ function zellijOptions(session: Pick<TerminalSession, "cwd" | "shell">): string[
     String(config.zellijScrollback),
     "--session-serialization",
     "true",
+    "--serialization-interval",
+    "1",
     "--serialize-pane-viewport",
     "true",
     "--scrollback-lines-to-serialize",

@@ -33,6 +33,10 @@ const ANSI_BRIGHT_COLORS = ["#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf
 const CARD_PREVIEW_MAX_LINES = 360;
 const CARD_PREVIEW_MAX_CHARS = 80_000;
 const CARD_PREVIEW_MAX_NODES = 2_000;
+const PREVIEW_FONT_SIZE = 14;
+const PREVIEW_MIN_SCALE = 0.9;
+const MOBILE_PREVIEW_MIN_SCALE = 1;
+const MOBILE_QUERY = "(max-width: 720px)";
 
 function SessionCardComponent({
   session,
@@ -138,11 +142,23 @@ function SessionCardComponent({
 
   const handlePreviewWheel = (event: WheelEvent<HTMLDivElement>) => {
     const target = event.currentTarget;
-    if (target.scrollHeight <= target.clientHeight) {
+    const canScrollY = target.scrollHeight > target.clientHeight;
+    const canScrollX = target.scrollWidth > target.clientWidth;
+    if (!canScrollY && !canScrollX) {
       return;
     }
 
     event.stopPropagation();
+    if (canScrollX && (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY))) {
+      event.preventDefault();
+      target.scrollLeft += event.shiftKey ? event.deltaY : event.deltaX;
+      return;
+    }
+
+    if (!canScrollY) {
+      return;
+    }
+
     const atTop = target.scrollTop <= 0;
     const atBottom = target.scrollTop + target.clientHeight >= target.scrollHeight - 1;
     if ((event.deltaY < 0 && atTop) || (event.deltaY > 0 && atBottom)) {
@@ -351,14 +367,19 @@ function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid,
     return;
   }
 
-  const fontSize = 12;
+  const fontSize = PREVIEW_FONT_SIZE;
   const lineHeight = Math.ceil(fontSize * 1.35);
   const fontFamily = '"Cascadia Mono", "SFMono-Regular", Consolas, "Noto Sans Mono CJK SC", "Microsoft YaHei Mono", NSimSun, monospace';
   context.font = `${fontSize}px ${fontFamily}`;
-  const cellWidth = Math.max(7, Math.ceil(context.measureText("M").width * 100) / 100);
+  const cellWidth = Math.max(8, Math.ceil(context.measureText("M").width * 100) / 100);
   const naturalWidth = Math.max(1, grid.cols * cellWidth);
   const naturalHeight = Math.max(lineHeight, grid.rows.length * lineHeight);
-  const scale = availableWidth && availableWidth > 0 ? Math.min(1, availableWidth / naturalWidth) : 1;
+  const fittedScale = availableWidth && availableWidth > 0 ? Math.min(1, availableWidth / naturalWidth) : 1;
+  const minScale =
+    typeof window.matchMedia === "function" && window.matchMedia(MOBILE_QUERY).matches
+      ? MOBILE_PREVIEW_MIN_SCALE
+      : PREVIEW_MIN_SCALE;
+  const scale = Math.min(1, Math.max(minScale, fittedScale));
   const width = Math.max(1, naturalWidth * scale);
   const height = Math.max(lineHeight * scale, naturalHeight * scale);
   const dpr = window.devicePixelRatio || 1;
@@ -367,6 +388,7 @@ function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid,
   canvas.height = Math.ceil(naturalHeight * dpr);
   canvas.style.width = `${width}px`;
   canvas.style.height = `${height}px`;
+  canvas.dataset.previewScale = scale.toFixed(2);
 
   context.setTransform(dpr, 0, 0, dpr, 0, 0);
   context.fillStyle = "#111614";

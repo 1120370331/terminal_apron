@@ -308,6 +308,18 @@ function buildSessionLayout(session: TerminalSession, index: number, settings: P
   };
 }
 
+function buildTopSessionLayout(sessionId: string, settings: PanelSettings): Layout {
+  return {
+    i: sessionId,
+    x: 0,
+    y: 0,
+    w: CARD_COLUMNS,
+    h: Math.max(settings.defaultCardRows, settings.minCardRows),
+    minW: 3,
+    minH: settings.minCardRows
+  };
+}
+
 function buildOrganizedLayout(sessions: TerminalSession[], settings: PanelSettings): Layout[] {
   const cardsPerRow = Math.max(1, Math.floor(GRID_COLUMNS / CARD_COLUMNS));
   return sessions.map((session, index) => ({
@@ -319,6 +331,60 @@ function buildOrganizedLayout(sessions: TerminalSession[], settings: PanelSettin
     minW: 3,
     minH: settings.minCardRows
   }));
+}
+
+function compareSessionsForDisplay(a: TerminalSession, b: TerminalSession): number {
+  const ay = a.layout?.y ?? Number.MAX_SAFE_INTEGER;
+  const by = b.layout?.y ?? Number.MAX_SAFE_INTEGER;
+  if (ay !== by) {
+    return ay - by;
+  }
+
+  const ax = a.layout?.x ?? Number.MAX_SAFE_INTEGER;
+  const bx = b.layout?.x ?? Number.MAX_SAFE_INTEGER;
+  if (ax !== bx) {
+    return ax - bx;
+  }
+
+  const createdDelta = Date.parse(b.createdAt) - Date.parse(a.createdAt);
+  if (createdDelta !== 0 && Number.isFinite(createdDelta)) {
+    return createdDelta;
+  }
+
+  return a.id.localeCompare(b.id);
+}
+
+function normalizeVisibleLayout(layout: Layout[]): Layout[] {
+  if (layout.length === 0) {
+    return layout;
+  }
+
+  const minY = Math.min(...layout.map((item) => item.y));
+  const placed: Layout[] = [];
+
+  for (const item of layout) {
+    const next: Layout = {
+      ...item,
+      x: Math.max(0, Math.min(GRID_COLUMNS - item.w, item.x)),
+      y: Math.max(0, item.y - minY)
+    };
+
+    while (next.y > 0 && !placed.some((placedItem) => layoutItemsOverlap({ ...next, y: next.y - 1 }, placedItem))) {
+      next.y -= 1;
+    }
+
+    while (placed.some((placedItem) => layoutItemsOverlap(next, placedItem))) {
+      next.y += 1;
+    }
+
+    placed.push(next);
+  }
+
+  return placed;
+}
+
+function layoutItemsOverlap(a: Layout, b: Layout): boolean {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
 function sameLayoutIds(previous: Layout[], next: Layout[]): boolean {
@@ -511,18 +577,20 @@ export function App() {
 
   const filtered = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    return sessions.filter((session) => {
-      const matchesQuery =
-        !normalizedQuery ||
-        [session.name, session.group, session.cwd, session.runtime?.currentPath, ...session.tags]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase()
-          .includes(normalizedQuery);
-      const matchesGroup = groupFilter === "all" || session.group === groupFilter;
-      const matchesTag = tagFilter === "all" || session.tags.includes(tagFilter);
-      return matchesQuery && matchesGroup && matchesTag;
-    });
+    return sessions
+      .filter((session) => {
+        const matchesQuery =
+          !normalizedQuery ||
+          [session.name, session.group, session.cwd, session.runtime?.currentPath, ...session.tags]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase()
+            .includes(normalizedQuery);
+        const matchesGroup = groupFilter === "all" || session.group === groupFilter;
+        const matchesTag = tagFilter === "all" || session.tags.includes(tagFilter);
+        return matchesQuery && matchesGroup && matchesTag;
+      })
+      .sort(compareSessionsForDisplay);
   }, [groupFilter, query, sessions, tagFilter]);
 
   const previewTargets = useMemo(
@@ -615,7 +683,7 @@ export function App() {
   }, [auth, previewTargetKey, settings.previewLines, settings.previewRefreshMs]);
 
   const desktopLayout = useMemo(
-    () => filtered.map((session, index) => buildSessionLayout(session, index, settings)),
+    () => normalizeVisibleLayout(filtered.map((session, index) => buildSessionLayout(session, index, settings))),
     [filtered, settings.defaultCardRows, settings.minCardRows]
   );
 
@@ -913,10 +981,16 @@ export function App() {
       {editorSession && (
         <SessionEditor
           session={editorSession === "new" ? null : editorSession}
+          initialGroup={groupFilter === "all" ? undefined : groupFilter}
+          initialTags={tagFilter === "all" ? [] : [tagFilter]}
           onClose={() => setEditorSession(null)}
           onSave={async (input) => {
             if (editorSession === "new") {
-              await api.createSession(input);
+              const created = await api.createSession(input);
+              const topLayout = buildTopSessionLayout(created.id, settings);
+              await api.updateSession(created.id, {
+                layout: layoutToSessionLayout(topLayout)
+              });
             } else {
               await api.updateSession(editorSession.id, input);
             }
