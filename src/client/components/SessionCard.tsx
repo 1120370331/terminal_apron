@@ -12,8 +12,24 @@ import {
   type CSSProperties,
   type ReactNode
 } from "react";
-import { Archive, Copy, Edit3, ExternalLink, Grip, Play, RotateCcw, Send, Square, Tag } from "lucide-react";
+import {
+  Archive,
+  Check,
+  Clipboard,
+  ClipboardPaste,
+  Copy,
+  Edit3,
+  ExternalLink,
+  Grip,
+  Play,
+  RotateCcw,
+  Send,
+  Square,
+  Tag,
+  TextCursorInput
+} from "lucide-react";
 import type { SessionPreview, TerminalPreviewGrid, TerminalPreviewSegment, TerminalSession } from "../../shared/types";
+import { readClipboardText, writeClipboardText } from "../clipboard";
 
 interface Props {
   session: TerminalSession;
@@ -60,13 +76,19 @@ function SessionCardComponent({
   const [displayedPreview, setDisplayedPreview] = useState<SessionPreview | undefined>(preview);
   const [historyPaused, setHistoryPaused] = useState(false);
   const [hasPendingPreview, setHasPendingPreview] = useState(false);
+  const [selectMode, setSelectMode] = useState(false);
+  const [copied, setCopied] = useState(false);
   const previewRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const quickInputRef = useRef<HTMLInputElement | null>(null);
+  const copiedTimerRef = useRef<number | null>(null);
   const stickToBottomRef = useRef(true);
   const deferredPreview = useDeferredValue(displayedPreview);
   const output = deferredPreview?.text || (isLive ? "" : "terminal is not running");
   const grid = deferredPreview?.grid;
+  const showCanvas = Boolean(grid && !selectMode);
   const compactOutput = useMemo(() => compactPreview(output), [output]);
+  const plainOutput = useMemo(() => stripAnsi(compactOutput), [compactOutput]);
   const renderedOutput = useMemo(() => renderAnsi(compactOutput), [compactOutput]);
   const terminalFontSize = normalizedPreviewFontSize(previewFontSize);
   const terminalScale = normalizedPreviewScale(previewScale);
@@ -92,15 +114,15 @@ function SessionCardComponent({
 
   useLayoutEffect(() => {
     const previewElement = previewRef.current;
-    if (!previewElement || !stickToBottomRef.current || grid) {
+    if (!previewElement || !stickToBottomRef.current || showCanvas) {
       return;
     }
 
     previewElement.scrollTop = previewElement.scrollHeight;
-  }, [displayedPreview, grid]);
+  }, [displayedPreview, showCanvas]);
 
   const redrawPreviewCanvas = useCallback(() => {
-    if (!grid || !canvasRef.current) {
+    if (!showCanvas || !grid || !canvasRef.current) {
       return;
     }
     const previewElement = previewRef.current;
@@ -112,10 +134,10 @@ function SessionCardComponent({
     if (previewElement && stickToBottomRef.current) {
       previewElement.scrollTop = previewElement.scrollHeight;
     }
-  }, [grid, terminalFontSize, terminalScale]);
+  }, [grid, showCanvas, terminalFontSize, terminalScale]);
 
   useLayoutEffect(() => {
-    if (!grid) {
+    if (!showCanvas) {
       return;
     }
 
@@ -133,7 +155,15 @@ function SessionCardComponent({
       observer.disconnect();
       window.removeEventListener("resize", redrawPreviewCanvas);
     };
-  }, [grid, redrawPreviewCanvas]);
+  }, [showCanvas, redrawPreviewCanvas]);
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current) {
+        window.clearTimeout(copiedTimerRef.current);
+      }
+    };
+  }, []);
 
   const trackPreviewScroll = () => {
     const target = previewRef.current;
@@ -192,6 +222,61 @@ function SessionCardComponent({
     }, 0);
   };
 
+  const markCopied = () => {
+    setCopied(true);
+    if (copiedTimerRef.current) {
+      window.clearTimeout(copiedTimerRef.current);
+    }
+    copiedTimerRef.current = window.setTimeout(() => setCopied(false), 1200);
+  };
+
+  const copyPreviewText = async () => {
+    const selectedText = selectedTextInside(previewRef.current);
+    const text = selectedText || plainOutput;
+    if (!text.trim()) {
+      return;
+    }
+
+    await writeClipboardText(text);
+    markCopied();
+  };
+
+  const toggleSelectMode = () => {
+    setSelectMode((current) => {
+      const next = !current;
+      if (next) {
+        stickToBottomRef.current = false;
+        setHistoryPaused(true);
+        setHasPendingPreview(false);
+      }
+      return next;
+    });
+  };
+
+  const pasteClipboardToInput = async () => {
+    try {
+      const text = await readClipboardText();
+      if (!text) {
+        quickInputRef.current?.focus();
+        return;
+      }
+      const input = quickInputRef.current;
+      setQuickInput((current) => {
+        const start = input?.selectionStart ?? current.length;
+        const end = input?.selectionEnd ?? start;
+        const next = `${current.slice(0, start)}${text}${current.slice(end)}`;
+        const cursor = start + text.length;
+        window.requestAnimationFrame(() => {
+          input?.focus();
+          input?.setSelectionRange(cursor, cursor);
+        });
+        return next;
+      });
+    } catch {
+      quickInputRef.current?.focus();
+    }
+  };
+
   const submitQuickInput = async (event: FormEvent) => {
     event.preventDefault();
     const value = quickInput.trimEnd();
@@ -230,7 +315,32 @@ function SessionCardComponent({
 
       <div className="preview-wrap">
         <div
-          className={grid ? "preview terminal-grid-preview" : "preview ansi-preview"}
+          className="preview-tools"
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onTouchStart={(event) => event.stopPropagation()}
+        >
+          <button
+            className={selectMode ? "preview-tool active" : "preview-tool"}
+            type="button"
+            title={selectMode ? "Terminal render mode" : "Select text mode"}
+            onClick={toggleSelectMode}
+          >
+            <TextCursorInput size={14} />
+          </button>
+          <button
+            className={copied ? "preview-tool success" : "preview-tool"}
+            type="button"
+            title={copied ? "Copied" : "Copy selected text or current preview"}
+            onClick={() => void copyPreviewText()}
+          >
+            {copied ? <Check size={14} /> : <Clipboard size={14} />}
+          </button>
+        </div>
+        <div
+          className={showCanvas ? "preview terminal-grid-preview" : "preview ansi-preview selectable-preview"}
           style={previewStyle}
           ref={previewRef}
           onScroll={trackPreviewScroll}
@@ -238,7 +348,7 @@ function SessionCardComponent({
           onMouseDown={(event) => event.stopPropagation()}
           onTouchStart={(event) => event.stopPropagation()}
         >
-          {grid ? <canvas className="terminal-preview-canvas" ref={canvasRef} /> : renderedOutput}
+          {showCanvas ? <canvas className="terminal-preview-canvas" ref={canvasRef} /> : renderedOutput}
         </div>
         {historyPaused && hasPendingPreview && (
           <button
@@ -256,11 +366,21 @@ function SessionCardComponent({
       {!session.archived && (
         <form className="quick-input" onSubmit={submitQuickInput} onMouseDown={(event) => event.stopPropagation()}>
           <input
+            ref={quickInputRef}
             value={quickInput}
             onChange={(event) => setQuickInput(event.target.value)}
             placeholder="Type to terminal..."
             disabled={sending}
           />
+          <button
+            className="icon-button small"
+            type="button"
+            disabled={sending}
+            title="Paste clipboard"
+            onClick={() => void pasteClipboardToInput()}
+          >
+            <ClipboardPaste size={15} />
+          </button>
           <button className="icon-button small" type="submit" disabled={sending || !quickInput.trim()} title="Send">
             <Send size={15} />
           </button>
@@ -333,6 +453,20 @@ function previewSignature(preview?: SessionPreview): string {
     preview?.text ?? "",
     gridSignature(preview.grid)
   ].join("\u001f");
+}
+
+function selectedTextInside(root: HTMLElement | null): string {
+  const selection = window.getSelection();
+  if (!root || !selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return "";
+  }
+
+  const range = selection.getRangeAt(0);
+  if (!root.contains(range.startContainer) && !root.contains(range.endContainer)) {
+    return "";
+  }
+
+  return selection.toString();
 }
 
 function gridSignature(grid?: TerminalPreviewGrid): string {

@@ -3,8 +3,9 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { io, type Socket } from "socket.io-client";
-import { Clipboard, RefreshCw, X } from "lucide-react";
+import { Check, Clipboard, ClipboardPaste, RefreshCw, X } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
+import { readClipboardText, writeClipboardText } from "../clipboard";
 
 interface Props {
   session: TerminalSession;
@@ -20,9 +21,11 @@ export function TerminalDock({ session, onClose }: Props) {
   const resizeSeqRef = useRef(0);
   const lastAckSeqRef = useRef(0);
   const resizeRetryRef = useRef(0);
+  const copiedTimerRef = useRef<number | null>(null);
   const [attachCommand, setAttachCommand] = useState<string | null>(null);
   const [backend, setBackend] = useState(session.runtime?.backend ?? session.backend);
   const [status, setStatus] = useState("connecting");
+  const [copied, setCopied] = useState(false);
 
   const refitTerminal = useCallback((force = false) => {
     const terminal = termRef.current;
@@ -59,6 +62,46 @@ export function TerminalDock({ session, onClose }: Props) {
     window.setTimeout(() => refitTerminal(true), 80);
     window.setTimeout(() => refitTerminal(true), 260);
   }, [refitTerminal]);
+
+  const markCopied = useCallback(() => {
+    setCopied(true);
+    if (copiedTimerRef.current) {
+      window.clearTimeout(copiedTimerRef.current);
+    }
+    copiedTimerRef.current = window.setTimeout(() => setCopied(false), 1200);
+  }, []);
+
+  const copyTerminalSelection = useCallback(async () => {
+    const terminal = termRef.current;
+    const selectedText = terminal?.getSelection() ?? "";
+    if (!selectedText.trim()) {
+      terminal?.focus();
+      return;
+    }
+
+    await writeClipboardText(selectedText);
+    markCopied();
+    terminal?.focus();
+  }, [markCopied]);
+
+  const pasteClipboardToTerminal = useCallback(async () => {
+    try {
+      const text = await readClipboardText();
+      if (text) {
+        socketRef.current?.emit("terminal:input", text);
+      }
+    } finally {
+      termRef.current?.focus();
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current) {
+        window.clearTimeout(copiedTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -243,7 +286,7 @@ export function TerminalDock({ session, onClose }: Props) {
                 className="icon-button"
                 type="button"
                 title="复制本机 attach 命令"
-                onClick={() => void navigator.clipboard.writeText(attachCommand)}
+                onClick={() => void writeClipboardText(attachCommand)}
               >
                 <Clipboard size={17} />
               </button>
@@ -252,6 +295,24 @@ export function TerminalDock({ session, onClose }: Props) {
             <code>{backend} pty</code>
           )}
           <span className="terminal-status">{status}</span>
+          <button
+            className="icon-button"
+            type="button"
+            title={copied ? "Copied" : "Copy selected terminal text"}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => void copyTerminalSelection()}
+          >
+            {copied ? <Check size={17} /> : <Clipboard size={17} />}
+          </button>
+          <button
+            className="icon-button"
+            type="button"
+            title="Paste clipboard to terminal"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => void pasteClipboardToTerminal()}
+          >
+            <ClipboardPaste size={17} />
+          </button>
           <button className="icon-button" type="button" title="修复显示" onClick={repairDisplay}>
             <RefreshCw size={17} />
           </button>

@@ -643,6 +643,48 @@ select {
   overflow: hidden;
 }
 
+.preview-tools {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: flex;
+  gap: 5px;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+
+.preview-wrap:hover .preview-tools,
+.preview-wrap:focus-within .preview-tools {
+  opacity: 1;
+}
+
+.preview-tool {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid #324039;
+  border-radius: 8px;
+  background: rgba(24, 32, 28, 0.92);
+  color: #dce9df;
+  cursor: pointer;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+}
+
+.preview-tool:hover,
+.preview-tool.active {
+  border-color: #7fb6ff;
+  background: #19344f;
+  color: #ffffff;
+}
+
+.preview-tool.success {
+  border-color: #3abf89;
+  background: #123a2a;
+  color: #8ef0bc;
+}
+
 .preview {
   --terminal-cell-width: 1ch;
   contain: content;
@@ -668,11 +710,23 @@ select {
   scrollbar-width: thin;
 }
 
+.selectable-preview {
+  user-select: text;
+  cursor: text;
+}
+
+.selectable-preview::selection,
+.selectable-preview *::selection {
+  background: rgba(47, 128, 237, 0.52);
+  color: #ffffff;
+}
+
 .terminal-grid-preview {
   line-height: 0;
   overflow: auto;
   -webkit-overflow-scrolling: touch;
   touch-action: pan-x pan-y;
+  user-select: none;
 }
 
 .terminal-preview-canvas {
@@ -1174,6 +1228,17 @@ select {
     min-height: min(460px, 62vh);
     max-height: 62vh;
     margin: 0 8px;
+  }
+
+  .mobile-session-list .preview-tools {
+    top: 10px;
+    right: 10px;
+    opacity: 1;
+  }
+
+  .mobile-session-list .preview-tool {
+    width: 34px;
+    height: 34px;
   }
 
   .mobile-session-list .preview {
