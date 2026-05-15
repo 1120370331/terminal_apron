@@ -54,6 +54,8 @@ const GRID_COLUMNS = 12;
 const CARD_COLUMNS = 4;
 const MIN_CARD_COLUMNS = 2;
 const MIN_LAYOUT_ROWS = 3;
+const COLLISION_PUSH_RATIO = 0.35;
+const FREE_SPOT_SEARCH_RADIUS = 80;
 const GRID_MARGIN: [number, number] = [14, 14];
 const GRID_RESIZE_HANDLES: Array<"s" | "w" | "e" | "n" | "sw" | "nw" | "se" | "ne"> = [
   "s",
@@ -227,6 +229,22 @@ function sameSessionList(previous: TerminalSession[], next: TerminalSession[]): 
     }
   }
   return true;
+}
+
+function mergeLocalLayoutsIntoSessions(
+  sessions: TerminalSession[],
+  localLayout: Layout[],
+  offsetY: number
+): TerminalSession[] {
+  if (localLayout.length === 0) {
+    return sessions;
+  }
+
+  const localById = new Map(localLayout.map((item) => [item.i, layoutToSessionLayout(item, offsetY)]));
+  return sessions.map((session) => {
+    const layout = localById.get(session.id);
+    return layout ? { ...session, layout } : session;
+  });
 }
 
 function sessionSignature(session: TerminalSession): string {
@@ -428,6 +446,139 @@ function sameLayout(previous: Layout[], next: Layout[]): boolean {
   });
 }
 
+function settleLayout(layout: Layout[], changedId?: string): Layout[] {
+  if (layout.length <= 1) {
+    return layout.map(clampLayoutItem);
+  }
+
+  const normalized = layout.map(clampLayoutItem);
+  const changed = changedId ? normalized.find((item) => item.i === changedId) : undefined;
+  if (!changed) {
+    return pushCollisionsDown(normalized);
+  }
+
+  const others = normalized.filter((item) => item.i !== changed.i);
+  const collisions = others.filter((item) => layoutItemsOverlap(changed, item));
+  if (collisions.length === 0) {
+    return normalized;
+  }
+
+  const shouldPush = collisions.some((item) => overlapRatio(changed, item) >= COLLISION_PUSH_RATIO);
+  if (!shouldPush) {
+    return replaceLayoutItem(normalized, findNearestFreeSpot(changed, others));
+  }
+
+  return pushCollisionsDown(normalized, changed.i);
+}
+
+function pushCollisionsDown(layout: Layout[], anchorId?: string): Layout[] {
+  const byId = new Map(layout.map((item) => [item.i, { ...item }]));
+  const anchor = anchorId ? byId.get(anchorId) : undefined;
+  const processing = layout
+    .filter((item) => item.i !== anchorId)
+    .map((item) => byId.get(item.i) ?? item)
+    .sort(compareLayoutPosition);
+  const placed: Layout[] = anchor ? [anchor] : [];
+
+  for (const item of processing) {
+    const next = { ...item };
+    let guard = 0;
+    while (guard < 200) {
+      const collision = firstCollision(placed, next);
+      if (!collision) {
+        break;
+      }
+      next.y = Math.max(next.y + 1, collision.y + collision.h);
+      guard += 1;
+    }
+    byId.set(next.i, next);
+    placed.push(next);
+  }
+
+  return layout.map((item) => byId.get(item.i) ?? item);
+}
+
+function findNearestFreeSpot(item: Layout, others: Layout[]): Layout {
+  const base = clampLayoutItem(item);
+  let best: Layout | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (let distance = 0; distance <= FREE_SPOT_SEARCH_RADIUS; distance += 1) {
+    for (let dx = -distance; dx <= distance; dx += 1) {
+      const remaining = distance - Math.abs(dx);
+      for (const dy of remaining === 0 ? [0] : [-remaining, remaining]) {
+        const candidate = clampLayoutItem({
+          ...base,
+          x: base.x + dx,
+          y: base.y + dy
+        });
+        if (others.some((other) => layoutItemsOverlap(candidate, other))) {
+          continue;
+        }
+        const score = Math.abs(candidate.x - base.x) * 2 + Math.abs(candidate.y - base.y) + Math.max(0, candidate.y - base.y) * 0.15;
+        if (score < bestScore) {
+          best = candidate;
+          bestScore = score;
+        }
+      }
+    }
+    if (best) {
+      return best;
+    }
+  }
+
+  const below = {
+    ...base,
+    y: Math.max(0, ...others.map((other) => other.y + other.h))
+  };
+  return clampLayoutItem(below);
+}
+
+function replaceLayoutItem(layout: Layout[], item: Layout): Layout[] {
+  return layout.map((current) => (current.i === item.i ? item : current));
+}
+
+function clampLayoutItem(item: Layout): Layout {
+  const minW = item.minW ?? MIN_CARD_COLUMNS;
+  const minH = item.minH ?? MIN_LAYOUT_ROWS;
+  const w = Math.max(minW, Math.min(GRID_COLUMNS, item.w));
+  return {
+    ...item,
+    minW,
+    minH,
+    w,
+    h: Math.max(minH, item.h),
+    x: Math.max(0, Math.min(GRID_COLUMNS - w, item.x)),
+    y: Math.max(0, item.y)
+  };
+}
+
+function compareLayoutPosition(a: Layout, b: Layout): number {
+  if (a.y !== b.y) {
+    return a.y - b.y;
+  }
+  if (a.x !== b.x) {
+    return a.x - b.x;
+  }
+  return a.i.localeCompare(b.i);
+}
+
+function firstCollision(layout: Layout[], item: Layout): Layout | undefined {
+  return layout.find((current) => current.i !== item.i && layoutItemsOverlap(current, item));
+}
+
+function layoutItemsOverlap(a: Layout, b: Layout): boolean {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function overlapRatio(a: Layout, b: Layout): number {
+  const width = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+  const height = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const overlap = width * height;
+  const smallerArea = Math.max(1, Math.min(a.w * a.h, b.w * b.h));
+  return overlap / smallerArea;
+}
+
 function layoutToSessionLayout(item: Layout, offsetY = 0) {
   return {
     x: item.x,
@@ -460,7 +611,10 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [localLayout, setLocalLayout] = useState<Layout[]>([]);
   const layoutDirtyRef = useRef(false);
+  const localLayoutRef = useRef<Layout[]>([]);
   const layoutOriginYRef = useRef(0);
+  const layoutProtectUntilRef = useRef(0);
+  const activeLayoutItemIdRef = useRef<string | null>(null);
   const layoutSaveSeqRef = useRef(0);
   const previewsRef = useRef<Record<string, SessionPreview>>({});
   const previewInFlightRef = useRef<Set<string>>(new Set());
@@ -470,7 +624,11 @@ export function App() {
 
   const loadSessions = useCallback(async () => {
     try {
-      const next = await api.sessions(showArchived);
+      const loaded = await api.sessions(showArchived);
+      const next =
+        layoutDirtyRef.current || Date.now() < layoutProtectUntilRef.current
+          ? mergeLocalLayoutsIntoSessions(loaded, localLayoutRef.current, layoutOriginYRef.current)
+          : loaded;
       setSessions((current) => (sameSessionList(current, next) ? current : next));
       setSessionsLoaded(true);
     } catch (error) {
@@ -744,12 +902,17 @@ export function App() {
   }, [desktopLayoutState.offsetY]);
 
   useEffect(() => {
+    localLayoutRef.current = localLayout;
+  }, [localLayout]);
+
+  useEffect(() => {
     setLocalLayout((current) => {
       if (layoutDirtyRef.current && sameLayoutIdSet(current, desktopLayout)) {
         return current;
       }
 
       layoutDirtyRef.current = false;
+      layoutProtectUntilRef.current = 0;
       return sameLayout(current, desktopLayout) ? current : desktopLayout;
     });
   }, [desktopLayout]);
@@ -762,6 +925,7 @@ export function App() {
       const saveSeq = ++layoutSaveSeqRef.current;
       const byId = new Map(layout.map((item) => [item.i, item]));
       const offsetY = layoutOriginYRef.current;
+      layoutProtectUntilRef.current = Date.now() + 5000;
       try {
         await Promise.all(
           filtered.map((session) => {
@@ -784,11 +948,24 @@ export function App() {
           })
         );
         layoutDirtyRef.current = false;
+        layoutProtectUntilRef.current = Date.now() + 2500;
       } catch (error) {
         console.error("Failed to save terminal layout", error);
       }
     },
     [filtered]
+  );
+
+  const handleLayoutStart = useCallback(
+    (_layout: Layout[], oldItem?: Layout, changedItem?: Layout) => {
+      if (isMobile) {
+        return;
+      }
+      activeLayoutItemIdRef.current = changedItem?.i ?? oldItem?.i ?? null;
+      layoutDirtyRef.current = true;
+      layoutProtectUntilRef.current = Date.now() + 5000;
+    },
+    [isMobile]
   );
 
   const handleLayoutMove = useCallback(
@@ -797,19 +974,26 @@ export function App() {
         return;
       }
       layoutDirtyRef.current = true;
+      layoutProtectUntilRef.current = Date.now() + 5000;
+      localLayoutRef.current = layout;
       setLocalLayout(layout);
     },
     [isMobile]
   );
 
   const handleLayoutStop = useCallback(
-    (layout: Layout[]) => {
+    (layout: Layout[], _oldItem?: Layout, changedItem?: Layout) => {
       if (isMobile) {
         return;
       }
+      const changedId = changedItem?.i ?? activeLayoutItemIdRef.current ?? undefined;
+      const settled = settleLayout(layout, changedId);
+      activeLayoutItemIdRef.current = null;
       layoutDirtyRef.current = true;
-      setLocalLayout(layout);
-      void saveLayout(layout);
+      layoutProtectUntilRef.current = Date.now() + 5000;
+      localLayoutRef.current = settled;
+      setLocalLayout(settled);
+      void saveLayout(settled);
     },
     [isMobile, saveLayout]
   );
@@ -821,6 +1005,8 @@ export function App() {
 
     const organized = buildOrganizedLayout(filtered, settings);
     layoutDirtyRef.current = true;
+    layoutProtectUntilRef.current = Date.now() + 5000;
+    localLayoutRef.current = organized;
     setLocalLayout(organized);
     void saveLayout(organized);
   }, [filtered, isMobile, saveLayout, settings]);
@@ -1036,17 +1222,20 @@ export function App() {
           rowHeight={settings.rowHeight}
           margin={GRID_MARGIN}
           compactType={null}
+          allowOverlap
           preventCollision={false}
           resizeHandles={GRID_RESIZE_HANDLES}
           draggableHandle=".drag-handle"
           draggableCancel=".preview,.quick-input,.card-actions,.preview-tools"
+          onDragStart={handleLayoutStart}
           onDrag={handleLayoutMove}
+          onResizeStart={handleLayoutStart}
           onResize={handleLayoutMove}
           onDragStop={handleLayoutStop}
           onResizeStop={handleLayoutStop}
         >
           {filtered.map((session) => (
-            <div key={session.id}>
+            <div key={session.id} data-session-id={session.id}>
               {renderSessionCard(session)}
             </div>
           ))}
