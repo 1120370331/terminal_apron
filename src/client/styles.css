@@ -1088,7 +1088,7 @@ select {
 
 .stable-width-terminal .terminal-host {
   overflow-x: auto;
-  overflow-y: hidden;
+  overflow-y: auto;
 }
 
 .terminal-host .xterm,

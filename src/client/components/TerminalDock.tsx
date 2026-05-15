@@ -13,7 +13,8 @@ interface Props {
 }
 
 const MOBILE_QUERY = "(max-width: 720px)";
-const STABLE_ZELLIJ_MIN_COLS = 100;
+const ZELLIJ_WEB_COLS = 120;
+const ZELLIJ_WEB_ROWS = 36;
 
 export function TerminalDock({ session, onClose }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -360,8 +361,15 @@ function normalizeTerminalDimensions(
   value: { cols: number; rows: number },
   stableZellijWidth: boolean
 ): { cols: number; rows: number } {
+  if (stableZellijWidth) {
+    return {
+      cols: ZELLIJ_WEB_COLS,
+      rows: ZELLIJ_WEB_ROWS
+    };
+  }
+
   return {
-    cols: stableZellijWidth ? Math.max(STABLE_ZELLIJ_MIN_COLS, value.cols) : value.cols,
+    cols: value.cols,
     rows: value.rows
   };
 }

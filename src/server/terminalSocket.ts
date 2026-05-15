@@ -17,7 +17,8 @@ import type { AuthUser } from "../shared/types.js";
 
 const MAX_TERMINAL_COLS = 4096;
 const MAX_TERMINAL_ROWS = 2048;
-const MIN_ZELLIJ_COLS = 100;
+const ZELLIJ_WEB_COLS = 120;
+const ZELLIJ_WEB_ROWS = 36;
 const ZELLIJ_SAVE_DEBOUNCE_MS = 10_000;
 
 export function registerTerminalSockets(
@@ -69,7 +70,7 @@ async function attachTerminal(
       return;
     }
     if (backend === "zellij") {
-      await attachZellij(socket, session, store.dataDir, Math.max(cols, MIN_ZELLIJ_COLS), rows);
+      await attachZellij(socket, session, store.dataDir, ZELLIJ_WEB_COLS, ZELLIJ_WEB_ROWS);
       return;
     }
     await attachTmux(socket, session, cols, rows);
@@ -159,10 +160,7 @@ async function attachZellij(
   });
 
   socket.on("terminal:resize", (size: { cols?: number; rows?: number; seq?: number }) => {
-    const nextCols = clampDimension(size.cols, Math.max(cols, MIN_ZELLIJ_COLS), MIN_ZELLIJ_COLS, MAX_TERMINAL_COLS);
-    const nextRows = clampDimension(size.rows, rows, 10, MAX_TERMINAL_ROWS);
-    term.resize(nextCols, nextRows);
-    socket.emit("terminal:resized", { cols: nextCols, rows: nextRows, seq: size.seq });
+    socket.emit("terminal:resized", { cols, rows, seq: size.seq });
   });
 
   socket.on("disconnect", () => {
