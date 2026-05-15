@@ -17,7 +17,8 @@ import {
   Settings,
   ShieldCheck,
   SlidersHorizontal,
-  Sun
+  Sun,
+  Type
 } from "lucide-react";
 import type {
   AuthUser,
@@ -58,6 +59,8 @@ interface PanelSettings {
   previewLines: number;
   previewRefreshMs: number;
   maxPreviewCards: number;
+  listTerminalFontSize: number;
+  listTerminalScale: number;
   inlineSubmitKey: "enter";
   themeMode: ThemeMode;
 }
@@ -77,6 +80,8 @@ const DEFAULT_SETTINGS: PanelSettings = {
   previewLines: DEFAULT_PREVIEW_LINES,
   previewRefreshMs: 1000,
   maxPreviewCards: 24,
+  listTerminalFontSize: 16,
+  listTerminalScale: 100,
   inlineSubmitKey: "enter",
   themeMode: "system"
 };
@@ -153,6 +158,8 @@ function loadPanelSettings(storageKey = SETTINGS_STATE_KEY): PanelSettings {
       previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, MAX_LIST_PREVIEW_LINES),
       previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000),
       maxPreviewCards: clampNumber(parsed.maxPreviewCards, DEFAULT_SETTINGS.maxPreviewCards, 1, 100),
+      listTerminalFontSize: clampNumber(parsed.listTerminalFontSize, DEFAULT_SETTINGS.listTerminalFontSize, 12, 24),
+      listTerminalScale: clampNumber(parsed.listTerminalScale, DEFAULT_SETTINGS.listTerminalScale, 80, 140),
       inlineSubmitKey: "enter",
       themeMode: parseThemeMode(parsed.themeMode)
     };
@@ -772,6 +779,8 @@ export function App() {
     <SessionCard
       session={session}
       preview={previews[session.id]}
+      previewFontSize={settings.listTerminalFontSize}
+      previewScale={settings.listTerminalScale / 100}
       onOpen={() => setActiveTerminal(session)}
       onEdit={() => setEditorSession(session)}
       onDuplicate={async () => {
@@ -927,6 +936,19 @@ export function App() {
             value={settings.rowHeight}
             onChange={(event) =>
               setSettings((current) => ({ ...current, rowHeight: Number(event.target.value) }))
+            }
+          />
+        </label>
+        <label className="density desktop-only-action" title="List terminal font size">
+          <Type size={16} />
+          <input
+            type="range"
+            min="12"
+            max="24"
+            step="1"
+            value={settings.listTerminalFontSize}
+            onChange={(event) =>
+              setSettings((current) => ({ ...current, listTerminalFontSize: Number(event.target.value) }))
             }
           />
         </label>
@@ -1142,7 +1164,32 @@ function SettingsModal({
             />
           </label>
           <label>
-            <span>列表发送按键</span>
+            <span>List terminal font px</span>
+            <input
+              type="number"
+              min="12"
+              max="24"
+              value={settings.listTerminalFontSize}
+              onChange={(event) =>
+                update("listTerminalFontSize", clampNumber(event.target.value, DEFAULT_SETTINGS.listTerminalFontSize, 12, 24))
+              }
+            />
+          </label>
+          <label>
+            <span>List terminal scale %</span>
+            <input
+              type="number"
+              min="80"
+              max="140"
+              step="5"
+              value={settings.listTerminalScale}
+              onChange={(event) =>
+                update("listTerminalScale", clampNumber(event.target.value, DEFAULT_SETTINGS.listTerminalScale, 80, 140))
+              }
+            />
+          </label>
+          <label>
+            <span>List terminal submit key</span>
             <select
               value={settings.inlineSubmitKey}
               onChange={() => update("inlineSubmitKey", "enter")}

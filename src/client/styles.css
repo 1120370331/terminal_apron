@@ -576,8 +576,9 @@ select {
   border-radius: 8px;
   background: #111614;
   color: #dce9df;
-  font:
-    14px/1.35 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: var(--list-terminal-font-size, 16px);
+  line-height: 1.35;
   white-space: pre;
   overflow-wrap: normal;
   word-break: normal;

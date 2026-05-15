@@ -18,6 +18,8 @@ import type { SessionPreview, TerminalPreviewGrid, TerminalPreviewSegment, Termi
 interface Props {
   session: TerminalSession;
   preview?: SessionPreview;
+  previewFontSize: number;
+  previewScale: number;
   onOpen: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
@@ -33,14 +35,14 @@ const ANSI_BRIGHT_COLORS = ["#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf
 const CARD_PREVIEW_MAX_LINES = 360;
 const CARD_PREVIEW_MAX_CHARS = 80_000;
 const CARD_PREVIEW_MAX_NODES = 2_000;
-const PREVIEW_FONT_SIZE = 14;
-const PREVIEW_MIN_SCALE = 0.9;
-const MOBILE_PREVIEW_MIN_SCALE = 1;
+const DEFAULT_PREVIEW_FONT_SIZE = 16;
 const MOBILE_QUERY = "(max-width: 720px)";
 
 function SessionCardComponent({
   session,
   preview,
+  previewFontSize,
+  previewScale,
   onOpen,
   onEdit,
   onDuplicate,
@@ -66,6 +68,11 @@ function SessionCardComponent({
   const grid = deferredPreview?.grid;
   const compactOutput = useMemo(() => compactPreview(output), [output]);
   const renderedOutput = useMemo(() => renderAnsi(compactOutput), [compactOutput]);
+  const terminalFontSize = normalizedPreviewFontSize(previewFontSize);
+  const terminalScale = normalizedPreviewScale(previewScale);
+  const previewStyle = {
+    "--list-terminal-font-size": `${terminalFontSize * terminalScale}px`
+  } as CSSProperties;
 
   useEffect(() => {
     if (!preview && !displayedPreview) {
@@ -98,11 +105,14 @@ function SessionCardComponent({
     }
     const previewElement = previewRef.current;
     const availableWidth = previewElement ? contentWidth(previewElement) : undefined;
-    drawPreviewCanvas(canvasRef.current, grid, availableWidth);
+    drawPreviewCanvas(canvasRef.current, grid, availableWidth, {
+      fontSize: terminalFontSize,
+      scale: terminalScale
+    });
     if (previewElement && stickToBottomRef.current) {
       previewElement.scrollTop = previewElement.scrollHeight;
     }
-  }, [grid]);
+  }, [grid, terminalFontSize, terminalScale]);
 
   useLayoutEffect(() => {
     if (!grid) {
@@ -221,6 +231,7 @@ function SessionCardComponent({
       <div className="preview-wrap">
         <div
           className={grid ? "preview terminal-grid-preview" : "preview ansi-preview"}
+          style={previewStyle}
           ref={previewRef}
           onScroll={trackPreviewScroll}
           onWheel={handlePreviewWheel}
@@ -303,7 +314,12 @@ function SessionCardComponent({
 export const SessionCard = memo(SessionCardComponent, areSessionCardPropsEqual);
 
 function areSessionCardPropsEqual(previous: Props, next: Props): boolean {
-  return previewSignature(previous.preview) === previewSignature(next.preview) && sessionCardSignature(previous.session) === sessionCardSignature(next.session);
+  return (
+    previous.previewFontSize === next.previewFontSize &&
+    previous.previewScale === next.previewScale &&
+    previewSignature(previous.preview) === previewSignature(next.preview) &&
+    sessionCardSignature(previous.session) === sessionCardSignature(next.session)
+  );
 }
 
 function previewSignature(preview?: SessionPreview): string {
@@ -361,36 +377,58 @@ function sessionCardSignature(session: TerminalSession): string {
   ].join("\u001f");
 }
 
-function drawPreviewCanvas(canvas: HTMLCanvasElement, grid: TerminalPreviewGrid, availableWidth?: number): void {
+function normalizedPreviewFontSize(value: number): number {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_PREVIEW_FONT_SIZE;
+  }
+  return Math.max(12, Math.min(24, Math.floor(value)));
+}
+
+function normalizedPreviewScale(value: number): number {
+  const parsed = Number.isFinite(value) ? value : 1;
+  const scale = Math.max(0.8, Math.min(1.4, parsed));
+  if (typeof window.matchMedia === "function" && window.matchMedia(MOBILE_QUERY).matches) {
+    return Math.max(1, Math.min(1.15, scale));
+  }
+  return scale;
+}
+
+function drawPreviewCanvas(
+  canvas: HTMLCanvasElement,
+  grid: TerminalPreviewGrid,
+  availableWidth: number | undefined,
+  options: { fontSize: number; scale: number }
+): void {
   const context = canvas.getContext("2d");
   if (!context) {
     return;
   }
 
-  const fontSize = PREVIEW_FONT_SIZE;
+  const fontSize = options.fontSize;
+  const scale = options.scale;
   const lineHeight = Math.ceil(fontSize * 1.35);
   const fontFamily = '"Cascadia Mono", "SFMono-Regular", Consolas, "Noto Sans Mono CJK SC", "Microsoft YaHei Mono", NSimSun, monospace';
   context.font = `${fontSize}px ${fontFamily}`;
   const cellWidth = Math.max(8, Math.ceil(context.measureText("M").width * 100) / 100);
   const naturalWidth = Math.max(1, grid.cols * cellWidth);
   const naturalHeight = Math.max(lineHeight, grid.rows.length * lineHeight);
-  const fittedScale = availableWidth && availableWidth > 0 ? Math.min(1, availableWidth / naturalWidth) : 1;
-  const minScale =
-    typeof window.matchMedia === "function" && window.matchMedia(MOBILE_QUERY).matches
-      ? MOBILE_PREVIEW_MIN_SCALE
-      : PREVIEW_MIN_SCALE;
-  const scale = Math.min(1, Math.max(minScale, fittedScale));
-  const width = Math.max(1, naturalWidth * scale);
-  const height = Math.max(lineHeight * scale, naturalHeight * scale);
+  const width = Math.max(1, Math.ceil(naturalWidth * scale));
+  const height = Math.max(1, Math.ceil(naturalHeight * scale));
   const dpr = window.devicePixelRatio || 1;
 
-  canvas.width = Math.ceil(naturalWidth * dpr);
-  canvas.height = Math.ceil(naturalHeight * dpr);
+  context.imageSmoothingEnabled = false;
+  canvas.width = Math.ceil(width * dpr);
+  canvas.height = Math.ceil(height * dpr);
   canvas.style.width = `${width}px`;
   canvas.style.height = `${height}px`;
   canvas.dataset.previewScale = scale.toFixed(2);
+  canvas.dataset.previewFontSize = String(fontSize);
+  if (availableWidth && availableWidth > 0) {
+    canvas.dataset.previewOverflows = width > availableWidth ? "true" : "false";
+  }
 
-  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  context.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+  context.imageSmoothingEnabled = false;
   context.fillStyle = "#111614";
   context.fillRect(0, 0, naturalWidth, naturalHeight);
 
