@@ -31,6 +31,7 @@ import {
   captureZellijPreview,
   ensureZellijSession,
   killZellijSession,
+  saveZellijSessionState,
   sendZellijInput,
   zellijHealth,
   zellijPreviewSize,
@@ -59,6 +60,7 @@ const io = new SocketServer(server, {
   }
 });
 const stores = new Map<string, Promise<SessionStore>>();
+const restoreQueuedStores = new Set<string>();
 const nativeSessions = new NativeSessionManager();
 const DEFAULT_PREVIEW_MAX_CHARS = 120_000;
 
@@ -71,6 +73,7 @@ async function storeForUser(user: AuthUser): Promise<SessionStore> {
     storePromise = (async () => {
       const store = new SessionStore(userDataDir);
       await store.init();
+      queueStoreSessionRestore(store);
       return store;
     })();
     stores.set(userDataDir, storePromise);
@@ -359,6 +362,60 @@ server.listen(config.port, config.host, () => {
   console.log(`data dir: ${config.dataDir}`);
   console.log(`auth modes: ${authConfig().methods.join(", ")}`);
 });
+
+let shutdownStarted = false;
+async function shutdown(signal: string) {
+  if (shutdownStarted) {
+    return;
+  }
+  shutdownStarted = true;
+  console.log(`received ${signal}; saving zellij sessions before shutdown`);
+  await saveKnownZellijSessions().catch((error) => {
+    console.error("Failed to save zellij sessions during shutdown", error);
+  });
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+async function saveKnownZellijSessions() {
+  const storeResults = await Promise.allSettled(Array.from(stores.values()));
+  const sessionNames = new Set<string>();
+  for (const result of storeResults) {
+    if (result.status !== "fulfilled") {
+      continue;
+    }
+    const sessions = await result.value.all().catch(() => []);
+    sessions.filter((session) => !session.archived).forEach((session) => sessionNames.add(session.tmuxName));
+  }
+
+  await Promise.allSettled(Array.from(sessionNames).map((sessionName) => saveZellijSessionState(sessionName)));
+}
+
+function queueStoreSessionRestore(store: SessionStore) {
+  const key = path.resolve(store.dataDir);
+  if (restoreQueuedStores.has(key)) {
+    return;
+  }
+  restoreQueuedStores.add(key);
+  setTimeout(() => {
+    void restoreActiveSessions(store).catch((error) => {
+      console.error(`Failed to restore active sessions in ${store.dataDir}`, error);
+    });
+  }, 0);
+}
+
+async function restoreActiveSessions(store: SessionStore) {
+  const sessions = (await store.all()).filter((session) => !session.archived);
+  const results = await Promise.allSettled(sessions.map((session) => ensureSession(session, store.dataDir)));
+  results.forEach((result, index) => {
+    if (result.status === "rejected") {
+      console.error(`Failed to restore session ${sessions[index]?.id}`, result.reason);
+    }
+  });
+}
 
 async function ensureSession(session: TerminalSession, dataDir = config.dataDir) {
   const backend = await resolveBackend(session);

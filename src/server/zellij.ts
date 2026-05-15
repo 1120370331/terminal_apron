@@ -109,6 +109,7 @@ export async function killZellijSession(session: Pick<TerminalSession, "tmuxName
   await runZellij(["kill-session", session.tmuxName], { timeoutMs: 5000 }).catch(() =>
     runZellij(["kill-sessions", session.tmuxName], { timeoutMs: 5000 })
   );
+  await runZellij(["delete-session", session.tmuxName], { timeoutMs: 5000 }).catch(() => undefined);
 }
 
 export async function saveZellijSessionState(sessionName: string): Promise<void> {

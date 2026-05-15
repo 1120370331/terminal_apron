@@ -2,7 +2,13 @@ import type { Server, Socket } from "socket.io";
 import { config } from "./config.js";
 import { SessionStore } from "./db.js";
 import { ensureTmuxSession } from "./tmux.js";
-import { appendZellijTranscript, ensureZellijSession, zellijAttachArgs, zellijAttachCommand } from "./zellij.js";
+import {
+  appendZellijTranscript,
+  ensureZellijSession,
+  saveZellijSessionState,
+  zellijAttachArgs,
+  zellijAttachCommand
+} from "./zellij.js";
 import { userFromCookie } from "./auth.js";
 import { loadPty } from "./pty.js";
 import { resolveBackend } from "./backend.js";
@@ -11,6 +17,7 @@ import type { AuthUser } from "../shared/types.js";
 
 const MAX_TERMINAL_COLS = 4096;
 const MAX_TERMINAL_ROWS = 2048;
+const ZELLIJ_SAVE_DEBOUNCE_MS = 10_000;
 
 export function registerTerminalSockets(
   io: Server,
@@ -101,20 +108,53 @@ async function attachZellij(
   socket.emit("terminal:resized", { cols, rows, seq: 0 });
 
   let transcriptQueue = Promise.resolve();
+  let saveTimer: NodeJS.Timeout | null = null;
+  let lastSaveAt = 0;
+  let closed = false;
+  const saveNow = () => {
+    lastSaveAt = Date.now();
+    return saveZellijSessionState(session.tmuxName).catch(() => undefined);
+  };
+  const scheduleSave = () => {
+    if (closed) {
+      return;
+    }
+
+    const elapsed = Date.now() - lastSaveAt;
+    if (elapsed >= ZELLIJ_SAVE_DEBOUNCE_MS) {
+      void saveNow();
+      return;
+    }
+
+    if (!saveTimer) {
+      saveTimer = setTimeout(() => {
+        saveTimer = null;
+        void saveNow();
+      }, ZELLIJ_SAVE_DEBOUNCE_MS - elapsed);
+    }
+  };
+
   term.onData((data) => {
     socket.emit("terminal:data", data);
     transcriptQueue = transcriptQueue
       .then(() => appendZellijTranscript(session.id, data, dataDir))
       .catch(() => undefined);
+    scheduleSave();
   });
 
   term.onExit((event) => {
+    closed = true;
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
     socket.emit("terminal:exit", event);
     socket.disconnect(true);
   });
 
   socket.on("terminal:input", (data: string) => {
     term.write(data);
+    scheduleSave();
   });
 
   socket.on("terminal:resize", (size: { cols?: number; rows?: number; seq?: number }) => {
@@ -125,7 +165,22 @@ async function attachZellij(
   });
 
   socket.on("disconnect", () => {
-    term.kill();
+    if (closed) {
+      return;
+    }
+    closed = true;
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
+
+    void Promise.all([transcriptQueue.catch(() => undefined), saveNow()]).finally(() => {
+      try {
+        term.kill();
+      } catch {
+        // The zellij client may already have detached.
+      }
+    });
   });
 }
 
