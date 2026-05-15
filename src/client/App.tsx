@@ -52,6 +52,19 @@ const MOBILE_INITIAL_PREVIEW_CARDS = 2;
 const MOBILE_QUERY = "(max-width: 720px)";
 const GRID_COLUMNS = 12;
 const CARD_COLUMNS = 4;
+const MIN_CARD_COLUMNS = 2;
+const MIN_LAYOUT_ROWS = 3;
+const GRID_MARGIN: [number, number] = [14, 14];
+const GRID_RESIZE_HANDLES: Array<"s" | "w" | "e" | "n" | "sw" | "nw" | "se" | "ne"> = [
+  "s",
+  "w",
+  "e",
+  "n",
+  "sw",
+  "nw",
+  "se",
+  "ne"
+];
 type ThemeMode = "system" | "light" | "dark";
 
 interface PanelSettings {
@@ -307,14 +320,15 @@ function mergeFastPreview(previous: SessionPreview | undefined, next: SessionPre
 }
 
 function buildSessionLayout(session: TerminalSession, index: number, settings: PanelSettings): Layout {
+  const width = Math.max(MIN_CARD_COLUMNS, Math.min(GRID_COLUMNS, session.layout?.w ?? CARD_COLUMNS));
   return {
     i: session.id,
     x: session.layout?.x ?? (index % 3) * CARD_COLUMNS,
     y: session.layout?.y ?? Math.floor(index / 3) * settings.defaultCardRows,
-    w: session.layout?.w ?? CARD_COLUMNS,
-    h: Math.max(session.layout?.h ?? settings.defaultCardRows, settings.minCardRows),
-    minW: session.layout?.minW ?? 3,
-    minH: Math.max(session.layout?.minH ?? settings.minCardRows, settings.minCardRows)
+    w: width,
+    h: Math.max(session.layout?.h ?? settings.defaultCardRows, MIN_LAYOUT_ROWS),
+    minW: MIN_CARD_COLUMNS,
+    minH: MIN_LAYOUT_ROWS
   };
 }
 
@@ -325,8 +339,8 @@ function buildTopSessionLayout(sessionId: string, settings: PanelSettings): Layo
     y: 0,
     w: CARD_COLUMNS,
     h: Math.max(settings.defaultCardRows, settings.minCardRows),
-    minW: 3,
-    minH: settings.minCardRows
+    minW: MIN_CARD_COLUMNS,
+    minH: MIN_LAYOUT_ROWS
   };
 }
 
@@ -338,8 +352,8 @@ function buildOrganizedLayout(sessions: TerminalSession[], settings: PanelSettin
     y: Math.floor(index / cardsPerRow) * settings.defaultCardRows,
     w: CARD_COLUMNS,
     h: Math.max(settings.defaultCardRows, settings.minCardRows),
-    minW: 3,
-    minH: settings.minCardRows
+    minW: MIN_CARD_COLUMNS,
+    minH: MIN_LAYOUT_ROWS
   }));
 }
 
@@ -364,52 +378,44 @@ function compareSessionsForDisplay(a: TerminalSession, b: TerminalSession): numb
   return a.id.localeCompare(b.id);
 }
 
-function normalizeVisibleLayout(layout: Layout[]): Layout[] {
+function normalizeVisibleLayout(layout: Layout[]): { layout: Layout[]; offsetY: number } {
   if (layout.length === 0) {
-    return layout;
+    return { layout, offsetY: 0 };
   }
 
-  const minY = Math.min(...layout.map((item) => item.y));
-  const placed: Layout[] = [];
-
-  for (const item of layout) {
-    const next: Layout = {
-      ...item,
-      x: Math.max(0, Math.min(GRID_COLUMNS - item.w, item.x)),
-      y: Math.max(0, item.y - minY)
-    };
-
-    while (next.y > 0 && !placed.some((placedItem) => layoutItemsOverlap({ ...next, y: next.y - 1 }, placedItem))) {
-      next.y -= 1;
-    }
-
-    while (placed.some((placedItem) => layoutItemsOverlap(next, placedItem))) {
-      next.y += 1;
-    }
-
-    placed.push(next);
-  }
-
-  return placed;
+  const offsetY = Math.min(...layout.map((item) => item.y));
+  return {
+    offsetY,
+    layout: layout.map((item) => {
+      const w = Math.max(item.minW ?? MIN_CARD_COLUMNS, Math.min(GRID_COLUMNS, item.w));
+      return {
+        ...item,
+        w,
+        h: Math.max(item.minH ?? MIN_LAYOUT_ROWS, item.h),
+        x: Math.max(0, Math.min(GRID_COLUMNS - w, item.x)),
+        y: Math.max(0, item.y - offsetY),
+        minW: MIN_CARD_COLUMNS,
+        minH: MIN_LAYOUT_ROWS
+      };
+    })
+  };
 }
 
-function layoutItemsOverlap(a: Layout, b: Layout): boolean {
-  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-}
-
-function sameLayoutIds(previous: Layout[], next: Layout[]): boolean {
+function sameLayoutIdSet(previous: Layout[], next: Layout[]): boolean {
   if (previous.length !== next.length) {
     return false;
   }
-  return previous.every((item, index) => item.i === next[index]?.i);
+  const nextIds = new Set(next.map((item) => item.i));
+  return previous.every((item) => nextIds.has(item.i));
 }
 
 function sameLayout(previous: Layout[], next: Layout[]): boolean {
   if (previous.length !== next.length) {
     return false;
   }
-  return previous.every((item, index) => {
-    const nextItem = next[index];
+  const nextById = new Map(next.map((item) => [item.i, item]));
+  return previous.every((item) => {
+    const nextItem = nextById.get(item.i);
     return (
       item.i === nextItem?.i &&
       item.x === nextItem.x &&
@@ -422,10 +428,10 @@ function sameLayout(previous: Layout[], next: Layout[]): boolean {
   });
 }
 
-function layoutToSessionLayout(item: Layout) {
+function layoutToSessionLayout(item: Layout, offsetY = 0) {
   return {
     x: item.x,
-    y: item.y,
+    y: item.y + offsetY,
     w: item.w,
     h: item.h,
     minW: item.minW,
@@ -454,6 +460,7 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [localLayout, setLocalLayout] = useState<Layout[]>([]);
   const layoutDirtyRef = useRef(false);
+  const layoutOriginYRef = useRef(0);
   const layoutSaveSeqRef = useRef(0);
   const previewsRef = useRef<Record<string, SessionPreview>>({});
   const previewInFlightRef = useRef<Set<string>>(new Set());
@@ -726,14 +733,19 @@ export function App() {
     };
   }, [auth, previewTargetKey, settings.previewLines, settings.previewRefreshMs]);
 
-  const desktopLayout = useMemo(
+  const desktopLayoutState = useMemo(
     () => normalizeVisibleLayout(filtered.map((session, index) => buildSessionLayout(session, index, settings))),
     [filtered, settings.defaultCardRows, settings.minCardRows]
   );
+  const desktopLayout = desktopLayoutState.layout;
+
+  useEffect(() => {
+    layoutOriginYRef.current = desktopLayoutState.offsetY;
+  }, [desktopLayoutState.offsetY]);
 
   useEffect(() => {
     setLocalLayout((current) => {
-      if (layoutDirtyRef.current && sameLayoutIds(current, desktopLayout)) {
+      if (layoutDirtyRef.current && sameLayoutIdSet(current, desktopLayout)) {
         return current;
       }
 
@@ -742,13 +754,14 @@ export function App() {
     });
   }, [desktopLayout]);
 
-  const gridLayout = localLayout.length === filtered.length ? localLayout : desktopLayout;
+  const gridLayout = sameLayoutIdSet(localLayout, desktopLayout) ? localLayout : desktopLayout;
   const layouts = useMemo(() => ({ lg: gridLayout }), [gridLayout]);
 
   const saveLayout = useCallback(
     async (layout: Layout[]) => {
       const saveSeq = ++layoutSaveSeqRef.current;
       const byId = new Map(layout.map((item) => [item.i, item]));
+      const offsetY = layoutOriginYRef.current;
       try {
         await Promise.all(
           filtered.map((session) => {
@@ -757,7 +770,7 @@ export function App() {
               return Promise.resolve();
             }
             return api.updateSession(session.id, {
-              layout: layoutToSessionLayout(item)
+              layout: layoutToSessionLayout(item, offsetY)
             });
           })
         );
@@ -767,7 +780,7 @@ export function App() {
         setSessions((current) =>
           current.map((session) => {
             const item = byId.get(session.id);
-            return item ? { ...session, layout: layoutToSessionLayout(item) } : session;
+            return item ? { ...session, layout: layoutToSessionLayout(item, offsetY) } : session;
           })
         );
         layoutDirtyRef.current = false;
@@ -1021,9 +1034,12 @@ export function App() {
           breakpoints={{ lg: 0 }}
           cols={{ lg: GRID_COLUMNS }}
           rowHeight={settings.rowHeight}
-          margin={[14, 14]}
+          margin={GRID_MARGIN}
           compactType={null}
+          preventCollision={false}
+          resizeHandles={GRID_RESIZE_HANDLES}
           draggableHandle=".drag-handle"
+          draggableCancel=".preview,.quick-input,.card-actions,.preview-tools"
           onDrag={handleLayoutMove}
           onResize={handleLayoutMove}
           onDragStop={handleLayoutStop}

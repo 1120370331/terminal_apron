@@ -558,6 +558,11 @@ select {
   box-shadow: var(--card-shadow);
 }
 
+.session-grid .session-card {
+  min-height: 0;
+  contain-intrinsic-size: auto 360px;
+}
+
 .session-card.archived {
   opacity: 0.72;
 }
@@ -641,6 +646,10 @@ select {
   min-height: var(--session-preview-min-height, 500px);
   margin: 0 10px;
   overflow: hidden;
+}
+
+.session-grid .preview-wrap {
+  min-height: 0;
 }
 
 .preview-tools {
@@ -1128,6 +1137,21 @@ select {
 .react-grid-item.react-grid-placeholder {
   border-radius: 8px;
   background: rgba(47, 128, 237, 0.18);
+}
+
+.react-grid-item > .react-resizable-handle {
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+
+.react-grid-item:hover > .react-resizable-handle,
+.react-grid-item.resizing > .react-resizable-handle {
+  opacity: 1;
+}
+
+.react-grid-item > .react-resizable-handle::after {
+  width: 8px;
+  height: 8px;
 }
 
 .react-resizable-handle::after {
