@@ -1086,6 +1086,11 @@ select {
   padding: 8px;
 }
 
+.stable-width-terminal .terminal-host {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
 .terminal-host .xterm,
 .terminal-host .xterm * {
   box-sizing: content-box;
@@ -1106,6 +1111,14 @@ select {
 
 .terminal-host .xterm-screen canvas {
   max-width: none;
+}
+
+.stable-width-terminal .terminal-host .xterm,
+.stable-width-terminal .terminal-host .xterm-screen,
+.stable-width-terminal .terminal-host .xterm-viewport {
+  display: inline-block;
+  width: auto !important;
+  min-width: 100%;
 }
 
 .spin {
@@ -1193,6 +1206,10 @@ select {
   .terminal-actions code {
     max-width: 100%;
     flex: 1;
+  }
+
+  .mobile-terminal .terminal-host {
+    -webkit-overflow-scrolling: touch;
   }
 
   .session-footer {

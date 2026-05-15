@@ -12,6 +12,9 @@ interface Props {
   onClose: () => void;
 }
 
+const MOBILE_QUERY = "(max-width: 720px)";
+const STABLE_ZELLIJ_MIN_COLS = 100;
+
 export function TerminalDock({ session, onClose }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -26,6 +29,8 @@ export function TerminalDock({ session, onClose }: Props) {
   const [backend, setBackend] = useState(session.runtime?.backend ?? session.backend);
   const [status, setStatus] = useState("connecting");
   const [copied, setCopied] = useState(false);
+  const isMobileClient = typeof window !== "undefined" && window.matchMedia(MOBILE_QUERY).matches;
+  const usesStableZellijWidth = backend === "zellij" || session.backend === "zellij" || session.backend === "auto";
 
   const refitTerminal = useCallback((force = false) => {
     const terminal = termRef.current;
@@ -37,11 +42,16 @@ export function TerminalDock({ session, onClose }: Props) {
     try {
       const proposed = fit.proposeDimensions();
       if (proposed && proposed.cols > 0 && proposed.rows > 0) {
-        if (terminal.cols !== proposed.cols || terminal.rows !== proposed.rows) {
-          terminal.resize(proposed.cols, proposed.rows);
+        const next = normalizeTerminalDimensions(proposed, usesStableZellijWidth);
+        if (terminal.cols !== next.cols || terminal.rows !== next.rows) {
+          terminal.resize(next.cols, next.rows);
         }
       } else {
         fit.fit();
+        const next = normalizeTerminalDimensions({ cols: terminal.cols, rows: terminal.rows }, usesStableZellijWidth);
+        if (terminal.cols !== next.cols || terminal.rows !== next.rows) {
+          terminal.resize(next.cols, next.rows);
+        }
       }
 
       const socket = socketRef.current;
@@ -54,7 +64,7 @@ export function TerminalDock({ session, onClose }: Props) {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     }
-  }, []);
+  }, [usesStableZellijWidth]);
 
   const repairDisplay = useCallback(() => {
     resizeRetryRef.current = 0;
@@ -144,7 +154,8 @@ export function TerminalDock({ session, onClose }: Props) {
       query: {
         sessionId: session.id,
         cols: terminal.cols,
-        rows: terminal.rows
+        rows: terminal.rows,
+        clientProfile: isMobileClient ? "mobile" : "desktop"
       }
     });
 
@@ -269,10 +280,18 @@ export function TerminalDock({ session, onClose }: Props) {
         fitRef.current = null;
       }
     };
-  }, [refitTerminal, session.id]);
+  }, [isMobileClient, refitTerminal, session.id, usesStableZellijWidth]);
 
   return (
-    <div className="terminal-dock">
+    <div
+      className={[
+        "terminal-dock",
+        isMobileClient ? "mobile-terminal" : "",
+        usesStableZellijWidth ? "stable-width-terminal" : ""
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
       <header className="terminal-header">
         <div className="terminal-title">
           <strong>{session.name}</strong>
@@ -326,7 +345,7 @@ export function TerminalDock({ session, onClose }: Props) {
   );
 
   function emitResize(socket: Socket, terminal: Terminal, force = false) {
-    const next = { cols: terminal.cols, rows: terminal.rows };
+    const next = normalizeTerminalDimensions({ cols: terminal.cols, rows: terminal.rows }, usesStableZellijWidth);
     const previous = sizeRef.current;
     if (!force && previous?.cols === next.cols && previous?.rows === next.rows) {
       return;
@@ -335,4 +354,14 @@ export function TerminalDock({ session, onClose }: Props) {
     resizeSeqRef.current += 1;
     socket.emit("terminal:resize", { ...next, seq: resizeSeqRef.current });
   }
+}
+
+function normalizeTerminalDimensions(
+  value: { cols: number; rows: number },
+  stableZellijWidth: boolean
+): { cols: number; rows: number } {
+  return {
+    cols: stableZellijWidth ? Math.max(STABLE_ZELLIJ_MIN_COLS, value.cols) : value.cols,
+    rows: value.rows
+  };
 }

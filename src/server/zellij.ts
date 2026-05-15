@@ -38,6 +38,7 @@ const VIEWPORT_PREVIEW_STALE_MS = 30_000;
 const ZELLIJ_SESSION_LIST_TTL_MS = 750;
 const ZELLIJ_VERSION_TTL_MS = 60_000;
 const ZELLIJ_RUNTIME_CACHE_TTL_MS = 10_000;
+const ZELLIJ_PREVIEW_MIN_COLS = 100;
 
 interface PreviewCacheEntry {
   value: string;
@@ -252,7 +253,7 @@ export async function zellijPreviewSize(
     return undefined;
   }
 
-  const cols = clampSize(pane.pane_content_columns ?? pane.pane_columns, 20, 600);
+  const cols = clampSize(pane.pane_content_columns ?? pane.pane_columns, ZELLIJ_PREVIEW_MIN_COLS, 600);
   const rows = clampSize(pane.pane_content_rows ?? pane.pane_rows, 10, 300);
   if (!cols || !rows) {
     return undefined;
