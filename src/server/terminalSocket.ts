@@ -55,16 +55,17 @@ async function attachTerminal(
     socket.disconnect(true);
     return;
   }
-  const store = await storeForUser(user);
-  const sessionId = String(socket.handshake.query.sessionId ?? "");
-  const session = await store.get(sessionId);
-  if (!session) {
-    socket.emit("terminal:error", "session not found");
-    socket.disconnect(true);
-    return;
-  }
 
   try {
+    const store = await storeForUser(user);
+    const sessionId = String(socket.handshake.query.sessionId ?? "");
+    const session = await store.get(sessionId);
+    if (!session) {
+      socket.emit("terminal:error", "session not found");
+      socket.disconnect(true);
+      return;
+    }
+
     const cols = clampDimension(socket.handshake.query.cols, 120, 20, MAX_TERMINAL_COLS);
     const rows = clampDimension(socket.handshake.query.rows, 36, 10, MAX_TERMINAL_ROWS);
     const isMobileClient = socket.handshake.query.clientProfile === "mobile";
