@@ -260,8 +260,12 @@ export function TerminalDock({ session, onClose }: Props) {
       setStatus("disconnected");
     });
 
+    const inputFilter = createTerminalInputFilter();
     const disposable = terminal.onData((data) => {
-      socket.emit("terminal:input", data);
+      const filtered = inputFilter(data);
+      if (filtered) {
+        socket.emit("terminal:input", filtered);
+      }
     });
     const resizeDisposable = terminal.onResize(() => {
       if (socket.connected) {
@@ -419,4 +423,70 @@ function normalizeTerminalDimensions(
     cols: value.cols,
     rows: value.rows
   };
+}
+
+function createTerminalInputFilter(): (data: string) => string {
+  let pending = "";
+  return (data: string) => {
+    const result = stripPaletteReports(`${pending}${data}`);
+    pending = result.pending;
+    return result.output;
+  };
+}
+
+function stripPaletteReports(data: string): { output: string; pending: string } {
+  let output = "";
+  let index = 0;
+
+  while (index < data.length) {
+    if (data[index] !== "\x1b" || data[index + 1] !== "]") {
+      output += data[index];
+      index += 1;
+      continue;
+    }
+
+    const terminator = findOscTerminator(data, index + 2);
+    if (!terminator) {
+      const rest = data.slice(index);
+      if (isPaletteReportPrefix(rest)) {
+        return { output, pending: rest };
+      }
+      output += data[index];
+      index += 1;
+      continue;
+    }
+
+    const sequence = data.slice(index, terminator.end);
+    if (!isPaletteReport(sequence)) {
+      output += sequence;
+    }
+    index = terminator.end;
+  }
+
+  return { output, pending: "" };
+}
+
+function findOscTerminator(data: string, start: number): { end: number } | null {
+  for (let index = start; index < data.length; index += 1) {
+    if (data[index] === "\x07") {
+      return { end: index + 1 };
+    }
+    if (data[index] === "\x1b" && data[index + 1] === "\\") {
+      return { end: index + 2 };
+    }
+  }
+  return null;
+}
+
+function isPaletteReportPrefix(value: string): boolean {
+  return /^\x1b\](?:4(?:;\d+(?:;rgb:[0-9a-fA-F/]*)?)*|1[012](?:;rgb:[0-9a-fA-F/]*)?)?$/.test(value);
+}
+
+function isPaletteReport(sequence: string): boolean {
+  const body = sequence.replace(/^\x1b\]/, "").replace(/(?:\x07|\x1b\\)$/, "");
+  const rgb = "[0-9a-fA-F]{2,4}/[0-9a-fA-F]{2,4}/[0-9a-fA-F]{2,4}";
+  return (
+    new RegExp(`^4(?:;\\d+;rgb:${rgb})+$`).test(body) ||
+    new RegExp(`^1[012];rgb:${rgb}$`).test(body)
+  );
 }
