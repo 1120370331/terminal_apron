@@ -4,6 +4,8 @@ import { SessionStore } from "./db.js";
 import { ensureTmuxSession } from "./tmux.js";
 import {
   appendZellijTranscript,
+  captureZellijAttachHistory,
+  createZellijAttachOutputFilter,
   ensureZellijSession,
   saveZellijSessionState,
   zellijAttachArgs,
@@ -97,6 +99,7 @@ async function attachZellij(
   stableSize: boolean
 ): Promise<void> {
   await ensureZellijSession(session);
+  const attachHistory = await captureZellijAttachHistory(session, dataDir).catch(() => "");
   const pty = await loadPty();
   let currentCols = cols;
   let currentRows = rows;
@@ -121,6 +124,8 @@ async function attachZellij(
   socket.emit("terminal:resized", { cols: currentCols, rows: currentRows, seq: 0 });
 
   let transcriptQueue = Promise.resolve();
+  let replayingHistory = true;
+  const pendingLiveData: string[] = [];
   let saveTimer: NodeJS.Timeout | null = null;
   let lastSaveAt = 0;
   let closed = false;
@@ -147,13 +152,37 @@ async function attachZellij(
     }
   };
 
-  term.onData((data) => {
+  const emitLiveData = (data: string) => {
     socket.emit("terminal:data", data);
     transcriptQueue = transcriptQueue
       .then(() => appendZellijTranscript(session.id, data, dataDir))
       .catch(() => undefined);
     scheduleSave();
+  };
+  const outputFilter = createZellijAttachOutputFilter();
+
+  term.onData((data) => {
+    if (replayingHistory) {
+      pendingLiveData.push(data);
+      return;
+    }
+    const filtered = outputFilter(data);
+    if (filtered) {
+      emitLiveData(filtered);
+    }
   });
+
+  if (attachHistory.trim()) {
+    socket.emit("terminal:data", normalizeAttachHistory(attachHistory));
+  }
+  replayingHistory = false;
+  for (const data of pendingLiveData) {
+    const filtered = outputFilter(data);
+    if (filtered) {
+      emitLiveData(filtered);
+    }
+  }
+  pendingLiveData.length = 0;
 
   term.onExit((event) => {
     closed = true;
@@ -260,4 +289,12 @@ function clampDimension(value: unknown, fallback: number, min: number, max: numb
     return fallback;
   }
   return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function normalizeAttachHistory(value: string): string {
+  if (!value) {
+    return "";
+  }
+  const normalized = value.replace(/\r?\n/g, "\r\n");
+  return normalized.endsWith("\r\n") ? normalized : `${normalized}\r\n`;
 }

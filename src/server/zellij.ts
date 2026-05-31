@@ -11,6 +11,7 @@ interface RunOptions {
   cwd?: string;
   input?: string;
   timeoutMs?: number;
+  maxBufferBytes?: number;
 }
 
 interface ZellijPane {
@@ -66,7 +67,7 @@ function runZellij(args: string[], options: RunOptions = {}): Promise<{ stdout: 
       {
         cwd: options.cwd,
         timeout: options.timeoutMs ?? 8000,
-        maxBuffer: 1024 * 1024 * 8
+        maxBuffer: options.maxBufferBytes ?? 1024 * 1024 * 64
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -266,6 +267,33 @@ export function appendZellijTranscript(sessionId: string, data: string, dataDir 
   return appendTranscript(zellijTranscriptPath(dataDir, sessionId), data, config.nativeHistoryBytes);
 }
 
+export async function captureZellijAttachHistory(
+  session: Pick<TerminalSession, "id" | "tmuxName">,
+  dataDir = config.dataDir,
+  lines = config.zellijScrollback
+): Promise<string> {
+  const linesToKeep = Math.max(100, Math.min(config.zellijScrollback, Math.floor(lines)));
+  const transcript = stripZellijHistoryHidingSequences(
+    tailRawLines(await loadZellijTranscript(dataDir, session.id), linesToKeep)
+  );
+  if (await hasZellijSession(session.tmuxName)) {
+    const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
+    const args = ["--session", session.tmuxName, "action", "dump-screen", "--ansi", "--full"];
+    if (paneId) {
+      args.push("--pane-id", paneId);
+    }
+    const result = await runZellij(args, {
+      timeoutMs: 8000,
+      maxBufferBytes: Math.max(1024 * 1024 * 16, config.nativeHistoryBytes + 1024 * 1024)
+    }).catch(() => ({ stdout: "", stderr: "" }));
+    const output = tailRawLines(result.stdout, linesToKeep);
+    if (output.trim()) {
+      return longerHistory(output, transcript);
+    }
+  }
+  return transcript;
+}
+
 export async function sendZellijInput(
   session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
   data: string,
@@ -416,7 +444,9 @@ async function listZellijSessions(): Promise<string[]> {
       const value = result.stdout
         .split(/\r?\n/)
         .map(stripAnsi)
-        .map((line) => line.trim().split(/\s+/)[0])
+        .map((line) => line.trim())
+        .filter((line) => line && !/\(EXITED\b/i.test(line))
+        .map((line) => line.split(/\s+/)[0])
         .filter(Boolean);
       sessionListCache = { value, capturedAt: Date.now() };
       return value;
@@ -649,6 +679,79 @@ function tailLines(value: string, linesToKeep: number): string {
 function tailRawLines(value: string, linesToKeep: number): string {
   const lines = value.split(/\r?\n/);
   return lines.slice(-linesToKeep).join("\n");
+}
+
+function longerHistory(primary: string, fallback: string): string {
+  if (!fallback.trim()) {
+    return primary;
+  }
+  if (!primary.trim()) {
+    return fallback;
+  }
+  return countRawLines(fallback) > countRawLines(primary) ? fallback : primary;
+}
+
+function countRawLines(value: string): number {
+  return value ? value.split(/\r?\n/).length : 0;
+}
+
+export function createZellijAttachOutputFilter(): (data: string) => string {
+  let pending = "";
+  return (data: string) => {
+    const result = stripZellijHistoryHidingSequencesChunk(`${pending}${data}`);
+    pending = result.pending;
+    return result.output;
+  };
+}
+
+export function stripZellijHistoryHidingSequences(data: string): string {
+  const result = stripZellijHistoryHidingSequencesChunk(data);
+  return result.output + result.pending;
+}
+
+function stripZellijHistoryHidingSequencesChunk(data: string): { output: string; pending: string } {
+  let output = "";
+  let index = 0;
+
+  while (index < data.length) {
+    if (data[index] !== "\x1b" || data[index + 1] !== "[") {
+      output += data[index];
+      index += 1;
+      continue;
+    }
+
+    const end = findCsiSequenceEnd(data, index + 2);
+    if (end === -1) {
+      return { output, pending: data.slice(index) };
+    }
+
+    const sequence = data.slice(index, end + 1);
+    if (!isHistoryHidingCsi(sequence)) {
+      output += sequence;
+    }
+    index = end + 1;
+  }
+
+  return { output, pending: "" };
+}
+
+function findCsiSequenceEnd(data: string, start: number): number {
+  for (let index = start; index < data.length; index += 1) {
+    const code = data.charCodeAt(index);
+    if (code >= 0x40 && code <= 0x7e) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function isHistoryHidingCsi(sequence: string): boolean {
+  const privateMode = /^\x1b\[\?([0-9;]*)([hl])$/.exec(sequence);
+  if (privateMode) {
+    const modes = privateMode[1].split(";");
+    return modes.some((mode) => mode === "47" || mode === "1047" || mode === "1048" || mode === "1049");
+  }
+  return /^\x1b\[\??3J$/.test(sequence);
 }
 
 async function renderPlainTranscript(value: string, lines: number): Promise<string> {

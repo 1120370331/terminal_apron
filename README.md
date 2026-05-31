@@ -45,7 +45,7 @@ TWM_COOKIE_SECURE=false
 # TWM_USERS_JSON='[{"name":"alice","password":"alice-pass"},{"name":"bob","authorizedKeysFile":"~/.ssh/bob_authorized_keys"}]'
 # TWM_USERS_FILE=./users.json
 
-TWM_NATIVE_HISTORY_BYTES=8000000
+TWM_NATIVE_HISTORY_BYTES=50000000
 TWM_PREVIEW_MAX_LINES=5000
 TWM_ZELLIJ_SCROLLBACK=50000
 ```

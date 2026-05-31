@@ -16,6 +16,7 @@ interface Props {
 const MOBILE_QUERY = "(max-width: 720px)";
 const ZELLIJ_WEB_COLS = 120;
 const ZELLIJ_WEB_ROWS = 36;
+const TERMINAL_SCROLLBACK_ROWS = 200_000;
 
 export function TerminalDock({ session, onClose }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -181,7 +182,7 @@ export function TerminalDock({ session, onClose }: Props) {
         cursor: "#f2c94c",
         selectionBackground: "#2f80ed66"
       },
-      scrollback: 50000
+      scrollback: TERMINAL_SCROLLBACK_ROWS
     });
     const fit = new FitAddon();
     const unicode11 = new Unicode11Addon();
