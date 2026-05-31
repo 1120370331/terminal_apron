@@ -39,6 +39,7 @@ import { TerminalDock } from "./components/TerminalDock";
 const ResponsiveGrid = WidthProvider(Responsive);
 const FILTER_STATE_KEY = "terminal-web-monitor.filters.v1";
 const SETTINGS_STATE_KEY = "terminal-web-monitor.settings.v1";
+const DEFAULT_BROWSER_TITLE = "Terminal Web Monitor";
 const DEFAULT_ROW_HEIGHT = 100;
 const DEFAULT_CARD_ROWS = 7;
 const MIN_CARD_ROWS = 7;
@@ -72,6 +73,7 @@ const GRID_RESIZE_HANDLES: Array<"s" | "w" | "e" | "n" | "sw" | "nw" | "se" | "n
 type ThemeMode = "system" | "light" | "dark";
 
 interface PanelSettings {
+  browserTitle: string;
   rowHeight: number;
   defaultCardRows: number;
   minCardRows: number;
@@ -93,6 +95,7 @@ interface FilterState {
 }
 
 const DEFAULT_SETTINGS: PanelSettings = {
+  browserTitle: DEFAULT_BROWSER_TITLE,
   rowHeight: DEFAULT_ROW_HEIGHT,
   defaultCardRows: DEFAULT_CARD_ROWS,
   minCardRows: MIN_CARD_ROWS,
@@ -116,6 +119,17 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
 
 function parseThemeMode(value: unknown): ThemeMode {
   return value === "light" || value === "dark" || value === "system" ? value : DEFAULT_SETTINGS.themeMode;
+}
+
+function normalizeBrowserTitle(value: unknown): string {
+  if (typeof value !== "string") {
+    return DEFAULT_SETTINGS.browserTitle;
+  }
+  return value.replace(/\s+/g, " ").trim().slice(0, 80);
+}
+
+function effectiveBrowserTitle(value: string): string {
+  return value.trim() || DEFAULT_BROWSER_TITLE;
 }
 
 function resolveThemeMode(mode: ThemeMode): "light" | "dark" {
@@ -171,6 +185,7 @@ function loadPanelSettings(storageKey = SETTINGS_STATE_KEY): PanelSettings {
     }
     const parsed = JSON.parse(stored) as Partial<PanelSettings>;
     return {
+      browserTitle: normalizeBrowserTitle(parsed.browserTitle),
       rowHeight: clampNumber(parsed.rowHeight, DEFAULT_SETTINGS.rowHeight, 80, 220),
       defaultCardRows: clampNumber(parsed.defaultCardRows, DEFAULT_SETTINGS.defaultCardRows, 3, 14),
       minCardRows: clampNumber(parsed.minCardRows, DEFAULT_SETTINGS.minCardRows, 3, 14),
@@ -695,6 +710,10 @@ export function App() {
     }
     window.localStorage.setItem(userStorageKey(SETTINGS_STATE_KEY, auth.name), JSON.stringify(settings));
   }, [auth, settings]);
+
+  useEffect(() => {
+    document.title = effectiveBrowserTitle(settings.browserTitle);
+  }, [settings.browserTitle]);
 
   useEffect(() => {
     const applyTheme = () => {
@@ -1356,6 +1375,16 @@ function SettingsModal({
           </button>
         </header>
         <div className="settings-form">
+          <label className="settings-form-wide">
+            <span>浏览器标签名称</span>
+            <input
+              type="text"
+              maxLength={80}
+              placeholder={DEFAULT_BROWSER_TITLE}
+              value={settings.browserTitle}
+              onChange={(event) => update("browserTitle", event.target.value.slice(0, 80))}
+            />
+          </label>
           <label>
             <span>Theme mode</span>
             <select value={settings.themeMode} onChange={(event) => update("themeMode", parseThemeMode(event.target.value))}>

@@ -1090,6 +1090,10 @@ select {
   font-weight: 650;
 }
 
+.settings-form-wide {
+  grid-column: 1 / -1;
+}
+
 .settings-form input,
 .settings-form select {
   width: 100%;
