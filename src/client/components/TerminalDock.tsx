@@ -10,6 +10,7 @@ import { filesFromClipboardData, readClipboardFiles, readClipboardText, writeCli
 
 interface Props {
   session: TerminalSession;
+  visible: boolean;
   onClose: () => void;
 }
 
@@ -19,7 +20,7 @@ const ZELLIJ_WEB_ROWS = 36;
 const TERMINAL_SCROLLBACK_ROWS = 200_000;
 const TERMINAL_INPUT_BATCH_MS = 12;
 
-export function TerminalDock({ session, onClose }: Props) {
+export function TerminalDock({ session, visible, onClose }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -190,6 +191,20 @@ export function TerminalDock({ session, onClose }: Props) {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!visible) {
+      return;
+    }
+
+    refitTerminal(true);
+    termRef.current?.focus();
+    const timers = [
+      window.setTimeout(() => refitTerminal(true), 80),
+      window.setTimeout(() => refitTerminal(true), 260)
+    ];
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [refitTerminal, visible]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -384,10 +399,12 @@ export function TerminalDock({ session, onClose }: Props) {
       className={[
         "terminal-dock",
         isMobileClient ? "mobile-terminal" : "",
-        usesStableZellijWidth ? "stable-width-terminal" : ""
+        usesStableZellijWidth ? "stable-width-terminal" : "",
+        visible ? "" : "terminal-dock-cached"
       ]
         .filter(Boolean)
         .join(" ")}
+      aria-hidden={!visible}
     >
       <header className="terminal-header">
         <div className="terminal-title">

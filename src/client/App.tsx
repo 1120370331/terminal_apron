@@ -553,6 +553,7 @@ export function App() {
   const [transferOpen, setTransferOpen] = useState(false);
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
+  const [cachedTerminal, setCachedTerminal] = useState<TerminalSession | null>(null);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [previewRevealTimedOut, setPreviewRevealTimedOut] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -977,7 +978,10 @@ export function App() {
       preview={previews[session.id]}
       previewFontSize={settings.listTerminalFontSize}
       previewScale={settings.listTerminalScale / 100}
-      onOpen={() => setActiveTerminal(session)}
+      onOpen={() => {
+        setCachedTerminal(session);
+        setActiveTerminal(session);
+      }}
       onEdit={() => setEditorSession(session)}
       onDuplicate={async () => {
         await api.duplicateSession(session.id);
@@ -1237,15 +1241,18 @@ export function App() {
             setEditorSession(null);
             await loadSessions();
             if (terminalToOpen) {
+              setCachedTerminal(terminalToOpen);
               setActiveTerminal(terminalToOpen);
             }
           }}
         />
       )}
 
-      {activeTerminal && (
+      {cachedTerminal && (
         <TerminalDock
-          session={activeTerminal}
+          key={cachedTerminal.id}
+          session={cachedTerminal}
+          visible={activeTerminal?.id === cachedTerminal.id}
           onClose={() => setActiveTerminal(null)}
         />
       )}

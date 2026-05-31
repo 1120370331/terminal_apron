@@ -1190,6 +1190,12 @@ select {
   box-shadow: 0 22px 60px rgba(0, 0, 0, 0.32);
 }
 
+.terminal-dock-cached {
+  visibility: hidden;
+  pointer-events: none;
+  z-index: -1;
+}
+
 .terminal-header {
   display: flex;
   align-items: center;
