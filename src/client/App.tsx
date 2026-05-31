@@ -49,7 +49,6 @@ const SYSTEM_METRICS_HISTORY_LIMIT = 120;
 const DEFAULT_PREVIEW_LINES = 600;
 const MAX_LIST_PREVIEW_LINES = 1200;
 const FULL_PREVIEW_REFRESH_MS = 10_000;
-const REMOTE_SESSION_REFRESH_MS = 2500;
 const REMOTE_SYSTEM_METRICS_REFRESH_MS = 5000;
 const REMOTE_PREVIEW_MIN_REFRESH_MS = 2500;
 const REMOTE_FULL_PREVIEW_REFRESH_MS = 30_000;
@@ -569,7 +568,6 @@ export function App() {
   const userStorageReadyRef = useRef<string | null>(null);
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const remoteBrowserHost = useMemo(isRemoteBrowserHost, []);
-  const sessionRefreshMs = remoteBrowserHost ? REMOTE_SESSION_REFRESH_MS : SESSION_REFRESH_MS;
   const systemMetricsRefreshMs = remoteBrowserHost ? REMOTE_SYSTEM_METRICS_REFRESH_MS : SYSTEM_METRICS_REFRESH_MS;
   const previewRefreshMs = remoteBrowserHost
     ? Math.max(settings.previewRefreshMs, REMOTE_PREVIEW_MIN_REFRESH_MS)
@@ -667,7 +665,7 @@ export function App() {
   }, [settings.themeMode]);
 
   useEffect(() => {
-    if (!auth) {
+    if (!auth || activeTerminal) {
       return;
     }
     void loadSessions();
@@ -676,9 +674,9 @@ export function App() {
         return;
       }
       void loadSessions();
-    }, sessionRefreshMs);
+    }, SESSION_REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [auth, loadSessions, sessionRefreshMs]);
+  }, [activeTerminal, auth, loadSessions]);
 
   useEffect(() => {
     if (!auth) {
@@ -1248,10 +1246,7 @@ export function App() {
       {activeTerminal && (
         <TerminalDock
           session={activeTerminal}
-          onClose={() => {
-            setActiveTerminal(null);
-            void loadSessions();
-          }}
+          onClose={() => setActiveTerminal(null)}
         />
       )}
 
