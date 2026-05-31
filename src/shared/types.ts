@@ -75,12 +75,58 @@ export interface UpdateSessionInput {
   layout?: GridItemLayout;
 }
 
+export type SessionInputMode = "paste" | "type";
+
+export interface SessionInputRequest {
+  data: string;
+  enter?: boolean;
+  submitKey?: "enter";
+  mode?: SessionInputMode;
+  submitDelayMs?: number;
+}
+
 export interface SessionPreview {
   sessionId: string;
   text: string;
   grid?: TerminalPreviewGrid;
   signature?: string;
   capturedAt: string;
+}
+
+export interface SessionUploadFile {
+  originalName: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  path: string;
+  terminalText: string;
+}
+
+export interface SessionUploadResponse {
+  files: SessionUploadFile[];
+  terminalText: string;
+}
+
+export interface FileTransferEntry {
+  name: string;
+  relativePath: string;
+  path: string;
+  terminalText: string;
+  size: number;
+  modifiedAt: string;
+  mimeType: string;
+}
+
+export interface FileTransferListResponse {
+  rootPath: string;
+  terminalText: string;
+  files: FileTransferEntry[];
+}
+
+export interface FileTransferUploadResponse {
+  rootPath: string;
+  terminalText: string;
+  files: FileTransferEntry[];
 }
 
 export interface TerminalPreviewGrid {

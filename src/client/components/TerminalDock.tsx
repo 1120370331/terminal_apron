@@ -5,7 +5,8 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { io, type Socket } from "socket.io-client";
 import { Check, Clipboard, ClipboardPaste, RefreshCw, X } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
-import { readClipboardText, writeClipboardText } from "../clipboard";
+import { api } from "../api";
+import { filesFromClipboardData, readClipboardFiles, readClipboardText, writeClipboardText } from "../clipboard";
 
 interface Props {
   session: TerminalSession;
@@ -26,12 +27,15 @@ export function TerminalDock({ session, onClose }: Props) {
   const lastAckSeqRef = useRef(0);
   const resizeRetryRef = useRef(0);
   const copiedTimerRef = useRef<number | null>(null);
+  const uploadingRef = useRef(false);
   const [attachCommand, setAttachCommand] = useState<string | null>(null);
   const [backend, setBackend] = useState(session.runtime?.backend ?? session.backend);
   const [status, setStatus] = useState("connecting");
   const [copied, setCopied] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const isMobileClient = typeof window !== "undefined" && window.matchMedia(MOBILE_QUERY).matches;
-  const usesStableZellijWidth = backend === "zellij" || session.backend === "zellij" || session.backend === "auto";
+  const usesStableZellijWidth =
+    !isMobileClient && (backend === "zellij" || session.backend === "zellij" || session.backend === "auto");
 
   const refitTerminal = useCallback((force = false) => {
     const terminal = termRef.current;
@@ -95,8 +99,39 @@ export function TerminalDock({ session, onClose }: Props) {
     terminal?.focus();
   }, [markCopied]);
 
+  const pasteFilesToTerminal = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0 || uploadingRef.current) {
+        termRef.current?.focus();
+        return;
+      }
+
+      uploadingRef.current = true;
+      setUploading(true);
+      try {
+        const result = await api.uploadSessionFiles(session.id, files);
+        if (result.terminalText) {
+          socketRef.current?.emit("terminal:input", result.terminalText);
+        }
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : String(error));
+      } finally {
+        uploadingRef.current = false;
+        setUploading(false);
+        termRef.current?.focus();
+      }
+    },
+    [session.id]
+  );
+
   const pasteClipboardToTerminal = useCallback(async () => {
     try {
+      const files = await readClipboardFiles().catch(() => []);
+      if (files.length > 0) {
+        await pasteFilesToTerminal(files);
+        return;
+      }
+
       const text = await readClipboardText();
       if (text) {
         socketRef.current?.emit("terminal:input", text);
@@ -104,7 +139,7 @@ export function TerminalDock({ session, onClose }: Props) {
     } finally {
       termRef.current?.focus();
     }
-  }, []);
+  }, [pasteFilesToTerminal]);
 
   useEffect(() => {
     return () => {
@@ -120,6 +155,17 @@ export function TerminalDock({ session, onClose }: Props) {
       return;
     }
 
+    const handlePaste = (event: ClipboardEvent) => {
+      const files = filesFromClipboardData(event.clipboardData);
+      if (files.length === 0) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      void pasteFilesToTerminal(files);
+    };
+    host.addEventListener("paste", handlePaste, true);
+
     const terminal = new Terminal({
       cursorBlink: true,
       allowProposedApi: true,
@@ -127,8 +173,8 @@ export function TerminalDock({ session, onClose }: Props) {
       windowsMode: true,
       fontFamily:
         '"JetBrains Mono", "Cascadia Mono", "SFMono-Regular", Consolas, "Noto Sans Mono CJK SC", "Microsoft YaHei Mono", NSimSun, monospace',
-      fontSize: 14,
-      lineHeight: 1.2,
+      fontSize: isMobileClient ? 13 : 14,
+      lineHeight: isMobileClient ? 1.18 : 1.2,
       theme: {
         background: "#111614",
         foreground: "#eef2ed",
@@ -264,6 +310,7 @@ export function TerminalDock({ session, onClose }: Props) {
       disposed = true;
       timers.forEach((timer) => window.clearTimeout(timer));
       observer.disconnect();
+      host.removeEventListener("paste", handlePaste, true);
       window.removeEventListener("resize", scheduleResize);
       window.visualViewport?.removeEventListener("resize", scheduleResize);
       window.clearInterval(sizeTimer);
@@ -281,7 +328,7 @@ export function TerminalDock({ session, onClose }: Props) {
         fitRef.current = null;
       }
     };
-  }, [isMobileClient, refitTerminal, session.id, usesStableZellijWidth]);
+  }, [isMobileClient, pasteFilesToTerminal, refitTerminal, session.id, usesStableZellijWidth]);
 
   return (
     <div
@@ -314,7 +361,7 @@ export function TerminalDock({ session, onClose }: Props) {
           ) : (
             <code>{backend} pty</code>
           )}
-          <span className="terminal-status">{status}</span>
+          <span className="terminal-status">{uploading ? "uploading" : status}</span>
           <button
             className="icon-button"
             type="button"

@@ -160,10 +160,17 @@ export class NativeSessionManager {
     this.sessions.delete(sessionKey);
   }
 
-  async write(session: TerminalSession, data: string, enter = false, dataDir = config.dataDir): Promise<void> {
+  async write(
+    session: TerminalSession,
+    data: string,
+    enter = false,
+    dataDir = config.dataDir,
+    submitDelayMs = 0
+  ): Promise<void> {
     const entry = await this.ensure(session, dataDir);
     entry.term.write(data);
     if (enter) {
+      await delay(submitDelayMs);
       entry.term.write("\r");
     }
   }
@@ -203,6 +210,14 @@ function writeHeadless(screen: HeadlessTerminal, data: string): Promise<void> {
   return new Promise<void>((resolve) => {
     screen.write(data, resolve);
   });
+}
+
+function delay(ms: number): Promise<void> {
+  const duration = Math.max(0, Math.min(1000, Math.floor(ms)));
+  if (duration === 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => setTimeout(resolve, duration));
 }
 
 function sessionKeyForDataDir(dataDir: string, sessionId: string): string {

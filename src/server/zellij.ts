@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Headless from "@xterm/headless";
 import type { Terminal as HeadlessTerminal } from "@xterm/headless";
-import type { SessionRuntime, TerminalSession } from "../shared/types.js";
+import type { SessionInputMode, SessionRuntime, TerminalSession } from "../shared/types.js";
 import { config } from "./config.js";
 import { loadPty } from "./pty.js";
 
@@ -39,6 +39,7 @@ const ZELLIJ_SESSION_LIST_TTL_MS = 750;
 const ZELLIJ_VERSION_TTL_MS = 60_000;
 const ZELLIJ_RUNTIME_CACHE_TTL_MS = 10_000;
 const ZELLIJ_PREVIEW_MIN_COLS = 120;
+const DEFAULT_PASTE_SUBMIT_DELAY_MS = 120;
 
 interface PreviewCacheEntry {
   value: string;
@@ -268,7 +269,8 @@ export function appendZellijTranscript(sessionId: string, data: string, dataDir 
 export async function sendZellijInput(
   session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
   data: string,
-  enter = false
+  enter = false,
+  options: { mode?: SessionInputMode; submitDelayMs?: number } = {}
 ): Promise<void> {
   await ensureZellijSession(session);
   if (!(await hasZellijSession(session.tmuxName))) {
@@ -276,11 +278,21 @@ export async function sendZellijInput(
   }
   const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
   const target = paneId ? ["--pane-id", paneId] : [];
-  await writeZellijChars(session.tmuxName, target, data);
+  if (options.mode === "type") {
+    await writeZellijChars(session.tmuxName, target, data);
+  } else {
+    await pasteZellijText(session.tmuxName, target, data);
+  }
   if (!enter) {
     void saveZellijSessionState(session.tmuxName).catch(() => undefined);
     return;
   }
+  await delay(
+    normalizeSubmitDelayMs(
+      options.submitDelayMs,
+      options.mode === "type" ? 0 : DEFAULT_PASTE_SUBMIT_DELAY_MS
+    )
+  );
   await sendZellijEnter(session.tmuxName, target);
   void saveZellijSessionState(session.tmuxName).catch(() => undefined);
 }
@@ -516,10 +528,28 @@ async function writeZellijChars(sessionName: string, target: string[], data: str
   }
 }
 
+async function pasteZellijText(sessionName: string, target: string[], data: string): Promise<void> {
+  for (const chunk of chunkString(data, 2000)) {
+    await runZellij(["--session", sessionName, "action", "paste", ...target, "--", chunk], {
+      timeoutMs: 5000
+    }).catch(() =>
+      runZellij(["--session", sessionName, "action", "write-chars", ...target, "--", chunk], { timeoutMs: 5000 })
+    );
+  }
+}
+
 async function sendZellijEnter(sessionName: string, target: string[]): Promise<void> {
   await runZellij(["--session", sessionName, "action", "send-keys", ...target, "Enter"], {
     timeoutMs: 5000
   }).catch(() => runZellij(["--session", sessionName, "action", "write", ...target, "13"], { timeoutMs: 5000 }));
+}
+
+function normalizeSubmitDelayMs(value: number | undefined, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(1000, Math.floor(parsed)));
 }
 
 function chunkString(value: string, chunkSize: number): string[] {

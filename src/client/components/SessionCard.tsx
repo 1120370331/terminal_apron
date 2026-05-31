@@ -1,4 +1,6 @@
 import {
+  ChangeEvent,
+  ClipboardEvent,
   FormEvent,
   WheelEvent,
   memo,
@@ -21,6 +23,7 @@ import {
   Edit3,
   ExternalLink,
   Grip,
+  Paperclip,
   Play,
   RotateCcw,
   Send,
@@ -29,7 +32,7 @@ import {
   TextCursorInput
 } from "lucide-react";
 import type { SessionPreview, TerminalPreviewGrid, TerminalPreviewSegment, TerminalSession } from "../../shared/types";
-import { readClipboardText, writeClipboardText } from "../clipboard";
+import { filesFromClipboardData, readClipboardFiles, readClipboardText, writeClipboardText } from "../clipboard";
 
 interface Props {
   session: TerminalSession;
@@ -40,6 +43,7 @@ interface Props {
   onEdit: () => void;
   onDuplicate: () => void;
   onQuickInput: (value: string) => Promise<void>;
+  onPasteFiles: (files: File[]) => Promise<string>;
   onArchive: () => void;
   onRestore: () => void;
   onKill: () => void;
@@ -63,6 +67,7 @@ function SessionCardComponent({
   onEdit,
   onDuplicate,
   onQuickInput,
+  onPasteFiles,
   onArchive,
   onRestore,
   onKill
@@ -73,6 +78,7 @@ function SessionCardComponent({
   const backend = runtime?.backend ?? session.backend;
   const [quickInput, setQuickInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [displayedPreview, setDisplayedPreview] = useState<SessionPreview | undefined>(preview);
   const [historyPaused, setHistoryPaused] = useState(false);
   const [hasPendingPreview, setHasPendingPreview] = useState(false);
@@ -81,7 +87,9 @@ function SessionCardComponent({
   const previewRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const quickInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const copiedTimerRef = useRef<number | null>(null);
+  const composingRef = useRef(false);
   const stickToBottomRef = useRef(true);
   const deferredPreview = useDeferredValue(displayedPreview);
   const output = deferredPreview?.text || (isLive ? "" : "terminal is not running");
@@ -253,34 +261,96 @@ function SessionCardComponent({
     });
   };
 
+  const insertQuickInputText = useCallback((text: string, pad = false) => {
+    if (!text) {
+      quickInputRef.current?.focus();
+      return;
+    }
+
+    const input = quickInputRef.current;
+    setQuickInput((current) => {
+      const start = input?.selectionStart ?? current.length;
+      const end = input?.selectionEnd ?? start;
+      const before = current.slice(0, start);
+      const after = current.slice(end);
+      const prefix = pad && before && !/\s$/.test(before) ? " " : "";
+      const suffix = pad && after && !/^\s/.test(after) ? " " : "";
+      const next = `${before}${prefix}${text}${suffix}${after}`;
+      const cursor = before.length + prefix.length + text.length;
+      window.requestAnimationFrame(() => {
+        input?.focus();
+        input?.setSelectionRange(cursor, cursor);
+      });
+      return next;
+    });
+  }, []);
+
+  const appendFilesToQuickInput = async (files: File[]) => {
+    if (files.length === 0) {
+      quickInputRef.current?.focus();
+      return;
+    }
+    if (sending || uploading) {
+      return;
+    }
+
+    setUploading(true);
+    try {
+      const terminalText = await onPasteFiles(files);
+      insertQuickInputText(terminalText, true);
+    } finally {
+      setUploading(false);
+      quickInputRef.current?.focus();
+    }
+  };
+
   const pasteClipboardToInput = async () => {
     try {
-      const text = await readClipboardText();
-      if (!text) {
-        quickInputRef.current?.focus();
+      const files = await readClipboardFiles();
+      if (files.length > 0) {
+        await appendFilesToQuickInput(files);
         return;
       }
-      const input = quickInputRef.current;
-      setQuickInput((current) => {
-        const start = input?.selectionStart ?? current.length;
-        const end = input?.selectionEnd ?? start;
-        const next = `${current.slice(0, start)}${text}${current.slice(end)}`;
-        const cursor = start + text.length;
-        window.requestAnimationFrame(() => {
-          input?.focus();
-          input?.setSelectionRange(cursor, cursor);
-        });
-        return next;
-      });
+    } catch {
+      // Fall back to text clipboard below.
+    }
+
+    try {
+      const text = await readClipboardText();
+      if (text) {
+        insertQuickInputText(text);
+      } else {
+        quickInputRef.current?.focus();
+      }
     } catch {
       quickInputRef.current?.focus();
     }
   };
 
+  const pasteFilesToInput = async (event: ClipboardEvent<HTMLInputElement>) => {
+    const files = filesFromClipboardData(event.clipboardData);
+    if (files.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    await appendFilesToQuickInput(files);
+  };
+
+  const selectFilesForInput = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = "";
+    await appendFilesToQuickInput(files);
+  };
+
   const submitQuickInput = async (event: FormEvent) => {
     event.preventDefault();
-    const value = quickInput.trimEnd();
-    if (!value || sending) {
+    if (composingRef.current) {
+      return;
+    }
+    const value = (quickInputRef.current?.value ?? quickInput).trimEnd();
+    if (!value || sending || uploading) {
       return;
     }
 
@@ -348,7 +418,11 @@ function SessionCardComponent({
           onMouseDown={(event) => event.stopPropagation()}
           onTouchStart={(event) => event.stopPropagation()}
         >
-          {showCanvas ? <canvas className="terminal-preview-canvas" ref={canvasRef} /> : renderedOutput}
+          {showCanvas ? (
+            <canvas className="terminal-preview-canvas" ref={canvasRef} />
+          ) : (
+            <code className="ansi-preview-content">{renderedOutput}</code>
+          )}
         </div>
         {historyPaused && hasPendingPreview && (
           <button
@@ -369,19 +443,42 @@ function SessionCardComponent({
             ref={quickInputRef}
             value={quickInput}
             onChange={(event) => setQuickInput(event.target.value)}
+            onPaste={(event) => void pasteFilesToInput(event)}
+            onCompositionStart={() => {
+              composingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              composingRef.current = false;
+            }}
             placeholder="Type to terminal..."
-            disabled={sending}
+            disabled={sending || uploading}
+          />
+          <input
+            ref={fileInputRef}
+            className="hidden-file-input"
+            type="file"
+            multiple
+            onChange={(event) => void selectFilesForInput(event)}
           />
           <button
             className="icon-button small"
             type="button"
-            disabled={sending}
-            title="Paste clipboard"
+            disabled={sending || uploading}
+            title="Attach image or file"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Paperclip size={15} />
+          </button>
+          <button
+            className="icon-button small"
+            type="button"
+            disabled={sending || uploading}
+            title="Paste clipboard text or image"
             onClick={() => void pasteClipboardToInput()}
           >
             <ClipboardPaste size={15} />
           </button>
-          <button className="icon-button small" type="submit" disabled={sending || !quickInput.trim()} title="Send">
+          <button className="icon-button small" type="submit" disabled={sending || uploading || !quickInput.trim()} title="Send">
             <Send size={15} />
           </button>
         </form>

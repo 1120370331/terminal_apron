@@ -1,7 +1,10 @@
 node_modules/
 dist/
 data/
+.local-test-data/
 tools/
+file-transfer/*
+!file-transfer/.gitkeep
 .env
 *.log
 .DS_Store

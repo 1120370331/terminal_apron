@@ -2,8 +2,12 @@ import type {
   AuthConfig,
   AuthUser,
   CreateSessionInput,
+  FileTransferListResponse,
+  FileTransferUploadResponse,
   HealthStatus,
   SessionPreview,
+  SessionInputRequest,
+  SessionUploadResponse,
   SystemMetrics,
   TerminalSession,
   UpdateSessionInput
@@ -20,7 +24,7 @@ export class ApiError extends Error {
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
-  if (init.body && !headers.has("Content-Type")) {
+  if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
@@ -49,6 +53,24 @@ export const api = {
   me: () => request<AuthUser>("/api/me"),
   health: () => request<HealthStatus>("/api/health"),
   systemMetrics: () => request<SystemMetrics>("/api/system/metrics"),
+  fileTransferList: () => request<FileTransferListResponse>("/api/file-transfer/files"),
+  uploadTransferFiles: (files: File[]) => {
+    const form = new FormData();
+    files.forEach((file, index) => {
+      form.append("files", file, uploadFileName(file, index));
+    });
+    return request<FileTransferUploadResponse>("/api/file-transfer/files", {
+      method: "POST",
+      body: form
+    });
+  },
+  deleteTransferFile: (relativePath: string) =>
+    request<{ ok: boolean }>("/api/file-transfer/files", {
+      method: "DELETE",
+      body: JSON.stringify({ path: relativePath })
+    }),
+  fileTransferDownloadUrl: (relativePath: string) =>
+    `/api/file-transfer/download?path=${encodeURIComponent(relativePath)}`,
   login: (username: string, password: string) =>
     request<AuthUser>("/api/auth/login", {
       method: "POST",
@@ -90,7 +112,7 @@ export const api = {
     request<TerminalSession>(`/api/sessions/${id}/ensure`, {
       method: "POST"
     }),
-  sendInput: (id: string, input: { data: string; enter?: boolean; submitKey?: "enter" }) =>
+  sendInput: (id: string, input: SessionInputRequest) =>
     request<{
       ok: boolean;
       runtime?: TerminalSession["runtime"];
@@ -101,6 +123,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
+  uploadSessionFiles: (id: string, files: File[]) => {
+    const form = new FormData();
+    files.forEach((file, index) => {
+      form.append("files", file, uploadFileName(file, index));
+    });
+    return request<SessionUploadResponse>(`/api/sessions/${id}/uploads`, {
+      method: "POST",
+      body: form
+    });
+  },
   archiveSession: (id: string) =>
     request<TerminalSession>(`/api/sessions/${id}/archive`, {
       method: "POST"
@@ -116,3 +148,34 @@ export const api = {
   preview: (id: string, lines = 500, maxChars = 500_000, full = true) =>
     request<SessionPreview>(`/api/sessions/${id}/preview?lines=${lines}&maxChars=${maxChars}&full=${full}`)
 };
+
+function uploadFileName(file: File, index: number): string {
+  const name = file.name.trim();
+  if (name) {
+    return name;
+  }
+  return `clipboard-${index + 1}${extensionForMimeType(file.type)}`;
+}
+
+function extensionForMimeType(mimeType: string): string {
+  const normalized = mimeType.toLowerCase();
+  if (normalized === "image/png") {
+    return ".png";
+  }
+  if (normalized === "image/jpeg") {
+    return ".jpg";
+  }
+  if (normalized === "image/gif") {
+    return ".gif";
+  }
+  if (normalized === "image/webp") {
+    return ".webp";
+  }
+  if (normalized === "application/pdf") {
+    return ".pdf";
+  }
+  if (normalized.startsWith("text/")) {
+    return ".txt";
+  }
+  return ".bin";
+}

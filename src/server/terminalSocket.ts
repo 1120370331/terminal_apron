@@ -64,13 +64,21 @@ async function attachTerminal(
   try {
     const cols = clampDimension(socket.handshake.query.cols, 120, 20, MAX_TERMINAL_COLS);
     const rows = clampDimension(socket.handshake.query.rows, 36, 10, MAX_TERMINAL_ROWS);
+    const isMobileClient = socket.handshake.query.clientProfile === "mobile";
     const backend = await resolveBackend(session);
     if (backend === "native") {
       await nativeSessions.attach(session, socket, store.dataDir, cols, rows);
       return;
     }
     if (backend === "zellij") {
-      await attachZellij(socket, session, store.dataDir, ZELLIJ_WEB_COLS, ZELLIJ_WEB_ROWS);
+      await attachZellij(
+        socket,
+        session,
+        store.dataDir,
+        isMobileClient ? cols : ZELLIJ_WEB_COLS,
+        isMobileClient ? rows : ZELLIJ_WEB_ROWS,
+        !isMobileClient
+      );
       return;
     }
     await attachTmux(socket, session, cols, rows);
@@ -85,14 +93,17 @@ async function attachZellij(
   session: { id: string; tmuxName: string; cwd: string; shell?: string },
   dataDir: string,
   cols: number,
-  rows: number
+  rows: number,
+  stableSize: boolean
 ): Promise<void> {
   await ensureZellijSession(session);
   const pty = await loadPty();
+  let currentCols = cols;
+  let currentRows = rows;
   const term = pty.spawn(config.zellijBin, zellijAttachArgs(session), {
     name: "xterm-256color",
-    cols,
-    rows,
+    cols: currentCols,
+    rows: currentRows,
     cwd: session.cwd,
     env: {
       ...process.env,
@@ -107,7 +118,7 @@ async function attachZellij(
     tmuxName: session.tmuxName,
     attachCommand: zellijAttachCommand(session)
   });
-  socket.emit("terminal:resized", { cols, rows, seq: 0 });
+  socket.emit("terminal:resized", { cols: currentCols, rows: currentRows, seq: 0 });
 
   let transcriptQueue = Promise.resolve();
   let saveTimer: NodeJS.Timeout | null = null;
@@ -160,7 +171,14 @@ async function attachZellij(
   });
 
   socket.on("terminal:resize", (size: { cols?: number; rows?: number; seq?: number }) => {
-    socket.emit("terminal:resized", { cols, rows, seq: size.seq });
+    if (stableSize) {
+      socket.emit("terminal:resized", { cols: currentCols, rows: currentRows, seq: size.seq });
+      return;
+    }
+    currentCols = clampDimension(size.cols, currentCols, 20, MAX_TERMINAL_COLS);
+    currentRows = clampDimension(size.rows, currentRows, 10, MAX_TERMINAL_ROWS);
+    term.resize(currentCols, currentRows);
+    socket.emit("terminal:resized", { cols: currentCols, rows: currentRows, seq: size.seq });
   });
 
   socket.on("disconnect", () => {

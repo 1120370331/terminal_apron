@@ -5,6 +5,7 @@ import {
   Activity,
   Boxes,
   Cpu,
+  FolderOpen,
   Laptop,
   LayoutGrid,
   LogOut,
@@ -30,6 +31,7 @@ import type {
 } from "../shared/types";
 import { api, ApiError } from "./api";
 import { Login } from "./components/Login";
+import { FileTransferPanel } from "./components/FileTransferPanel";
 import { SessionCard } from "./components/SessionCard";
 import { SessionEditor } from "./components/SessionEditor";
 import { TerminalDock } from "./components/TerminalDock";
@@ -283,6 +285,10 @@ function emptyPreview(sessionId: string): SessionPreview {
     signature: "",
     capturedAt: new Date(0).toISOString()
   };
+}
+
+function quickSubmitDelayMs(value: string): number {
+  return Math.max(140, Math.min(600, 140 + Math.ceil(value.length / 80)));
 }
 
 function samePreview(previous: SessionPreview | undefined, next: SessionPreview): boolean {
@@ -604,6 +610,7 @@ export function App() {
   const [showArchived, setShowArchived] = useState(initialFilters.showArchived);
   const [settings, setSettings] = useState<PanelSettings>(initialSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [transferOpen, setTransferOpen] = useState(false);
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
@@ -1024,7 +1031,13 @@ export function App() {
         await loadSessions();
       }}
       onQuickInput={async (value) => {
-        const input = { data: value, enter: true, submitKey: "enter" as const };
+        const input = {
+          data: value,
+          enter: true,
+          submitKey: "enter" as const,
+          mode: "paste" as const,
+          submitDelayMs: quickSubmitDelayMs(value)
+        };
         const result = await api.sendInput(session.id, input);
         if (result.preview !== undefined) {
           setPreviews((current) => ({
@@ -1044,6 +1057,10 @@ export function App() {
             .then((preview) => setPreviews((current) => ({ ...current, [session.id]: preview })))
             .catch(() => undefined);
         }, 900);
+      }}
+      onPasteFiles={async (files) => {
+        const result = await api.uploadSessionFiles(session.id, files);
+        return result.terminalText;
       }}
       onArchive={async () => {
         await api.archiveSession(session.id);
@@ -1111,6 +1128,9 @@ export function App() {
           </button>
           <button className="icon-button desktop-only-action" type="button" onClick={() => setSettingsOpen(true)} title="配置">
             <Settings size={18} />
+          </button>
+          <button className="icon-button" type="button" onClick={() => setTransferOpen(true)} title="文件传输">
+            <FolderOpen size={18} />
           </button>
           <button className="icon-button" type="button" onClick={refresh} title="刷新">
             <RefreshCw size={18} className={loading ? "spin" : ""} />
@@ -1251,10 +1271,11 @@ export function App() {
           initialTags={tagFilter === "all" ? [] : [tagFilter]}
           onClose={() => setEditorSession(null)}
           onSave={async (input) => {
+            let terminalToOpen: TerminalSession | null = null;
             if (editorSession === "new") {
               const created = await api.createSession(input);
               const topLayout = buildTopSessionLayout(created.id, settings);
-              await api.updateSession(created.id, {
+              terminalToOpen = await api.updateSession(created.id, {
                 layout: layoutToSessionLayout(topLayout)
               });
             } else {
@@ -1262,6 +1283,9 @@ export function App() {
             }
             setEditorSession(null);
             await loadSessions();
+            if (terminalToOpen) {
+              setActiveTerminal(terminalToOpen);
+            }
           }}
         />
       )}
@@ -1284,6 +1308,8 @@ export function App() {
           onReset={() => setSettings(DEFAULT_SETTINGS)}
         />
       )}
+
+      {transferOpen && <FileTransferPanel onClose={() => setTransferOpen(false)} />}
     </main>
   );
 }

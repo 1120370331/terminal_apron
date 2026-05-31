@@ -97,8 +97,9 @@ function renderDumpScreenGrid(data: string, cols: number, rowsToKeep: number, pa
     rawRows.push("");
   }
 
+  const renderedCols = Math.max(cols, ...rawRows.map((line) => visibleColumns(line.replace(ANSI_PATTERN, "").trimEnd())));
   return {
-    cols,
+    cols: Math.min(PREVIEW_MAX_COLS, renderedCols),
     rows: rawRows.map((line) => ({
       segments: trimTrailingDefaultSpaces(parseAnsiLine(line))
     }))

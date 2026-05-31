@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server as SocketServer } from "socket.io";
+import multer from "multer";
 import { config, dataDirForUser } from "./config.js";
 import { SessionStore } from "./db.js";
 import {
@@ -46,6 +47,12 @@ import { renderPreviewGrid } from "./previewGrid.js";
 import type {
   CreateSessionInput,
   AuthUser,
+  FileTransferEntry,
+  FileTransferListResponse,
+  FileTransferUploadResponse,
+  SessionInputMode,
+  SessionInputRequest,
+  SessionUploadResponse,
   SystemMetrics,
   TerminalPreviewGrid,
   TerminalSession,
@@ -64,6 +71,17 @@ const stores = new Map<string, Promise<SessionStore>>();
 const restoreQueuedStores = new Set<string>();
 const nativeSessions = new NativeSessionManager();
 const DEFAULT_PREVIEW_MAX_CHARS = 120_000;
+const MAX_UPLOAD_FILES = 8;
+const MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024;
+const TRANSFER_DIR_NAME = "file-transfer";
+const MAX_TRANSFER_LIST_FILES = 1000;
+const uploadSessionFiles = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: MAX_UPLOAD_FILES,
+    fileSize: MAX_UPLOAD_FILE_BYTES
+  }
+}).array("files", MAX_UPLOAD_FILES);
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -163,6 +181,57 @@ app.get("/api/system/metrics", (_req, res) => {
   res.json(readSystemMetrics());
 });
 
+app.get("/api/file-transfer/files", async (_req, res) => {
+  const user = res.locals.user as AuthUser;
+  const rootDir = await ensureTransferRoot(user);
+  res.json(await fileTransferListPayload(rootDir));
+});
+
+app.post("/api/file-transfer/files", (req, res, next) => {
+  uploadSessionFiles(req, res, (error) => {
+    if (error) {
+      res.status(error instanceof multer.MulterError ? 413 : 400).json({
+        error: error instanceof Error ? error.message : "upload failed"
+      });
+      return;
+    }
+    void handleFileTransferUpload(req, res).catch(next);
+  });
+});
+
+app.delete("/api/file-transfer/files", async (req, res) => {
+  const user = res.locals.user as AuthUser;
+  const rootDir = await ensureTransferRoot(user);
+  const relativePath = typeof req.body?.path === "string" ? req.body.path : "";
+  const targetPath = resolveTransferFilePathOrRespond(rootDir, relativePath, res);
+  if (!targetPath) {
+    return;
+  }
+  const stat = await fs.promises.stat(targetPath).catch(() => null);
+  if (!stat?.isFile()) {
+    res.status(404).json({ error: "file not found" });
+    return;
+  }
+  await fs.promises.unlink(targetPath);
+  res.json({ ok: true });
+});
+
+app.get("/api/file-transfer/download", async (req, res) => {
+  const user = res.locals.user as AuthUser;
+  const rootDir = await ensureTransferRoot(user);
+  const relativePath = typeof req.query.path === "string" ? req.query.path : "";
+  const targetPath = resolveTransferFilePathOrRespond(rootDir, relativePath, res);
+  if (!targetPath) {
+    return;
+  }
+  const stat = await fs.promises.stat(targetPath).catch(() => null);
+  if (!stat?.isFile()) {
+    res.status(404).json({ error: "file not found" });
+    return;
+  }
+  res.download(targetPath, path.basename(targetPath));
+});
+
 app.get("/api/sessions", async (req, res) => {
   const store = await storeForUser(res.locals.user as AuthUser);
   const includeArchived = req.query.archived === "true";
@@ -260,7 +329,7 @@ app.post("/api/sessions/:id/input", async (req, res) => {
     return;
   }
 
-  const { data, enter } = req.body as { data?: unknown; enter?: unknown; submitKey?: unknown };
+  const { data, enter, mode, submitDelayMs } = req.body as Partial<SessionInputRequest>;
   if (typeof data !== "string" || data.length === 0) {
     res.status(400).json({ error: "input data is required" });
     return;
@@ -270,7 +339,15 @@ app.post("/api/sessions/:id/input", async (req, res) => {
     return;
   }
 
-  await sendSessionInput(session, data, enter !== false, store.dataDir);
+  const inputMode = normalizeInputMode(mode);
+  await sendSessionInput(
+    session,
+    data,
+    enter !== false,
+    store.dataDir,
+    inputMode,
+    parseSubmitDelayMs(submitDelayMs, inputMode === "paste" ? 120 : 0)
+  );
   const previewLines = parsePreviewLines(req.body?.lines);
   const previewText = await captureSessionPreview(session, store.dataDir, previewLines, false).catch(() => "");
   const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.body?.maxChars));
@@ -281,6 +358,18 @@ app.post("/api/sessions/:id/input", async (req, res) => {
     preview: compactPreview,
     grid,
     signature: previewSignature(compactPreview, grid)
+  });
+});
+
+app.post("/api/sessions/:id/uploads", (req, res, next) => {
+  uploadSessionFiles(req, res, (error) => {
+    if (error) {
+      res.status(error instanceof multer.MulterError ? 413 : 400).json({
+        error: error instanceof Error ? error.message : "upload failed"
+      });
+      return;
+    }
+    void handleSessionUpload(req, res).catch(next);
   });
 });
 
@@ -499,18 +588,337 @@ async function sendSessionInput(
   session: TerminalSession,
   data: string,
   enter: boolean,
-  dataDir = config.dataDir
+  dataDir = config.dataDir,
+  mode: SessionInputMode = "paste",
+  submitDelayMs = 0
 ) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
-    await sendTmuxInput(session, data, enter);
+    await sendTmuxInput(session, data, enter, submitDelayMs);
     return;
   }
   if (backend === "zellij") {
-    await sendZellijInput(session, data, enter);
+    await sendZellijInput(session, data, enter, { mode, submitDelayMs });
     return;
   }
-  await nativeSessions.write(session, data, enter, dataDir);
+  await nativeSessions.write(session, data, enter, dataDir, submitDelayMs);
+}
+
+function normalizeInputMode(value: unknown): SessionInputMode {
+  return value === "type" ? "type" : "paste";
+}
+
+function parseSubmitDelayMs(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(1000, Math.floor(parsed)));
+}
+
+async function handleFileTransferUpload(
+  req: express.Request,
+  res: express.Response<FileTransferUploadResponse | { error: string }>
+) {
+  const user = res.locals.user as AuthUser;
+  const rootDir = await ensureTransferRoot(user);
+  const files = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
+  if (files.length === 0) {
+    res.status(400).json({ error: "upload files are required" });
+    return;
+  }
+
+  const savedFiles = await saveTransferFiles(files, rootDir);
+  res.json({
+    rootPath: rootDir,
+    terminalText: savedFiles.map((file) => file.terminalText).join(" "),
+    files: savedFiles
+  });
+}
+
+async function handleSessionUpload(
+  req: express.Request,
+  res: express.Response<SessionUploadResponse | { error: string }>
+) {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  const session = await store.get(String(req.params.id ?? ""));
+  if (!session) {
+    res.status(404).json({ error: "session not found" });
+    return;
+  }
+
+  const files = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
+  if (files.length === 0) {
+    res.status(400).json({ error: "upload files are required" });
+    return;
+  }
+
+  const rootDir = await ensureTransferRoot(res.locals.user as AuthUser);
+  const savedFiles = await saveTransferFiles(files, rootDir, session.shell);
+
+  res.json({
+    files: savedFiles.map((file) => ({
+      originalName: file.originalName,
+      fileName: file.name,
+      mimeType: file.mimeType,
+      size: file.size,
+      path: file.path,
+      terminalText: file.terminalText
+    })),
+    terminalText: savedFiles.map((file) => file.terminalText).join(" ")
+  });
+}
+
+type SavedTransferEntry = FileTransferEntry & {
+  originalName: string;
+};
+
+async function saveTransferFiles(
+  files: Express.Multer.File[],
+  rootDir: string,
+  shell?: string
+): Promise<SavedTransferEntry[]> {
+  await fs.promises.mkdir(rootDir, { recursive: true });
+  const usedNames = new Set<string>();
+  const savedFiles: SavedTransferEntry[] = [];
+
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    const requestedName = safeUploadFileName(file.originalname, file.mimetype, index);
+    const filePath = await uniqueTransferFilePath(rootDir, requestedName, usedNames);
+    await fs.promises.writeFile(filePath, file.buffer);
+    const stat = await fs.promises.stat(filePath);
+    savedFiles.push(
+      transferEntryFromPath(rootDir, filePath, stat, shell, file.originalname || path.basename(filePath), file.mimetype)
+    );
+  }
+
+  return savedFiles;
+}
+
+async function fileTransferListPayload(rootDir: string): Promise<FileTransferListResponse> {
+  const files = await listTransferFiles(rootDir);
+  return {
+    rootPath: rootDir,
+    terminalText: quotePathForTerminal(rootDir, undefined),
+    files
+  };
+}
+
+async function ensureTransferRoot(user: AuthUser): Promise<string> {
+  const rootDir = path.resolve(process.cwd(), TRANSFER_DIR_NAME, safePathSegment(user.name));
+  await fs.promises.mkdir(rootDir, { recursive: true });
+  return rootDir;
+}
+
+async function listTransferFiles(rootDir: string): Promise<FileTransferEntry[]> {
+  const entries: FileTransferEntry[] = [];
+  await collectTransferFiles(rootDir, rootDir, entries);
+  return entries.sort((left, right) => Date.parse(right.modifiedAt) - Date.parse(left.modifiedAt));
+}
+
+async function collectTransferFiles(rootDir: string, directory: string, entries: FileTransferEntry[]): Promise<void> {
+  if (entries.length >= MAX_TRANSFER_LIST_FILES) {
+    return;
+  }
+
+  const items = await fs.promises.readdir(directory, { withFileTypes: true }).catch(() => []);
+  for (const item of items) {
+    if (entries.length >= MAX_TRANSFER_LIST_FILES) {
+      return;
+    }
+    const itemPath = path.join(directory, item.name);
+    if (item.isDirectory()) {
+      await collectTransferFiles(rootDir, itemPath, entries);
+      continue;
+    }
+    if (!item.isFile()) {
+      continue;
+    }
+    const stat = await fs.promises.stat(itemPath).catch(() => null);
+    if (stat?.isFile()) {
+      entries.push(transferEntryFromPath(rootDir, itemPath, stat));
+    }
+  }
+}
+
+function transferEntryFromPath(
+  rootDir: string,
+  filePath: string,
+  stat: fs.Stats,
+  shell?: string,
+  originalName?: string,
+  mimeType?: string
+): SavedTransferEntry {
+  const relativePath = toTransferRelativePath(rootDir, filePath);
+  const name = path.basename(filePath);
+  return {
+    name,
+    originalName: originalName || name,
+    relativePath,
+    path: filePath,
+    terminalText: quotePathForTerminal(filePath, shell),
+    size: stat.size,
+    modifiedAt: stat.mtime.toISOString(),
+    mimeType: mimeType || mimeTypeForFileName(name)
+  };
+}
+
+async function uniqueTransferFilePath(rootDir: string, fileName: string, usedNames: Set<string>): Promise<string> {
+  let candidateName = uniqueUploadFileName(fileName, usedNames);
+  let candidatePath = path.join(rootDir, candidateName);
+  if (!(await pathExists(candidatePath))) {
+    return candidatePath;
+  }
+
+  const extension = path.extname(candidateName);
+  const stem = candidateName.slice(0, candidateName.length - extension.length) || "file";
+  for (let index = 2; index < 10_000; index += 1) {
+    candidateName = `${stem}-${index}${extension}`;
+    candidatePath = path.join(rootDir, candidateName);
+    if (!usedNames.has(candidateName) && !(await pathExists(candidatePath))) {
+      usedNames.add(candidateName);
+      return candidatePath;
+    }
+  }
+
+  candidateName = `${stem}-${Date.now()}${extension}`;
+  usedNames.add(candidateName);
+  return path.join(rootDir, candidateName);
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  return fs.promises
+    .access(filePath)
+    .then(() => true)
+    .catch(() => false);
+}
+
+function resolveTransferFilePath(rootDir: string, relativePath: string): string {
+  const targetPath = path.resolve(rootDir, relativePath);
+  const relative = path.relative(rootDir, targetPath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("invalid file path");
+  }
+  return targetPath;
+}
+
+function resolveTransferFilePathOrRespond(
+  rootDir: string,
+  relativePath: string,
+  res: express.Response
+): string | null {
+  try {
+    return resolveTransferFilePath(rootDir, relativePath);
+  } catch {
+    res.status(400).json({ error: "invalid file path" });
+    return null;
+  }
+}
+
+function toTransferRelativePath(rootDir: string, filePath: string): string {
+  return path.relative(rootDir, filePath).split(path.sep).join("/");
+}
+
+function safeUploadFileName(originalName: string | undefined, mimeType: string | undefined, index: number): string {
+  const baseName = (originalName ?? "").split(/[\\/]/).pop()?.trim() ?? "";
+  const fallback = `clipboard-${index + 1}${extensionForMimeType(mimeType)}`;
+  const cleaned = (baseName || fallback)
+    .replace(/[\x00-\x1f<>:"/\\|?*]+/g, "_")
+    .replace(/\s+/g, " ")
+    .replace(/^\.+/, "")
+    .trim();
+  const safeName = cleaned || fallback;
+  if (safeName.length <= 180) {
+    return safeName;
+  }
+  const extension = path.extname(safeName);
+  const stem = safeName.slice(0, Math.max(1, 180 - extension.length));
+  return `${stem}${extension}`;
+}
+
+function uniqueUploadFileName(fileName: string, usedNames: Set<string>): string {
+  if (!usedNames.has(fileName)) {
+    usedNames.add(fileName);
+    return fileName;
+  }
+
+  const extension = path.extname(fileName);
+  const stem = fileName.slice(0, fileName.length - extension.length) || "file";
+  for (let index = 2; index < 10_000; index += 1) {
+    const candidate = `${stem}-${index}${extension}`;
+    if (!usedNames.has(candidate)) {
+      usedNames.add(candidate);
+      return candidate;
+    }
+  }
+  const fallback = `${stem}-${Date.now()}${extension}`;
+  usedNames.add(fallback);
+  return fallback;
+}
+
+function extensionForMimeType(mimeType: string | undefined): string {
+  const normalized = mimeType?.toLowerCase() ?? "";
+  if (normalized === "image/png") {
+    return ".png";
+  }
+  if (normalized === "image/jpeg") {
+    return ".jpg";
+  }
+  if (normalized === "image/gif") {
+    return ".gif";
+  }
+  if (normalized === "image/webp") {
+    return ".webp";
+  }
+  if (normalized === "application/pdf") {
+    return ".pdf";
+  }
+  if (normalized.startsWith("text/")) {
+    return ".txt";
+  }
+  return ".bin";
+}
+
+function mimeTypeForFileName(fileName: string): string {
+  const extension = path.extname(fileName).toLowerCase();
+  if (extension === ".png") {
+    return "image/png";
+  }
+  if (extension === ".jpg" || extension === ".jpeg") {
+    return "image/jpeg";
+  }
+  if (extension === ".gif") {
+    return "image/gif";
+  }
+  if (extension === ".webp") {
+    return "image/webp";
+  }
+  if (extension === ".pdf") {
+    return "application/pdf";
+  }
+  if ([".txt", ".md", ".json", ".csv", ".log"].includes(extension)) {
+    return "text/plain";
+  }
+  return "application/octet-stream";
+}
+
+function quotePathForTerminal(filePath: string, shell: string | undefined): string {
+  const normalizedShell = shell?.toLowerCase() ?? "";
+  if (process.platform === "win32" && normalizedShell.includes("cmd")) {
+    return `"${filePath.replace(/"/g, '\\"')}"`;
+  }
+  return `'${filePath.replace(/'/g, "'\\''")}'`;
+}
+
+function safePathSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^\.+/, "") || "session";
+}
+
+function uploadStamp(): string {
+  const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  const suffix = crypto.randomBytes(4).toString("hex");
+  return `${timestamp}-${suffix}`;
 }
 
 function nextCopyName(name: string, existingNames: string[]): string {
