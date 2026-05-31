@@ -17,6 +17,7 @@ const MOBILE_QUERY = "(max-width: 720px)";
 const ZELLIJ_WEB_COLS = 120;
 const ZELLIJ_WEB_ROWS = 36;
 const TERMINAL_SCROLLBACK_ROWS = 200_000;
+const TERMINAL_INPUT_BATCH_MS = 12;
 
 export function TerminalDock({ session, onClose }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -28,6 +29,8 @@ export function TerminalDock({ session, onClose }: Props) {
   const lastAckSeqRef = useRef(0);
   const resizeRetryRef = useRef(0);
   const copiedTimerRef = useRef<number | null>(null);
+  const inputBufferRef = useRef("");
+  const inputFlushTimerRef = useRef<number | null>(null);
   const uploadingRef = useRef(false);
   const [attachCommand, setAttachCommand] = useState<string | null>(null);
   const [backend, setBackend] = useState(session.runtime?.backend ?? session.backend);
@@ -100,6 +103,41 @@ export function TerminalDock({ session, onClose }: Props) {
     terminal?.focus();
   }, [markCopied]);
 
+  const flushTerminalInput = useCallback(() => {
+    if (inputFlushTimerRef.current) {
+      window.clearTimeout(inputFlushTimerRef.current);
+      inputFlushTimerRef.current = null;
+    }
+
+    const data = inputBufferRef.current;
+    if (!data) {
+      return;
+    }
+
+    inputBufferRef.current = "";
+    socketRef.current?.emit("terminal:input", data);
+  }, []);
+
+  const sendTerminalInput = useCallback(
+    (data: string) => {
+      if (!data) {
+        return;
+      }
+
+      if (shouldSendTerminalInputImmediately(data)) {
+        flushTerminalInput();
+        socketRef.current?.emit("terminal:input", data);
+        return;
+      }
+
+      inputBufferRef.current += data;
+      if (!inputFlushTimerRef.current) {
+        inputFlushTimerRef.current = window.setTimeout(flushTerminalInput, TERMINAL_INPUT_BATCH_MS);
+      }
+    },
+    [flushTerminalInput]
+  );
+
   const pasteFilesToTerminal = useCallback(
     async (files: File[]) => {
       if (files.length === 0 || uploadingRef.current) {
@@ -112,7 +150,7 @@ export function TerminalDock({ session, onClose }: Props) {
       try {
         const result = await api.uploadSessionFiles(session.id, files);
         if (result.terminalText) {
-          socketRef.current?.emit("terminal:input", result.terminalText);
+          sendTerminalInput(result.terminalText);
         }
       } catch (error) {
         setStatus(error instanceof Error ? error.message : String(error));
@@ -122,7 +160,7 @@ export function TerminalDock({ session, onClose }: Props) {
         termRef.current?.focus();
       }
     },
-    [session.id]
+    [sendTerminalInput, session.id]
   );
 
   const pasteClipboardToTerminal = useCallback(async () => {
@@ -135,17 +173,20 @@ export function TerminalDock({ session, onClose }: Props) {
 
       const text = await readClipboardText();
       if (text) {
-        socketRef.current?.emit("terminal:input", text);
+        sendTerminalInput(text);
       }
     } finally {
       termRef.current?.focus();
     }
-  }, [pasteFilesToTerminal]);
+  }, [pasteFilesToTerminal, sendTerminalInput]);
 
   useEffect(() => {
     return () => {
       if (copiedTimerRef.current) {
         window.clearTimeout(copiedTimerRef.current);
+      }
+      if (inputFlushTimerRef.current) {
+        window.clearTimeout(inputFlushTimerRef.current);
       }
     };
   }, []);
@@ -199,6 +240,8 @@ export function TerminalDock({ session, onClose }: Props) {
 
     const socket = io({
       withCredentials: true,
+      transports: ["websocket", "polling"],
+      rememberUpgrade: true,
       query: {
         sessionId: session.id,
         cols: terminal.cols,
@@ -265,7 +308,7 @@ export function TerminalDock({ session, onClose }: Props) {
     const disposable = terminal.onData((data) => {
       const filtered = inputFilter(data);
       if (filtered) {
-        socket.emit("terminal:input", filtered);
+        sendTerminalInput(filtered);
       }
     });
     const resizeDisposable = terminal.onResize(() => {
@@ -321,6 +364,7 @@ export function TerminalDock({ session, onClose }: Props) {
       window.clearInterval(sizeTimer);
       disposable.dispose();
       resizeDisposable.dispose();
+      flushTerminalInput();
       socket.disconnect();
       terminal.dispose();
       if (socketRef.current === socket) {
@@ -333,7 +377,7 @@ export function TerminalDock({ session, onClose }: Props) {
         fitRef.current = null;
       }
     };
-  }, [isMobileClient, pasteFilesToTerminal, refitTerminal, session.id, usesStableZellijWidth]);
+  }, [flushTerminalInput, isMobileClient, pasteFilesToTerminal, refitTerminal, sendTerminalInput, session.id, usesStableZellijWidth]);
 
   return (
     <div
@@ -424,6 +468,10 @@ function normalizeTerminalDimensions(
     cols: value.cols,
     rows: value.rows
   };
+}
+
+function shouldSendTerminalInputImmediately(data: string): boolean {
+  return data.length > 1 || /[\r\n\x03\x04\x1a]/.test(data);
 }
 
 function createTerminalInputFilter(): (data: string) => string {

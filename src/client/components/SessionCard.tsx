@@ -84,6 +84,7 @@ function SessionCardComponent({
   const [hasPendingPreview, setHasPendingPreview] = useState(false);
   const [selectMode, setSelectMode] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
   const previewRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const quickInputRef = useRef<HTMLInputElement | null>(null);
@@ -109,7 +110,7 @@ function SessionCardComponent({
       return;
     }
 
-    if (historyPaused) {
+    if (historyPaused || inputFocused) {
       if (previewSignature(preview) !== previewSignature(displayedPreview)) {
         setHasPendingPreview(true);
       }
@@ -118,7 +119,7 @@ function SessionCardComponent({
 
     setDisplayedPreview(preview);
     setHasPendingPreview(false);
-  }, [displayedPreview, historyPaused, preview]);
+  }, [displayedPreview, historyPaused, inputFocused, preview]);
 
   useLayoutEffect(() => {
     const previewElement = previewRef.current;
@@ -443,6 +444,8 @@ function SessionCardComponent({
             ref={quickInputRef}
             value={quickInput}
             onChange={(event) => setQuickInput(event.target.value)}
+            onFocus={() => setInputFocused(true)}
+            onBlur={() => setInputFocused(false)}
             onPaste={(event) => void pasteFilesToInput(event)}
             onCompositionStart={() => {
               composingRef.current = true;

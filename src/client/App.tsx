@@ -49,6 +49,12 @@ const SYSTEM_METRICS_HISTORY_LIMIT = 120;
 const DEFAULT_PREVIEW_LINES = 600;
 const MAX_LIST_PREVIEW_LINES = 1200;
 const FULL_PREVIEW_REFRESH_MS = 10_000;
+const REMOTE_SESSION_REFRESH_MS = 2500;
+const REMOTE_SYSTEM_METRICS_REFRESH_MS = 5000;
+const REMOTE_PREVIEW_MIN_REFRESH_MS = 2500;
+const REMOTE_FULL_PREVIEW_REFRESH_MS = 30_000;
+const LOCAL_PREVIEW_MAX_CHARS = 500_000;
+const REMOTE_PREVIEW_MAX_CHARS = 120_000;
 const PREVIEW_REVEAL_TIMEOUT_MS = 1500;
 const DESKTOP_INITIAL_PREVIEW_CARDS = 3;
 const MOBILE_INITIAL_PREVIEW_CARDS = 2;
@@ -129,6 +135,25 @@ function normalizeBrowserTitle(value: unknown): string {
 
 function effectiveBrowserTitle(value: string): string {
   return value.trim() || DEFAULT_BROWSER_TITLE;
+}
+
+function isRemoteBrowserHost(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  const hostname = window.location.hostname.toLowerCase();
+  return !["localhost", "127.0.0.1", "::1", ""].includes(hostname);
+}
+
+function isTerminalInputFocused(): boolean {
+  if (typeof document === "undefined") {
+    return false;
+  }
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement)) {
+    return false;
+  }
+  return Boolean(active.closest(".quick-input, .terminal-dock"));
 }
 
 function resolveThemeMode(mode: ThemeMode): "light" | "dark" {
@@ -543,6 +568,14 @@ export function App() {
   const lastFullPreviewAtRef = useRef<Record<string, number>>({});
   const userStorageReadyRef = useRef<string | null>(null);
   const isMobile = useMediaQuery(MOBILE_QUERY);
+  const remoteBrowserHost = useMemo(isRemoteBrowserHost, []);
+  const sessionRefreshMs = remoteBrowserHost ? REMOTE_SESSION_REFRESH_MS : SESSION_REFRESH_MS;
+  const systemMetricsRefreshMs = remoteBrowserHost ? REMOTE_SYSTEM_METRICS_REFRESH_MS : SYSTEM_METRICS_REFRESH_MS;
+  const previewRefreshMs = remoteBrowserHost
+    ? Math.max(settings.previewRefreshMs, REMOTE_PREVIEW_MIN_REFRESH_MS)
+    : settings.previewRefreshMs;
+  const fullPreviewRefreshMs = remoteBrowserHost ? REMOTE_FULL_PREVIEW_REFRESH_MS : FULL_PREVIEW_REFRESH_MS;
+  const previewMaxChars = remoteBrowserHost ? REMOTE_PREVIEW_MAX_CHARS : LOCAL_PREVIEW_MAX_CHARS;
 
   const loadSessions = useCallback(async () => {
     try {
@@ -639,10 +672,13 @@ export function App() {
     }
     void loadSessions();
     const timer = window.setInterval(() => {
+      if (isTerminalInputFocused()) {
+        return;
+      }
       void loadSessions();
-    }, SESSION_REFRESH_MS);
+    }, sessionRefreshMs);
     return () => window.clearInterval(timer);
-  }, [auth, loadSessions]);
+  }, [auth, loadSessions, sessionRefreshMs]);
 
   useEffect(() => {
     if (!auth) {
@@ -651,6 +687,9 @@ export function App() {
 
     let cancelled = false;
     const loadMetrics = async () => {
+      if (isTerminalInputFocused()) {
+        return;
+      }
       try {
         const metrics = await api.systemMetrics();
         if (!cancelled) {
@@ -664,12 +703,12 @@ export function App() {
     };
 
     void loadMetrics();
-    const timer = window.setInterval(loadMetrics, SYSTEM_METRICS_REFRESH_MS);
+    const timer = window.setInterval(loadMetrics, systemMetricsRefreshMs);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [auth]);
+  }, [auth, systemMetricsRefreshMs]);
 
   const groups = useMemo(
     () => ["all", ...Array.from(new Set(sessions.map((session) => session.group))).sort()],
@@ -742,7 +781,7 @@ export function App() {
   }, [auth, sessionsLoaded, previewRevealReady, previewRevealTargetKey, previewRevealTargets.length]);
 
   useEffect(() => {
-    if (!auth || previewTargets.length === 0) {
+    if (!auth || activeTerminal || previewTargets.length === 0) {
       return;
     }
 
@@ -765,7 +804,7 @@ export function App() {
     });
 
     const pollPreview = async (sessionId: string) => {
-      if (previewInFlightRef.current.has(sessionId)) {
+      if (previewInFlightRef.current.has(sessionId) || isTerminalInputFocused()) {
         return;
       }
 
@@ -774,8 +813,8 @@ export function App() {
         const now = Date.now();
         const previous = previewsRef.current[sessionId];
         const lastFullAt = lastFullPreviewAtRef.current[sessionId] ?? 0;
-        const shouldLoadFull = Boolean(previous?.grid) && now - lastFullAt >= FULL_PREVIEW_REFRESH_MS;
-        const preview = await api.preview(sessionId, settings.previewLines, 500_000, shouldLoadFull);
+        const shouldLoadFull = Boolean(previous?.grid) && now - lastFullAt >= fullPreviewRefreshMs;
+        const preview = await api.preview(sessionId, settings.previewLines, previewMaxChars, shouldLoadFull);
         if (cancelled || !visibleIds.has(sessionId)) {
           return;
         }
@@ -808,14 +847,14 @@ export function App() {
         continue;
       }
       void pollPreview(target.id);
-      timers.push(window.setInterval(() => void pollPreview(target.id), settings.previewRefreshMs));
+      timers.push(window.setInterval(() => void pollPreview(target.id), previewRefreshMs));
     }
 
     return () => {
       cancelled = true;
       timers.forEach((timer) => window.clearInterval(timer));
     };
-  }, [auth, previewTargetKey, settings.previewLines, settings.previewRefreshMs]);
+  }, [activeTerminal, auth, fullPreviewRefreshMs, previewMaxChars, previewRefreshMs, previewTargetKey, settings.previewLines]);
 
   const desktopLayoutState = useMemo(
     () => normalizeVisibleLayout(filtered.map((session, index) => buildSessionLayout(session, index, settings))),
@@ -969,7 +1008,7 @@ export function App() {
         await loadSessions();
         window.setTimeout(() => {
           void api
-            .preview(session.id, settings.previewLines)
+            .preview(session.id, settings.previewLines, previewMaxChars)
             .then((preview) => setPreviews((current) => ({ ...current, [session.id]: preview })))
             .catch(() => undefined);
         }, 900);
