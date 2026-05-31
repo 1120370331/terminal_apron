@@ -19,6 +19,7 @@ export interface GridItemLayout {
   h: number;
   minW?: number;
   minH?: number;
+  gridColumns?: number;
 }
 
 export interface SessionRuntime {

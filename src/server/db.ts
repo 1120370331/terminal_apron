@@ -190,6 +190,7 @@ function normalizeLayout(
     w: Math.max(2, Number(layout.w) || fallback?.w || 4),
     h: Math.max(2, Number(layout.h) || fallback?.h || 4),
     minW: Math.max(2, Number(layout.minW) || 3),
-    minH: Math.max(2, Number(layout.minH) || 3)
+    minH: Math.max(2, Number(layout.minH) || 3),
+    gridColumns: Math.max(1, Number(layout.gridColumns) || fallback?.gridColumns || 12)
   };
 }

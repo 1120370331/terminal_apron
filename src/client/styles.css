@@ -578,6 +578,14 @@ select {
   padding: 7px 10px 5px;
 }
 
+.session-grid .session-card-header {
+  cursor: grab;
+}
+
+.session-grid .react-grid-item.react-draggable-dragging .session-card-header {
+  cursor: grabbing;
+}
+
 .drag-handle {
   display: grid;
   place-items: center;

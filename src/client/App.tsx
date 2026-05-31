@@ -40,9 +40,9 @@ const ResponsiveGrid = WidthProvider(Responsive);
 const FILTER_STATE_KEY = "terminal-web-monitor.filters.v1";
 const SETTINGS_STATE_KEY = "terminal-web-monitor.settings.v1";
 const DEFAULT_BROWSER_TITLE = "Terminal Web Monitor";
-const DEFAULT_ROW_HEIGHT = 100;
-const DEFAULT_CARD_ROWS = 7;
-const MIN_CARD_ROWS = 7;
+const DEFAULT_ROW_HEIGHT = 48;
+const DEFAULT_CARD_ROWS = 12;
+const MIN_CARD_ROWS = 6;
 const SESSION_REFRESH_MS = 1000;
 const SYSTEM_METRICS_REFRESH_MS = 1000;
 const SYSTEM_METRICS_HISTORY_LIMIT = 120;
@@ -53,12 +53,11 @@ const PREVIEW_REVEAL_TIMEOUT_MS = 1500;
 const DESKTOP_INITIAL_PREVIEW_CARDS = 3;
 const MOBILE_INITIAL_PREVIEW_CARDS = 2;
 const MOBILE_QUERY = "(max-width: 720px)";
-const GRID_COLUMNS = 12;
-const CARD_COLUMNS = 4;
-const MIN_CARD_COLUMNS = 2;
-const MIN_LAYOUT_ROWS = 3;
-const COLLISION_PUSH_RATIO = 0.35;
-const FREE_SPOT_SEARCH_RADIUS = 80;
+const LEGACY_GRID_COLUMNS = 12;
+const GRID_COLUMNS = 24;
+const CARD_COLUMNS = 8;
+const MIN_CARD_COLUMNS = 4;
+const MIN_LAYOUT_ROWS = 5;
 const GRID_MARGIN: [number, number] = [14, 14];
 const GRID_RESIZE_HANDLES: Array<"s" | "w" | "e" | "n" | "sw" | "nw" | "se" | "ne"> = [
   "s",
@@ -186,9 +185,9 @@ function loadPanelSettings(storageKey = SETTINGS_STATE_KEY): PanelSettings {
     const parsed = JSON.parse(stored) as Partial<PanelSettings>;
     return {
       browserTitle: normalizeBrowserTitle(parsed.browserTitle),
-      rowHeight: clampNumber(parsed.rowHeight, DEFAULT_SETTINGS.rowHeight, 80, 220),
-      defaultCardRows: clampNumber(parsed.defaultCardRows, DEFAULT_SETTINGS.defaultCardRows, 3, 14),
-      minCardRows: clampNumber(parsed.minCardRows, DEFAULT_SETTINGS.minCardRows, 3, 14),
+      rowHeight: clampNumber(parsed.rowHeight, DEFAULT_SETTINGS.rowHeight, 24, 180),
+      defaultCardRows: clampNumber(parsed.defaultCardRows, DEFAULT_SETTINGS.defaultCardRows, 3, 32),
+      minCardRows: clampNumber(parsed.minCardRows, DEFAULT_SETTINGS.minCardRows, 3, 32),
       previewMinHeight: clampNumber(parsed.previewMinHeight, DEFAULT_SETTINGS.previewMinHeight, 160, 1400),
       previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, MAX_LIST_PREVIEW_LINES),
       previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000),
@@ -359,16 +358,35 @@ function mergeFastPreview(previous: SessionPreview | undefined, next: SessionPre
 }
 
 function buildSessionLayout(session: TerminalSession, index: number, settings: PanelSettings): Layout {
-  const width = Math.max(MIN_CARD_COLUMNS, Math.min(GRID_COLUMNS, session.layout?.w ?? CARD_COLUMNS));
+  const storedLayout = normalizeStoredLayout(session.layout);
+  const width = Math.max(MIN_CARD_COLUMNS, Math.min(GRID_COLUMNS, storedLayout?.w ?? CARD_COLUMNS));
   return {
     i: session.id,
-    x: session.layout?.x ?? (index % 3) * CARD_COLUMNS,
-    y: session.layout?.y ?? Math.floor(index / 3) * settings.defaultCardRows,
+    x: storedLayout?.x ?? (index % 3) * CARD_COLUMNS,
+    y: storedLayout?.y ?? Math.floor(index / 3) * settings.defaultCardRows,
     w: width,
-    h: Math.max(session.layout?.h ?? settings.defaultCardRows, MIN_LAYOUT_ROWS),
+    h: Math.max(storedLayout?.h ?? settings.defaultCardRows, MIN_LAYOUT_ROWS),
     minW: MIN_CARD_COLUMNS,
     minH: MIN_LAYOUT_ROWS
   };
+}
+
+function normalizeStoredLayout(layout: TerminalSession["layout"]): Layout | null {
+  if (!layout) {
+    return null;
+  }
+
+  const sourceColumns = Math.max(1, Number(layout.gridColumns) || LEGACY_GRID_COLUMNS);
+  const columnScale = GRID_COLUMNS / sourceColumns;
+  return clampLayoutItem({
+    i: "",
+    x: Math.round(layout.x * columnScale),
+    y: layout.y,
+    w: Math.round(layout.w * columnScale),
+    h: layout.h,
+    minW: layout.minW ? Math.round(layout.minW * columnScale) : MIN_CARD_COLUMNS,
+    minH: layout.minH ?? MIN_LAYOUT_ROWS
+  });
 }
 
 function buildTopSessionLayout(sessionId: string, settings: PanelSettings): Layout {
@@ -467,98 +485,6 @@ function sameLayout(previous: Layout[], next: Layout[]): boolean {
   });
 }
 
-function settleLayout(layout: Layout[], changedId?: string): Layout[] {
-  if (layout.length <= 1) {
-    return layout.map(clampLayoutItem);
-  }
-
-  const normalized = layout.map(clampLayoutItem);
-  const changed = changedId ? normalized.find((item) => item.i === changedId) : undefined;
-  if (!changed) {
-    return pushCollisionsDown(normalized);
-  }
-
-  const others = normalized.filter((item) => item.i !== changed.i);
-  const collisions = others.filter((item) => layoutItemsOverlap(changed, item));
-  if (collisions.length === 0) {
-    return normalized;
-  }
-
-  const shouldPush = collisions.some((item) => overlapRatio(changed, item) >= COLLISION_PUSH_RATIO);
-  if (!shouldPush) {
-    return replaceLayoutItem(normalized, findNearestFreeSpot(changed, others));
-  }
-
-  return pushCollisionsDown(normalized, changed.i);
-}
-
-function pushCollisionsDown(layout: Layout[], anchorId?: string): Layout[] {
-  const byId = new Map(layout.map((item) => [item.i, { ...item }]));
-  const anchor = anchorId ? byId.get(anchorId) : undefined;
-  const processing = layout
-    .filter((item) => item.i !== anchorId)
-    .map((item) => byId.get(item.i) ?? item)
-    .sort(compareLayoutPosition);
-  const placed: Layout[] = anchor ? [anchor] : [];
-
-  for (const item of processing) {
-    const next = { ...item };
-    let guard = 0;
-    while (guard < 200) {
-      const collision = firstCollision(placed, next);
-      if (!collision) {
-        break;
-      }
-      next.y = Math.max(next.y + 1, collision.y + collision.h);
-      guard += 1;
-    }
-    byId.set(next.i, next);
-    placed.push(next);
-  }
-
-  return layout.map((item) => byId.get(item.i) ?? item);
-}
-
-function findNearestFreeSpot(item: Layout, others: Layout[]): Layout {
-  const base = clampLayoutItem(item);
-  let best: Layout | null = null;
-  let bestScore = Number.POSITIVE_INFINITY;
-
-  for (let distance = 0; distance <= FREE_SPOT_SEARCH_RADIUS; distance += 1) {
-    for (let dx = -distance; dx <= distance; dx += 1) {
-      const remaining = distance - Math.abs(dx);
-      for (const dy of remaining === 0 ? [0] : [-remaining, remaining]) {
-        const candidate = clampLayoutItem({
-          ...base,
-          x: base.x + dx,
-          y: base.y + dy
-        });
-        if (others.some((other) => layoutItemsOverlap(candidate, other))) {
-          continue;
-        }
-        const score = Math.abs(candidate.x - base.x) * 2 + Math.abs(candidate.y - base.y) + Math.max(0, candidate.y - base.y) * 0.15;
-        if (score < bestScore) {
-          best = candidate;
-          bestScore = score;
-        }
-      }
-    }
-    if (best) {
-      return best;
-    }
-  }
-
-  const below = {
-    ...base,
-    y: Math.max(0, ...others.map((other) => other.y + other.h))
-  };
-  return clampLayoutItem(below);
-}
-
-function replaceLayoutItem(layout: Layout[], item: Layout): Layout[] {
-  return layout.map((current) => (current.i === item.i ? item : current));
-}
-
 function clampLayoutItem(item: Layout): Layout {
   const minW = item.minW ?? MIN_CARD_COLUMNS;
   const minH = item.minH ?? MIN_LAYOUT_ROWS;
@@ -574,32 +500,6 @@ function clampLayoutItem(item: Layout): Layout {
   };
 }
 
-function compareLayoutPosition(a: Layout, b: Layout): number {
-  if (a.y !== b.y) {
-    return a.y - b.y;
-  }
-  if (a.x !== b.x) {
-    return a.x - b.x;
-  }
-  return a.i.localeCompare(b.i);
-}
-
-function firstCollision(layout: Layout[], item: Layout): Layout | undefined {
-  return layout.find((current) => current.i !== item.i && layoutItemsOverlap(current, item));
-}
-
-function layoutItemsOverlap(a: Layout, b: Layout): boolean {
-  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-}
-
-function overlapRatio(a: Layout, b: Layout): number {
-  const width = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
-  const height = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
-  const overlap = width * height;
-  const smallerArea = Math.max(1, Math.min(a.w * a.h, b.w * b.h));
-  return overlap / smallerArea;
-}
-
 function layoutToSessionLayout(item: Layout, offsetY = 0) {
   return {
     x: item.x,
@@ -607,7 +507,8 @@ function layoutToSessionLayout(item: Layout, offsetY = 0) {
     w: item.w,
     h: item.h,
     minW: item.minW,
-    minH: item.minH
+    minH: item.minH,
+    gridColumns: GRID_COLUMNS
   };
 }
 
@@ -636,7 +537,6 @@ export function App() {
   const localLayoutRef = useRef<Layout[]>([]);
   const layoutOriginYRef = useRef(0);
   const layoutProtectUntilRef = useRef(0);
-  const activeLayoutItemIdRef = useRef<string | null>(null);
   const layoutSaveSeqRef = useRef(0);
   const previewsRef = useRef<Record<string, SessionPreview>>({});
   const previewInFlightRef = useRef<Set<string>>(new Set());
@@ -983,11 +883,10 @@ export function App() {
   );
 
   const handleLayoutStart = useCallback(
-    (_layout: Layout[], oldItem?: Layout, changedItem?: Layout) => {
+    () => {
       if (isMobile) {
         return;
       }
-      activeLayoutItemIdRef.current = changedItem?.i ?? oldItem?.i ?? null;
       layoutDirtyRef.current = true;
       layoutProtectUntilRef.current = Date.now() + 5000;
     },
@@ -1008,18 +907,16 @@ export function App() {
   );
 
   const handleLayoutStop = useCallback(
-    (layout: Layout[], _oldItem?: Layout, changedItem?: Layout) => {
+    (layout: Layout[]) => {
       if (isMobile) {
         return;
       }
-      const changedId = changedItem?.i ?? activeLayoutItemIdRef.current ?? undefined;
-      const settled = settleLayout(layout, changedId);
-      activeLayoutItemIdRef.current = null;
+      const next = layout.map(clampLayoutItem);
       layoutDirtyRef.current = true;
       layoutProtectUntilRef.current = Date.now() + 5000;
-      localLayoutRef.current = settled;
-      setLocalLayout(settled);
-      void saveLayout(settled);
+      localLayoutRef.current = next;
+      setLocalLayout(next);
+      void saveLayout(next);
     },
     [isMobile, saveLayout]
   );
@@ -1205,7 +1102,7 @@ export function App() {
           <SlidersHorizontal size={16} />
           <input
             type="range"
-            min="100"
+            min="24"
             max="180"
             step="4"
             value={settings.rowHeight}
@@ -1264,8 +1161,8 @@ export function App() {
           allowOverlap
           preventCollision={false}
           resizeHandles={GRID_RESIZE_HANDLES}
-          draggableHandle=".drag-handle"
-          draggableCancel=".preview,.quick-input,.card-actions,.preview-tools"
+          draggableHandle=".session-card-header"
+          draggableCancel=".preview,.quick-input,.card-actions,.preview-tools,input,select,a"
           onDragStart={handleLayoutStart}
           onDrag={handleLayoutMove}
           onResizeStart={handleLayoutStart}
@@ -1397,11 +1294,11 @@ function SettingsModal({
             <span>网格行高</span>
             <input
               type="number"
-              min="80"
-              max="220"
+              min="24"
+              max="180"
               step="4"
               value={settings.rowHeight}
-              onChange={(event) => update("rowHeight", clampNumber(event.target.value, DEFAULT_SETTINGS.rowHeight, 80, 220))}
+              onChange={(event) => update("rowHeight", clampNumber(event.target.value, DEFAULT_SETTINGS.rowHeight, 24, 180))}
             />
           </label>
           <label>
@@ -1409,10 +1306,10 @@ function SettingsModal({
             <input
               type="number"
               min="3"
-              max="14"
+              max="32"
               value={settings.defaultCardRows}
               onChange={(event) =>
-                update("defaultCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.defaultCardRows, 3, 14))
+                update("defaultCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.defaultCardRows, 3, 32))
               }
             />
           </label>
@@ -1421,10 +1318,10 @@ function SettingsModal({
             <input
               type="number"
               min="3"
-              max="14"
+              max="32"
               value={settings.minCardRows}
               onChange={(event) =>
-                update("minCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.minCardRows, 3, 14))
+                update("minCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.minCardRows, 3, 32))
               }
             />
           </label>
