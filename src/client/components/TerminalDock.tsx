@@ -19,6 +19,7 @@ const ZELLIJ_WEB_COLS = 120;
 const ZELLIJ_WEB_ROWS = 36;
 const TERMINAL_SCROLLBACK_ROWS = 200_000;
 const TERMINAL_INPUT_BATCH_MS = 12;
+const TERMINAL_WRITE_CHUNK_CHARS = 8192;
 
 export function TerminalDock({ session, visible, onClose }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -32,6 +33,9 @@ export function TerminalDock({ session, visible, onClose }: Props) {
   const copiedTimerRef = useRef<number | null>(null);
   const inputBufferRef = useRef("");
   const inputFlushTimerRef = useRef<number | null>(null);
+  const writeQueueRef = useRef<string[]>([]);
+  const writeInProgressRef = useRef(false);
+  const writeTimerRef = useRef<number | null>(null);
   const uploadingRef = useRef(false);
   const [attachCommand, setAttachCommand] = useState<string | null>(null);
   const [backend, setBackend] = useState(session.runtime?.backend ?? session.backend);
@@ -181,6 +185,18 @@ export function TerminalDock({ session, visible, onClose }: Props) {
     }
   }, [pasteFilesToTerminal, sendTerminalInput]);
 
+  const enqueueTerminalWrite = useCallback((terminal: Terminal, data: string) => {
+    if (!data) {
+      return;
+    }
+
+    writeQueueRef.current.push(...chunkTerminalWrite(data));
+    if (!writeInProgressRef.current) {
+      writeInProgressRef.current = true;
+      pumpTerminalWrites(terminal, writeQueueRef, writeInProgressRef, writeTimerRef);
+    }
+  }, []);
+
   useEffect(() => {
     return () => {
       if (copiedTimerRef.current) {
@@ -189,6 +205,11 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       if (inputFlushTimerRef.current) {
         window.clearTimeout(inputFlushTimerRef.current);
       }
+      if (writeTimerRef.current) {
+        window.clearTimeout(writeTimerRef.current);
+      }
+      writeQueueRef.current = [];
+      writeInProgressRef.current = false;
     };
   }, []);
 
@@ -279,7 +300,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       window.setTimeout(() => refitTerminal(true), 0);
     });
     socket.on("terminal:data", (data: string) => {
-      terminal.write(data);
+      enqueueTerminalWrite(terminal, data);
     });
     socket.on("terminal:resized", (size: { cols?: number; rows?: number; seq?: number }) => {
       if (typeof size.seq === "number") {
@@ -380,6 +401,12 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       disposable.dispose();
       resizeDisposable.dispose();
       flushTerminalInput();
+      if (writeTimerRef.current) {
+        window.clearTimeout(writeTimerRef.current);
+        writeTimerRef.current = null;
+      }
+      writeQueueRef.current = [];
+      writeInProgressRef.current = false;
       socket.disconnect();
       terminal.dispose();
       if (socketRef.current === socket) {
@@ -392,7 +419,16 @@ export function TerminalDock({ session, visible, onClose }: Props) {
         fitRef.current = null;
       }
     };
-  }, [flushTerminalInput, isMobileClient, pasteFilesToTerminal, refitTerminal, sendTerminalInput, session.id, usesStableZellijWidth]);
+  }, [
+    enqueueTerminalWrite,
+    flushTerminalInput,
+    isMobileClient,
+    pasteFilesToTerminal,
+    refitTerminal,
+    sendTerminalInput,
+    session.id,
+    usesStableZellijWidth
+  ]);
 
   return (
     <div
@@ -489,6 +525,51 @@ function normalizeTerminalDimensions(
 
 function shouldSendTerminalInputImmediately(data: string): boolean {
   return data.length > 1 || /[\r\n\x03\x04\x1a]/.test(data);
+}
+
+function chunkTerminalWrite(data: string): string[] {
+  if (data.length <= TERMINAL_WRITE_CHUNK_CHARS) {
+    return [data];
+  }
+
+  const chunks: string[] = [];
+  for (let index = 0; index < data.length; index += TERMINAL_WRITE_CHUNK_CHARS) {
+    let end = Math.min(data.length, index + TERMINAL_WRITE_CHUNK_CHARS);
+    if (end < data.length && isHighSurrogate(data.charCodeAt(end - 1))) {
+      end -= 1;
+    }
+    chunks.push(data.slice(index, Math.max(index + 1, end)));
+  }
+  return chunks;
+}
+
+function pumpTerminalWrites(
+  terminal: Terminal,
+  queueRef: { current: string[] },
+  inProgressRef: { current: boolean },
+  timerRef: { current: number | null }
+): void {
+  const chunk = queueRef.current.shift();
+  if (!chunk) {
+    inProgressRef.current = false;
+    return;
+  }
+
+  try {
+    terminal.write(chunk, () => {
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = null;
+        pumpTerminalWrites(terminal, queueRef, inProgressRef, timerRef);
+      }, 0);
+    });
+  } catch {
+    queueRef.current = [];
+    inProgressRef.current = false;
+  }
+}
+
+function isHighSurrogate(value: number): boolean {
+  return value >= 0xd800 && value <= 0xdbff;
 }
 
 function createTerminalInputFilter(): (data: string) => string {

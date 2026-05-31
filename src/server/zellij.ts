@@ -271,12 +271,16 @@ export function appendZellijTranscript(sessionId: string, data: string, dataDir 
 export async function captureZellijAttachHistory(
   session: Pick<TerminalSession, "id" | "tmuxName">,
   dataDir = config.dataDir,
-  lines = config.zellijScrollback
+  lines = config.terminalAttachHistoryLines
 ): Promise<string> {
   const linesToKeep = Math.max(MIN_ATTACH_HISTORY_LINES, Math.min(config.zellijScrollback, Math.floor(lines)));
   const transcript = stripZellijHistoryHidingSequences(
-    tailRawLines(await loadZellijTranscript(dataDir, session.id), linesToKeep)
+    tailRawLines(await loadZellijTranscript(dataDir, session.id, linesToKeep), linesToKeep)
   );
+  if (countRawLines(transcript) >= linesToKeep) {
+    return transcript;
+  }
+
   if (await hasZellijSession(session.tmuxName)) {
     const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
     const args = ["--session", session.tmuxName, "action", "dump-screen", "--ansi", "--full"];
@@ -601,8 +605,12 @@ async function activeTerminalPane(sessionName: string): Promise<ZellijPane | nul
   );
 }
 
-async function loadZellijTranscript(dataDir: string, sessionId: string): Promise<string> {
-  return readTailFile(zellijTranscriptPath(dataDir, sessionId), config.nativeHistoryBytes).catch(() => "");
+async function loadZellijTranscript(dataDir: string, sessionId: string, lines?: number): Promise<string> {
+  const transcriptPath = zellijTranscriptPath(dataDir, sessionId);
+  if (lines !== undefined) {
+    return readTailFileLines(transcriptPath, lines, config.nativeHistoryBytes).catch(() => "");
+  }
+  return readTailFile(transcriptPath, config.nativeHistoryBytes).catch(() => "");
 }
 
 function zellijTranscriptPath(dataDir: string, sessionId: string): string {
@@ -633,6 +641,50 @@ async function readTailFile(filePath: string, maxBytes: number): Promise<string>
   } finally {
     await handle.close();
   }
+}
+
+async function readTailFileLines(filePath: string, linesToKeep: number, maxBytes: number): Promise<string> {
+  const stat = await fs.promises.stat(filePath);
+  if (stat.size <= 0) {
+    return "";
+  }
+
+  const chunks: Buffer[] = [];
+  const chunkSize = 256 * 1024;
+  const targetLines = Math.max(1, Math.floor(linesToKeep));
+  const bytesToRead = Math.min(stat.size, maxBytes);
+  let remaining = stat.size;
+  let bytesRead = 0;
+  let lineBreaks = 0;
+  const handle = await fs.promises.open(filePath, "r");
+  try {
+    while (remaining > 0 && bytesRead < bytesToRead && lineBreaks <= targetLines) {
+      const length = Math.min(chunkSize, remaining, bytesToRead - bytesRead);
+      remaining -= length;
+      const buffer = Buffer.alloc(length);
+      const result = await handle.read(buffer, 0, length, remaining);
+      const chunk = buffer.subarray(0, result.bytesRead);
+      chunks.unshift(chunk);
+      bytesRead += result.bytesRead;
+      lineBreaks += countLineBreakBytes(chunk);
+      if (result.bytesRead <= 0) {
+        break;
+      }
+    }
+    return tailRawLines(Buffer.concat(chunks).toString("utf8"), targetLines);
+  } finally {
+    await handle.close();
+  }
+}
+
+function countLineBreakBytes(value: Buffer): number {
+  let count = 0;
+  for (const byte of value) {
+    if (byte === 10) {
+      count += 1;
+    }
+  }
+  return count;
 }
 
 function zellijOptions(session: Pick<TerminalSession, "cwd" | "shell">): string[] {
