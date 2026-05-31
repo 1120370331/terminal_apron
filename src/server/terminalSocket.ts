@@ -15,6 +15,7 @@ import { userFromCookie } from "./auth.js";
 import { loadPty } from "./pty.js";
 import { resolveBackend } from "./backend.js";
 import { NativeSessionManager } from "./nativeSessions.js";
+import { emitTerminalData } from "./terminalData.js";
 import type { AuthUser } from "../shared/types.js";
 
 const MAX_TERMINAL_COLS = 4096;
@@ -153,7 +154,7 @@ async function attachZellij(
   };
 
   const emitLiveData = (data: string) => {
-    socket.emit("terminal:data", data);
+    emitTerminalData(socket, data);
     transcriptQueue = transcriptQueue
       .then(() => appendZellijTranscript(session.id, data, dataDir))
       .catch(() => undefined);
@@ -173,7 +174,7 @@ async function attachZellij(
   });
 
   if (attachHistory.trim()) {
-    socket.emit("terminal:data", normalizeAttachHistory(attachHistory));
+    emitTerminalData(socket, normalizeAttachHistory(attachHistory));
   }
   replayingHistory = false;
   for (const data of pendingLiveData) {
@@ -264,7 +265,7 @@ async function attachTmux(
   socket.emit("terminal:resized", { cols, rows, seq: 0 });
 
   term.onData((data) => {
-    socket.emit("terminal:data", data);
+    emitTerminalData(socket, data);
   });
 
   term.onExit((event) => {

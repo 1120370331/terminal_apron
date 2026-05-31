@@ -41,6 +41,7 @@ const ZELLIJ_VERSION_TTL_MS = 60_000;
 const ZELLIJ_RUNTIME_CACHE_TTL_MS = 10_000;
 const ZELLIJ_PREVIEW_MIN_COLS = 120;
 const DEFAULT_PASTE_SUBMIT_DELAY_MS = 120;
+const MIN_ATTACH_HISTORY_LINES = 5_000;
 
 interface PreviewCacheEntry {
   value: string;
@@ -272,7 +273,7 @@ export async function captureZellijAttachHistory(
   dataDir = config.dataDir,
   lines = config.zellijScrollback
 ): Promise<string> {
-  const linesToKeep = Math.max(100, Math.min(config.zellijScrollback, Math.floor(lines)));
+  const linesToKeep = Math.max(MIN_ATTACH_HISTORY_LINES, Math.min(config.zellijScrollback, Math.floor(lines)));
   const transcript = stripZellijHistoryHidingSequences(
     tailRawLines(await loadZellijTranscript(dataDir, session.id), linesToKeep)
   );
@@ -286,7 +287,7 @@ export async function captureZellijAttachHistory(
       timeoutMs: 8000,
       maxBufferBytes: Math.max(1024 * 1024 * 16, config.nativeHistoryBytes + 1024 * 1024)
     }).catch(() => ({ stdout: "", stderr: "" }));
-    const output = tailRawLines(result.stdout, linesToKeep);
+    const output = stripZellijHistoryHidingSequences(tailRawLines(result.stdout, linesToKeep));
     if (output.trim()) {
       return longerHistory(output, transcript);
     }

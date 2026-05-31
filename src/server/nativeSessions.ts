@@ -7,6 +7,7 @@ import type { Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { SessionRuntime, TerminalSession } from "../shared/types.js";
 import { config } from "./config.js";
 import { loadPty, type PtyProcess } from "./pty.js";
+import { emitTerminalData } from "./terminalData.js";
 
 const MAX_TERMINAL_COLS = 4096;
 const MAX_TERMINAL_ROWS = 2048;
@@ -96,7 +97,7 @@ export class NativeSessionManager {
       entry.output = tailByUtf8Bytes(entry.output + data, config.nativeHistoryBytes);
       queueTranscriptWrite(entry, data);
       for (const client of entry.clients) {
-        client.emit("terminal:data", data);
+        emitTerminalData(client, data);
       }
     });
 
@@ -129,7 +130,7 @@ export class NativeSessionManager {
 
     const attachHistory = await loadTranscript(dataDir, session.id);
     if (attachHistory) {
-      socket.emit("terminal:data", attachHistory);
+      emitTerminalData(socket, attachHistory);
     }
 
     socket.on("terminal:input", (data: string) => {

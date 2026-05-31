@@ -76,10 +76,10 @@ export const config = {
   cookieSecure: process.env.TWM_COOKIE_SECURE === "true",
   sshNamespace: "terminal-web-monitor",
   nativeHistoryBytes: parseBoundedInteger(process.env.TWM_NATIVE_HISTORY_BYTES, 50_000_000, 1_000_000, 200_000_000),
-  nativeScreenScrollback: parseBoundedInteger(process.env.TWM_NATIVE_SCREEN_SCROLLBACK, 50_000, 1_000, 200_000),
+  nativeScreenScrollback: parseBoundedInteger(process.env.TWM_NATIVE_SCREEN_SCROLLBACK, 50_000, 5_000, 200_000),
   previewMaxLines: parseBoundedInteger(process.env.TWM_PREVIEW_MAX_LINES, 5_000, 100, 20_000),
-  tmuxHistoryLimit: parseBoundedInteger(process.env.TWM_TMUX_HISTORY_LIMIT, 50_000, 1_000, 200_000),
-  zellijScrollback: parseBoundedInteger(process.env.TWM_ZELLIJ_SCROLLBACK, 50_000, 1_000, 200_000)
+  tmuxHistoryLimit: parseBoundedInteger(process.env.TWM_TMUX_HISTORY_LIMIT, 50_000, 5_000, 200_000),
+  zellijScrollback: parseBoundedInteger(process.env.TWM_ZELLIJ_SCROLLBACK, 50_000, 5_000, 200_000)
 };
 
 export function configuredUser(name: string | undefined): ConfigUser | undefined {
