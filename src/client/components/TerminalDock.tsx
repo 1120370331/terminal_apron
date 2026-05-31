@@ -460,7 +460,7 @@ function normalizeTerminalDimensions(
   if (stableZellijWidth) {
     return {
       cols: ZELLIJ_WEB_COLS,
-      rows: ZELLIJ_WEB_ROWS
+      rows: Math.max(10, value.rows || ZELLIJ_WEB_ROWS)
     };
   }
 

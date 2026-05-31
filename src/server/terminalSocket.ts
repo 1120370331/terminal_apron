@@ -201,6 +201,11 @@ async function attachZellij(
 
   socket.on("terminal:resize", (size: { cols?: number; rows?: number; seq?: number }) => {
     if (stableSize) {
+      const nextRows = clampDimension(size.rows, currentRows, 10, MAX_TERMINAL_ROWS);
+      if (nextRows !== currentRows) {
+        currentRows = nextRows;
+        term.resize(currentCols, currentRows);
+      }
       socket.emit("terminal:resized", { cols: currentCols, rows: currentRows, seq: size.seq });
       return;
     }
