@@ -83,6 +83,32 @@ export const config = {
     5_000,
     200_000
   ),
+  terminalSnapshotViewportLines: parseBoundedInteger(
+    process.env.TWM_TERMINAL_SNAPSHOT_VIEWPORT_LINES,
+    120,
+    20,
+    1_200
+  ),
+  terminalHistoryColdTailLines: parseBoundedInteger(process.env.TWM_TERMINAL_HISTORY_COLD_TAIL_LINES, 500, 20, 800),
+  terminalHistoryColdTailBytes: parseBoundedInteger(
+    process.env.TWM_TERMINAL_HISTORY_COLD_TAIL_BYTES,
+    512_000,
+    64_000,
+    4_000_000
+  ),
+  terminalHistoryRangeLines: parseBoundedInteger(process.env.TWM_TERMINAL_HISTORY_RANGE_LINES, 800, 20, 5_000),
+  terminalHistoryMaxRangeLines: parseBoundedInteger(
+    process.env.TWM_TERMINAL_HISTORY_MAX_RANGE_LINES,
+    5_000,
+    100,
+    20_000
+  ),
+  terminalHistoryRangeBytes: parseBoundedInteger(
+    process.env.TWM_TERMINAL_HISTORY_RANGE_BYTES,
+    1_000_000,
+    64_000,
+    8_000_000
+  ),
   previewMaxLines: parseBoundedInteger(process.env.TWM_PREVIEW_MAX_LINES, 5_000, 100, 20_000),
   tmuxHistoryLimit: parseBoundedInteger(process.env.TWM_TMUX_HISTORY_LIMIT, 50_000, 5_000, 200_000),
   zellijScrollback: parseBoundedInteger(process.env.TWM_ZELLIJ_SCROLLBACK, 50_000, 5_000, 200_000)

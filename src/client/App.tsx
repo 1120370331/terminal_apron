@@ -29,10 +29,10 @@ import type {
   TerminalPreviewGrid,
   TerminalSession
 } from "../shared/types";
-import { api, ApiError } from "./api";
+import { api, ApiError, type SessionInputResponse } from "./api";
 import { Login } from "./components/Login";
 import { FileTransferPanel } from "./components/FileTransferPanel";
-import { SessionCard } from "./components/SessionCard";
+import { SessionCard, type QuickInputPhase, type QuickInputStatus } from "./components/SessionCard";
 import { SessionEditor } from "./components/SessionEditor";
 import { TerminalDock } from "./components/TerminalDock";
 
@@ -55,6 +55,10 @@ const REMOTE_FULL_PREVIEW_REFRESH_MS = 30_000;
 const LOCAL_PREVIEW_MAX_CHARS = 500_000;
 const REMOTE_PREVIEW_MAX_CHARS = 120_000;
 const PREVIEW_REVEAL_TIMEOUT_MS = 1500;
+const QUICK_INPUT_ECHO_DELAY_MS = 180;
+const QUICK_INPUT_REFRESH_RETRY_MS = 900;
+const QUICK_INPUT_UPDATED_CLEAR_MS = 1800;
+const QUICK_INPUT_ERROR_CLEAR_MS = 4000;
 const DESKTOP_INITIAL_PREVIEW_CARDS = 3;
 const MOBILE_INITIAL_PREVIEW_CARDS = 2;
 const MOBILE_QUERY = "(max-width: 720px)";
@@ -152,7 +156,7 @@ function isTerminalInputFocused(): boolean {
   if (!(active instanceof HTMLElement)) {
     return false;
   }
-  return Boolean(active.closest(".quick-input, .terminal-dock"));
+  return Boolean(active.closest(".terminal-dock"));
 }
 
 function resolveThemeMode(mode: ThemeMode): "light" | "dark" {
@@ -327,6 +331,52 @@ function emptyPreview(sessionId: string): SessionPreview {
 
 function quickSubmitDelayMs(value: string): number {
   return Math.max(140, Math.min(600, 140 + Math.ceil(value.length / 80)));
+}
+
+function createQuickInputId(sessionId: string): string {
+  return `qi:${sessionId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function removeRecordKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  if (!(key in record)) {
+    return record;
+  }
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+
+function previewFromInputResponse(
+  sessionId: string,
+  result: SessionInputResponse,
+  fallback?: SessionPreview
+): SessionPreview | null {
+  if (result.preview === undefined && !result.grid) {
+    return null;
+  }
+  return {
+    ...emptyPreview(sessionId),
+    text: result.preview ?? fallback?.text ?? "",
+    grid: result.grid,
+    signature: result.signature,
+    capturedAt: result.capturedAt ?? new Date().toISOString()
+  };
+}
+
+function quickInputPhaseRank(phase: QuickInputPhase): number {
+  if (phase === "sending") {
+    return 0;
+  }
+  if (phase === "sent") {
+    return 1;
+  }
+  if (phase === "echoing") {
+    return 2;
+  }
+  if (phase === "updated") {
+    return 3;
+  }
+  return 4;
 }
 
 function samePreview(previous: SessionPreview | undefined, next: SessionPreview): boolean {
@@ -542,6 +592,7 @@ export function App() {
   const [auth, setAuth] = useState<AuthUser | null | undefined>(undefined);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [previews, setPreviews] = useState<Record<string, SessionPreview>>({});
+  const [quickInputStatuses, setQuickInputStatuses] = useState<Record<string, QuickInputStatus>>({});
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [metricsHistory, setMetricsHistory] = useState<SystemMetrics[]>([]);
   const [query, setQuery] = useState(initialFilters.query);
@@ -553,7 +604,7 @@ export function App() {
   const [transferOpen, setTransferOpen] = useState(false);
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
-  const [cachedTerminal, setCachedTerminal] = useState<TerminalSession | null>(null);
+  const [cachedTerminals, setCachedTerminals] = useState<TerminalSession[]>([]);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [previewRevealTimedOut, setPreviewRevealTimedOut] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -566,6 +617,7 @@ export function App() {
   const previewsRef = useRef<Record<string, SessionPreview>>({});
   const previewInFlightRef = useRef<Set<string>>(new Set());
   const lastFullPreviewAtRef = useRef<Record<string, number>>({});
+  const quickInputTimersRef = useRef<Record<string, number[]>>({});
   const userStorageReadyRef = useRef<string | null>(null);
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const remoteBrowserHost = useMemo(isRemoteBrowserHost, []);
@@ -575,6 +627,70 @@ export function App() {
     : settings.previewRefreshMs;
   const fullPreviewRefreshMs = remoteBrowserHost ? REMOTE_FULL_PREVIEW_REFRESH_MS : FULL_PREVIEW_REFRESH_MS;
   const previewMaxChars = remoteBrowserHost ? REMOTE_PREVIEW_MAX_CHARS : LOCAL_PREVIEW_MAX_CHARS;
+
+  const clearQuickInputTimers = useCallback((sessionId: string) => {
+    const timers = quickInputTimersRef.current[sessionId] ?? [];
+    timers.forEach((timer) => window.clearTimeout(timer));
+    delete quickInputTimersRef.current[sessionId];
+  }, []);
+
+  const scheduleQuickInputTimer = useCallback((sessionId: string, callback: () => void, delayMs: number) => {
+    const timer = window.setTimeout(callback, delayMs);
+    quickInputTimersRef.current[sessionId] = [...(quickInputTimersRef.current[sessionId] ?? []), timer];
+    return timer;
+  }, []);
+
+  const setQuickInputPhase = useCallback(
+    (
+      sessionId: string,
+      inputId: string,
+      phase: QuickInputPhase,
+      details: { inputSeq?: number; message?: string } = {}
+    ) => {
+      setQuickInputStatuses((current) => {
+        const previous = current[sessionId];
+        if (phase !== "sending" && previous && previous.inputId !== inputId) {
+          return current;
+        }
+        if (previous?.inputId === inputId && quickInputPhaseRank(phase) < quickInputPhaseRank(previous.phase)) {
+          return current;
+        }
+        return {
+          ...current,
+          [sessionId]: {
+            inputId,
+            phase,
+            inputSeq: details.inputSeq ?? (previous?.inputId === inputId ? previous.inputSeq : undefined),
+            message: details.message,
+            updatedAt: Date.now()
+          }
+        };
+      });
+    },
+    []
+  );
+
+  const clearQuickInputStatus = useCallback((sessionId: string, inputId: string) => {
+    setQuickInputStatuses((current) => {
+      if (current[sessionId]?.inputId !== inputId) {
+        return current;
+      }
+      return removeRecordKey(current, sessionId);
+    });
+  }, []);
+
+  const cacheTerminal = useCallback((session: TerminalSession) => {
+    setCachedTerminals((current) => [session, ...current.filter((item) => item.id !== session.id)].slice(0, 3));
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      Object.values(quickInputTimersRef.current).forEach((timers) => {
+        timers.forEach((timer) => window.clearTimeout(timer));
+      });
+      quickInputTimersRef.current = {};
+    };
+  }, []);
 
   const loadSessions = useCallback(async () => {
     try {
@@ -779,6 +895,37 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [auth, sessionsLoaded, previewRevealReady, previewRevealTargetKey, previewRevealTargets.length]);
 
+  const applySessionPreview = useCallback(
+    (sessionId: string, preview: SessionPreview, full: boolean) => {
+      setPreviews((current) => {
+        const nextPreview = full ? preview : mergeFastPreview(current[sessionId], preview, settings.previewLines);
+        return samePreview(current[sessionId], nextPreview) ? current : { ...current, [sessionId]: nextPreview };
+      });
+    },
+    [settings.previewLines]
+  );
+
+  const refreshSessionPreview = useCallback(
+    async (sessionId: string, full = false): Promise<SessionPreview | null> => {
+      if (previewInFlightRef.current.has(sessionId)) {
+        return null;
+      }
+
+      previewInFlightRef.current.add(sessionId);
+      try {
+        const preview = await api.preview(sessionId, settings.previewLines, previewMaxChars, full);
+        if (full) {
+          lastFullPreviewAtRef.current[sessionId] = Date.now();
+        }
+        applySessionPreview(sessionId, preview, full);
+        return preview;
+      } finally {
+        previewInFlightRef.current.delete(sessionId);
+      }
+    },
+    [applySessionPreview, previewMaxChars, settings.previewLines]
+  );
+
   useEffect(() => {
     if (!auth || activeTerminal || previewTargets.length === 0) {
       return;
@@ -822,12 +969,7 @@ export function App() {
           lastFullPreviewAtRef.current[sessionId] = Date.now();
         }
 
-        setPreviews((current) => {
-          const nextPreview = shouldLoadFull
-            ? preview
-            : mergeFastPreview(current[sessionId], preview, settings.previewLines);
-          return samePreview(current[sessionId], nextPreview) ? current : { ...current, [sessionId]: nextPreview };
-        });
+        applySessionPreview(sessionId, preview, shouldLoadFull);
       } catch {
         if (!cancelled) {
           setPreviews((current) =>
@@ -853,7 +995,16 @@ export function App() {
       cancelled = true;
       timers.forEach((timer) => window.clearInterval(timer));
     };
-  }, [activeTerminal, auth, fullPreviewRefreshMs, previewMaxChars, previewRefreshMs, previewTargetKey, settings.previewLines]);
+  }, [
+    activeTerminal,
+    applySessionPreview,
+    auth,
+    fullPreviewRefreshMs,
+    previewMaxChars,
+    previewRefreshMs,
+    previewTargetKey,
+    settings.previewLines
+  ]);
 
   const desktopLayoutState = useMemo(
     () => normalizeVisibleLayout(filtered.map((session, index) => buildSessionLayout(session, index, settings))),
@@ -976,10 +1127,11 @@ export function App() {
     <SessionCard
       session={session}
       preview={previews[session.id]}
+      quickInputStatus={quickInputStatuses[session.id]}
       previewFontSize={settings.listTerminalFontSize}
       previewScale={settings.listTerminalScale / 100}
       onOpen={() => {
-        setCachedTerminal(session);
+        cacheTerminal(session);
         setActiveTerminal(session);
       }}
       onEdit={() => setEditorSession(session)}
@@ -988,32 +1140,58 @@ export function App() {
         await loadSessions();
       }}
       onQuickInput={async (value) => {
+        const inputId = createQuickInputId(session.id);
+        clearQuickInputTimers(session.id);
+        setQuickInputPhase(session.id, inputId, "sending");
         const input = {
+          inputId,
           data: value,
           enter: true,
           submitKey: "enter" as const,
           mode: "paste" as const,
-          submitDelayMs: quickSubmitDelayMs(value)
+          submitDelayMs: quickSubmitDelayMs(value),
+          lines: settings.previewLines,
+          maxChars: previewMaxChars,
+          includePreview: false
         };
-        const result = await api.sendInput(session.id, input);
-        if (result.preview !== undefined) {
-          setPreviews((current) => ({
-            ...current,
-            [session.id]: {
-              ...emptyPreview(session.id),
-              text: result.preview || current[session.id]?.text || "",
-              grid: result.grid,
-              signature: result.signature
-            }
-          }));
+        let result: SessionInputResponse;
+        try {
+          result = await api.sendInput(session.id, input);
+        } catch (error) {
+          setQuickInputPhase(session.id, inputId, "error", {
+            message: error instanceof Error ? error.message : "send failed"
+          });
+          scheduleQuickInputTimer(session.id, () => clearQuickInputStatus(session.id, inputId), QUICK_INPUT_ERROR_CLEAR_MS);
+          throw error;
         }
-        await loadSessions();
-        window.setTimeout(() => {
-          void api
-            .preview(session.id, settings.previewLines, previewMaxChars)
-            .then((preview) => setPreviews((current) => ({ ...current, [session.id]: preview })))
-            .catch(() => undefined);
-        }, 900);
+
+        setQuickInputPhase(session.id, inputId, "sent", { inputSeq: result.inputSeq });
+        const preview = previewFromInputResponse(session.id, result, previewsRef.current[session.id]);
+        if (preview) {
+          applySessionPreview(session.id, preview, false);
+        }
+        void loadSessions();
+        scheduleQuickInputTimer(session.id, () => {
+          setQuickInputPhase(session.id, inputId, "echoing", { inputSeq: result.inputSeq });
+        }, QUICK_INPUT_ECHO_DELAY_MS);
+        scheduleQuickInputTimer(session.id, () => {
+          void refreshSessionPreview(session.id, false)
+            .then(() => {
+              setQuickInputPhase(session.id, inputId, "updated", { inputSeq: result.inputSeq });
+              scheduleQuickInputTimer(
+                session.id,
+                () => clearQuickInputStatus(session.id, inputId),
+                QUICK_INPUT_UPDATED_CLEAR_MS
+              );
+            })
+            .catch((error) => {
+              setQuickInputPhase(session.id, inputId, "error", {
+                inputSeq: result.inputSeq,
+                message: error instanceof Error ? error.message : "preview refresh failed"
+              });
+              scheduleQuickInputTimer(session.id, () => clearQuickInputStatus(session.id, inputId), QUICK_INPUT_ERROR_CLEAR_MS);
+            });
+        }, QUICK_INPUT_REFRESH_RETRY_MS);
       }}
       onPasteFiles={async (files) => {
         const result = await api.uploadSessionFiles(session.id, files);
@@ -1241,21 +1419,21 @@ export function App() {
             setEditorSession(null);
             await loadSessions();
             if (terminalToOpen) {
-              setCachedTerminal(terminalToOpen);
+              cacheTerminal(terminalToOpen);
               setActiveTerminal(terminalToOpen);
             }
           }}
         />
       )}
 
-      {cachedTerminal && (
+      {cachedTerminals.map((terminal) => (
         <TerminalDock
-          key={cachedTerminal.id}
-          session={cachedTerminal}
-          visible={activeTerminal?.id === cachedTerminal.id}
+          key={terminal.id}
+          session={terminal}
+          visible={activeTerminal?.id === terminal.id}
           onClose={() => setActiveTerminal(null)}
         />
-      )}
+      ))}
 
       {settingsOpen && (
         <SettingsModal

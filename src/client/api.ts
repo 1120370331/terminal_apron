@@ -13,6 +13,28 @@ import type {
   UpdateSessionInput
 } from "../shared/types";
 
+export type SessionInputAckStatus = "accepted" | "error";
+
+export type SessionInputRequestBody = SessionInputRequest & {
+  inputId?: string;
+  lines?: number;
+  maxChars?: number;
+  includePreview?: boolean;
+};
+
+export interface SessionInputResponse {
+  ok: boolean;
+  inputId: string;
+  inputSeq: number;
+  status: SessionInputAckStatus;
+  message?: string;
+  runtime?: TerminalSession["runtime"];
+  preview?: string;
+  grid?: SessionPreview["grid"];
+  signature?: string;
+  capturedAt?: string;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -112,14 +134,8 @@ export const api = {
     request<TerminalSession>(`/api/sessions/${id}/ensure`, {
       method: "POST"
     }),
-  sendInput: (id: string, input: SessionInputRequest) =>
-    request<{
-      ok: boolean;
-      runtime?: TerminalSession["runtime"];
-      preview?: string;
-      grid?: SessionPreview["grid"];
-      signature?: string;
-    }>(`/api/sessions/${id}/input`, {
+  sendInput: (id: string, input: SessionInputRequestBody) =>
+    request<SessionInputResponse>(`/api/sessions/${id}/input`, {
       method: "POST",
       body: JSON.stringify(input)
     }),

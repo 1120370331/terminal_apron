@@ -613,7 +613,7 @@ async function loadZellijTranscript(dataDir: string, sessionId: string, lines?: 
   return readTailFile(transcriptPath, config.nativeHistoryBytes).catch(() => "");
 }
 
-function zellijTranscriptPath(dataDir: string, sessionId: string): string {
+export function zellijTranscriptPath(dataDir: string, sessionId: string): string {
   return path.join(dataDir, "transcripts", `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.ansi`);
 }
 

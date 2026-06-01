@@ -34,9 +34,20 @@ import {
 import type { SessionPreview, TerminalPreviewGrid, TerminalPreviewSegment, TerminalSession } from "../../shared/types";
 import { filesFromClipboardData, readClipboardFiles, readClipboardText, writeClipboardText } from "../clipboard";
 
+export type QuickInputPhase = "sending" | "sent" | "echoing" | "updated" | "error";
+
+export interface QuickInputStatus {
+  inputId: string;
+  phase: QuickInputPhase;
+  inputSeq?: number;
+  message?: string;
+  updatedAt: number;
+}
+
 interface Props {
   session: TerminalSession;
   preview?: SessionPreview;
+  quickInputStatus?: QuickInputStatus;
   previewFontSize: number;
   previewScale: number;
   onOpen: () => void;
@@ -61,6 +72,7 @@ const MOBILE_QUERY = "(max-width: 720px)";
 function SessionCardComponent({
   session,
   preview,
+  quickInputStatus,
   previewFontSize,
   previewScale,
   onOpen,
@@ -84,7 +96,6 @@ function SessionCardComponent({
   const [hasPendingPreview, setHasPendingPreview] = useState(false);
   const [selectMode, setSelectMode] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [inputFocused, setInputFocused] = useState(false);
   const previewRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const quickInputRef = useRef<HTMLInputElement | null>(null);
@@ -92,6 +103,7 @@ function SessionCardComponent({
   const copiedTimerRef = useRef<number | null>(null);
   const composingRef = useRef(false);
   const stickToBottomRef = useRef(true);
+  const userPreviewScrollRef = useRef(false);
   const deferredPreview = useDeferredValue(displayedPreview);
   const output = deferredPreview?.text || (isLive ? "" : "terminal is not running");
   const grid = deferredPreview?.grid;
@@ -104,13 +116,29 @@ function SessionCardComponent({
   const previewStyle = {
     "--list-terminal-font-size": `${terminalFontSize * terminalScale}px`
   } as CSSProperties;
+  const quickInputPhase = quickInputStatus?.phase;
+  const inputControlsDisabled = sending || uploading || quickInputPhase === "sending";
+  const quickStatusLabel = quickInputPhase ? quickInputStatusLabel(quickInputPhase) : sending ? "sending" : uploading ? "uploading" : "";
+  const quickStatusClass = quickInputPhase ?? (sending || uploading ? "sending" : "sent");
+  const quickStatusTitle = quickInputStatus
+    ? [quickInputStatus.message, quickInputStatus.inputSeq ? `seq ${quickInputStatus.inputSeq}` : quickInputStatus.inputId]
+        .filter(Boolean)
+        .join(" / ")
+    : quickStatusLabel;
+  const cardClassName = [
+    "session-card",
+    session.archived ? "archived" : "",
+    quickInputPhase ? `quick-input-${quickInputPhase}` : ""
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   useEffect(() => {
     if (!preview && !displayedPreview) {
       return;
     }
 
-    if (historyPaused || inputFocused) {
+    if (historyPaused) {
       if (previewSignature(preview) !== previewSignature(displayedPreview)) {
         setHasPendingPreview(true);
       }
@@ -119,7 +147,7 @@ function SessionCardComponent({
 
     setDisplayedPreview(preview);
     setHasPendingPreview(false);
-  }, [displayedPreview, historyPaused, inputFocused, preview]);
+  }, [displayedPreview, historyPaused, preview]);
 
   useLayoutEffect(() => {
     const previewElement = previewRef.current;
@@ -183,10 +211,15 @@ function SessionCardComponent({
     const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
     const isAtBottom = distanceToBottom < 24;
     stickToBottomRef.current = isAtBottom;
-    setHistoryPaused(target.scrollHeight > target.clientHeight && !isAtBottom);
     if (isAtBottom) {
+      userPreviewScrollRef.current = false;
+      setHistoryPaused(false);
       setHasPendingPreview(false);
+      return;
     }
+
+    const shouldPause = target.scrollHeight > target.clientHeight && (userPreviewScrollRef.current || selectMode);
+    setHistoryPaused(shouldPause);
   };
 
   const handlePreviewWheel = (event: WheelEvent<HTMLDivElement>) => {
@@ -197,6 +230,7 @@ function SessionCardComponent({
       return;
     }
 
+    userPreviewScrollRef.current = true;
     event.stopPropagation();
     if (canScrollX && (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY))) {
       event.preventDefault();
@@ -219,6 +253,7 @@ function SessionCardComponent({
   };
 
   const resumeLatestPreview = () => {
+    userPreviewScrollRef.current = false;
     stickToBottomRef.current = true;
     setHistoryPaused(false);
     setDisplayedPreview(preview);
@@ -291,7 +326,7 @@ function SessionCardComponent({
       quickInputRef.current?.focus();
       return;
     }
-    if (sending || uploading) {
+    if (inputControlsDisabled) {
       return;
     }
 
@@ -351,7 +386,7 @@ function SessionCardComponent({
       return;
     }
     const value = (quickInputRef.current?.value ?? quickInput).trimEnd();
-    if (!value || sending || uploading) {
+    if (!value || inputControlsDisabled) {
       return;
     }
 
@@ -359,13 +394,15 @@ function SessionCardComponent({
     try {
       await onQuickInput(value);
       setQuickInput("");
+    } catch {
+      // Parent owns the visible error state; keep the input so it can be retried.
     } finally {
       setSending(false);
     }
   };
 
   return (
-    <article className={session.archived ? "session-card archived" : "session-card"}>
+    <article className={cardClassName}>
       <div className="session-accent" style={{ background: session.color }} />
       <header className="session-card-header">
         <button className="drag-handle" type="button" title="拖拽排列">
@@ -416,7 +453,12 @@ function SessionCardComponent({
           ref={previewRef}
           onScroll={trackPreviewScroll}
           onWheel={handlePreviewWheel}
-          onMouseDown={(event) => event.stopPropagation()}
+          onMouseDown={(event) => {
+            event.stopPropagation();
+            if (selectMode) {
+              userPreviewScrollRef.current = true;
+            }
+          }}
           onTouchStart={(event) => event.stopPropagation()}
         >
           {showCanvas ? (
@@ -442,10 +484,12 @@ function SessionCardComponent({
         <form className="quick-input" onSubmit={submitQuickInput} onMouseDown={(event) => event.stopPropagation()}>
           <input
             ref={quickInputRef}
+            id={`quick-input-${session.id}`}
+            name={`quick-input-${session.id}`}
+            autoComplete="off"
+            spellCheck={false}
             value={quickInput}
             onChange={(event) => setQuickInput(event.target.value)}
-            onFocus={() => setInputFocused(true)}
-            onBlur={() => setInputFocused(false)}
             onPaste={(event) => void pasteFilesToInput(event)}
             onCompositionStart={() => {
               composingRef.current = true;
@@ -454,7 +498,7 @@ function SessionCardComponent({
               composingRef.current = false;
             }}
             placeholder="Type to terminal..."
-            disabled={sending || uploading}
+            disabled={inputControlsDisabled}
           />
           <input
             ref={fileInputRef}
@@ -466,7 +510,7 @@ function SessionCardComponent({
           <button
             className="icon-button small"
             type="button"
-            disabled={sending || uploading}
+            disabled={inputControlsDisabled}
             title="Attach image or file"
             onClick={() => fileInputRef.current?.click()}
           >
@@ -475,15 +519,20 @@ function SessionCardComponent({
           <button
             className="icon-button small"
             type="button"
-            disabled={sending || uploading}
+            disabled={inputControlsDisabled}
             title="Paste clipboard text or image"
             onClick={() => void pasteClipboardToInput()}
           >
             <ClipboardPaste size={15} />
           </button>
-          <button className="icon-button small" type="submit" disabled={sending || uploading || !quickInput.trim()} title="Send">
+          <button className="icon-button small" type="submit" disabled={inputControlsDisabled || !quickInput.trim()} title="Send">
             <Send size={15} />
           </button>
+          {quickStatusLabel && (
+            <span className={`quick-input-status ${quickStatusClass}`} title={quickStatusTitle} aria-live="polite">
+              {quickStatusLabel}
+            </span>
+          )}
         </form>
       )}
 
@@ -538,8 +587,32 @@ function areSessionCardPropsEqual(previous: Props, next: Props): boolean {
     previous.previewFontSize === next.previewFontSize &&
     previous.previewScale === next.previewScale &&
     previewSignature(previous.preview) === previewSignature(next.preview) &&
+    quickInputStatusSignature(previous.quickInputStatus) === quickInputStatusSignature(next.quickInputStatus) &&
     sessionCardSignature(previous.session) === sessionCardSignature(next.session)
   );
+}
+
+function quickInputStatusLabel(phase: QuickInputPhase): string {
+  if (phase === "sent") {
+    return "sent";
+  }
+  if (phase === "echoing") {
+    return "echoing";
+  }
+  if (phase === "updated") {
+    return "updated";
+  }
+  if (phase === "error") {
+    return "error";
+  }
+  return "sending";
+}
+
+function quickInputStatusSignature(status?: QuickInputStatus): string {
+  if (!status) {
+    return "";
+  }
+  return [status.inputId, status.phase, status.inputSeq ?? "", status.message ?? "", status.updatedAt].join("\u001f");
 }
 
 function previewSignature(preview?: SessionPreview): string {

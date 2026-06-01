@@ -3,10 +3,24 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { io, type Socket } from "socket.io-client";
-import { Check, Clipboard, ClipboardPaste, RefreshCw, X } from "lucide-react";
+import { ArrowDownToLine, Check, Clipboard, ClipboardPaste, History, RefreshCw, X } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
 import { api } from "../api";
 import { filesFromClipboardData, readClipboardFiles, readClipboardText, writeClipboardText } from "../clipboard";
+import {
+  TERMINAL_PROTOCOL_VERSION,
+  type TerminalDataKind,
+  type TerminalProtocolVersion,
+  isProtocolV2Ready,
+  normalizeTerminalData,
+  normalizeTerminalError,
+  normalizeTerminalFlow,
+  normalizeTerminalHistoryChunk,
+  normalizeTerminalHistoryInit,
+  normalizeTerminalInputAck,
+  normalizeTerminalReady,
+  normalizeTerminalState
+} from "../terminalProtocol";
 
 interface Props {
   session: TerminalSession;
@@ -20,31 +34,211 @@ const ZELLIJ_WEB_ROWS = 36;
 const TERMINAL_SCROLLBACK_ROWS = 200_000;
 const TERMINAL_INPUT_BATCH_MS = 12;
 const TERMINAL_WRITE_CHUNK_CHARS = 8192;
+const TERMINAL_HISTORY_REQUEST_LINES = 800;
+const TERMINAL_HISTORY_REQUEST_MAX_BYTES = 256_000;
+const TERMINAL_HISTORY_PREVIEW_MAX_CHARS = 80_000;
+
+type LatestHistoryStatus = "waiting" | "loading" | "ready" | "error";
+type OlderHistoryStatus = "idle" | "loading" | "ready" | "exhausted" | "error";
+type TerminalWriteKind = "latest" | TerminalDataKind;
+
+interface TerminalHistoryMeta {
+  latest: LatestHistoryStatus;
+  older: OlderHistoryStatus;
+  canLoadOlder: boolean;
+  hasMoreBefore: boolean;
+  olderLoadedBytes: number;
+}
+
+interface TerminalFlowMeta {
+  paused: boolean;
+  reason?: string;
+}
+
+interface TerminalHistoryCursor {
+  oldestLine?: number;
+  newestLine?: number;
+  beforeOffset?: number;
+}
+
+interface TerminalWriteItem {
+  chunks: string[];
+  chunkIndex: number;
+  kind: TerminalWriteKind;
+  seq?: number;
+  streamId?: string;
+  onComplete?: () => void;
+}
 
 export function TerminalDock({ session, visible, onClose }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<Socket | null>(null);
+  const clientIdRef = useRef(makeTerminalClientId(session.id));
+  const protocolVersionRef = useRef<TerminalProtocolVersion>(1);
+  const streamIdRef = useRef<string | null>(null);
   const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const resizeSeqRef = useRef(0);
+  const resizeAckSeqRef = useRef(0);
   const lastAckSeqRef = useRef(0);
   const resizeRetryRef = useRef(0);
   const copiedTimerRef = useRef<number | null>(null);
   const inputBufferRef = useRef("");
   const inputFlushTimerRef = useRef<number | null>(null);
-  const writeQueueRef = useRef<string[]>([]);
+  const latestWriteQueueRef = useRef<TerminalWriteItem[]>([]);
+  const liveWriteQueueRef = useRef<TerminalWriteItem[]>([]);
+  const historyWriteQueueRef = useRef<TerminalWriteItem[]>([]);
+  const currentWriteRef = useRef<TerminalWriteItem | null>(null);
   const writeInProgressRef = useRef(false);
   const writeTimerRef = useRef<number | null>(null);
+  const writeQueueBytesRef = useRef(0);
   const uploadingRef = useRef(false);
+  const inputSeqRef = useRef(0);
+  const pendingInputIdsRef = useRef<Set<string>>(new Set());
+  const historyCursorRef = useRef<TerminalHistoryCursor>({});
+  const activeHistoryRequestRef = useRef<string | null>(null);
+  const hasMoreBeforeRef = useRef(false);
+  const historyLoadingRef = useRef(false);
+  const atBottomRef = useRef(true);
+  const receivedHistoryInitRef = useRef(false);
   const [attachCommand, setAttachCommand] = useState<string | null>(null);
   const [backend, setBackend] = useState(session.runtime?.backend ?? session.backend);
   const [status, setStatus] = useState("connecting");
   const [copied, setCopied] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [writeQueueBytes, setWriteQueueBytes] = useState(0);
+  const [pendingInputCount, setPendingInputCount] = useState(0);
+  const [newOutputAvailable, setNewOutputAvailable] = useState(false);
+  const [historyPreviewOpen, setHistoryPreviewOpen] = useState(false);
+  const [olderHistoryPreview, setOlderHistoryPreview] = useState("");
+  const [flowMeta, setFlowMeta] = useState<TerminalFlowMeta>({ paused: false });
+  const [historyMeta, setHistoryMeta] = useState<TerminalHistoryMeta>({
+    latest: "waiting",
+    older: "idle",
+    canLoadOlder: false,
+    hasMoreBefore: false,
+    olderLoadedBytes: 0
+  });
   const isMobileClient = typeof window !== "undefined" && window.matchMedia(MOBILE_QUERY).matches;
   const usesStableZellijWidth =
     !isMobileClient && (backend === "zellij" || session.backend === "zellij" || session.backend === "auto");
+
+  const updateWriteQueueBytes = useCallback((delta: number) => {
+    writeQueueBytesRef.current = Math.max(0, writeQueueBytesRef.current + delta);
+    setWriteQueueBytes(writeQueueBytesRef.current);
+  }, []);
+
+  const sendTerminalAck = useCallback(
+    (seq?: number, streamId?: string) => {
+      if (typeof seq !== "number") {
+        return;
+      }
+
+      lastAckSeqRef.current = Math.max(lastAckSeqRef.current, seq);
+      const socket = socketRef.current;
+      if (!socket?.connected) {
+        return;
+      }
+
+      socket.emit("terminal:ack", {
+        sessionId: session.id,
+        streamId: streamId || streamIdRef.current || "",
+        seq,
+        renderedAt: Date.now(),
+        writeQueueBytes: writeQueueBytesRef.current
+      });
+    },
+    [session.id]
+  );
+
+  const emitTerminalInput = useCallback(
+    (data: string, mode: "type" | "paste" = "type") => {
+      const socket = socketRef.current;
+      if (!socket?.connected) {
+        setStatus("disconnected");
+        return;
+      }
+
+      if (protocolVersionRef.current >= TERMINAL_PROTOCOL_VERSION) {
+        inputSeqRef.current += 1;
+        const inputId = `${clientIdRef.current}-${inputSeqRef.current}`;
+        pendingInputIdsRef.current.add(inputId);
+        setPendingInputCount(pendingInputIdsRef.current.size);
+        socket.emit("terminal:input", {
+          sessionId: session.id,
+          inputId,
+          data,
+          mode
+        });
+        return;
+      }
+
+      socket.emit("terminal:input", data);
+    },
+    [session.id]
+  );
+
+  const cancelHistoryRequest = useCallback(
+    (nextStatus: OlderHistoryStatus = "idle") => {
+      const requestId = activeHistoryRequestRef.current;
+      if (!requestId) {
+        return;
+      }
+
+      activeHistoryRequestRef.current = null;
+      historyLoadingRef.current = false;
+      socketRef.current?.emit("terminal:history:cancel", {
+        sessionId: session.id,
+        requestId
+      });
+      setHistoryMeta((current) => ({ ...current, older: nextStatus }));
+    },
+    [session.id]
+  );
+
+  const requestOlderHistory = useCallback(
+    (source: "button" | "scroll" = "button") => {
+      const socket = socketRef.current;
+      if (!socket?.connected || historyLoadingRef.current || !hasMoreBeforeRef.current) {
+        return;
+      }
+
+      const requestId = `${clientIdRef.current}-history-${Date.now()}-${source}`;
+      activeHistoryRequestRef.current = requestId;
+      historyLoadingRef.current = true;
+      setHistoryMeta((current) => ({ ...current, older: "loading" }));
+      if (source === "button") {
+        setHistoryPreviewOpen(true);
+      }
+      socket.emit("terminal:history:request", {
+        sessionId: session.id,
+        requestId,
+        beforeLine: historyCursorRef.current.oldestLine,
+        beforeOffset: historyCursorRef.current.beforeOffset,
+        limitLines: TERMINAL_HISTORY_REQUEST_LINES,
+        maxBytes: TERMINAL_HISTORY_REQUEST_MAX_BYTES,
+        format: "ansi"
+      });
+    },
+    [session.id]
+  );
+
+  const jumpToLiveOutput = useCallback(() => {
+    const terminal = termRef.current;
+    if (!terminal) {
+      return;
+    }
+    terminal.scrollToBottom();
+    atBottomRef.current = true;
+    setNewOutputAvailable(false);
+    terminal.focus();
+    socketRef.current?.emit("terminal:visibility", {
+      sessionId: session.id,
+      visible,
+      atBottom: true
+    });
+  }, [session.id, visible]);
 
   const refitTerminal = useCallback((force = false) => {
     const terminal = termRef.current;
@@ -120,8 +314,8 @@ export function TerminalDock({ session, visible, onClose }: Props) {
     }
 
     inputBufferRef.current = "";
-    socketRef.current?.emit("terminal:input", data);
-  }, []);
+    emitTerminalInput(data, "type");
+  }, [emitTerminalInput]);
 
   const sendTerminalInput = useCallback(
     (data: string) => {
@@ -131,7 +325,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
 
       if (shouldSendTerminalInputImmediately(data)) {
         flushTerminalInput();
-        socketRef.current?.emit("terminal:input", data);
+        emitTerminalInput(data, data.length > 1 ? "paste" : "type");
         return;
       }
 
@@ -140,7 +334,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
         inputFlushTimerRef.current = window.setTimeout(flushTerminalInput, TERMINAL_INPUT_BATCH_MS);
       }
     },
-    [flushTerminalInput]
+    [emitTerminalInput, flushTerminalInput]
   );
 
   const pasteFilesToTerminal = useCallback(
@@ -185,17 +379,117 @@ export function TerminalDock({ session, visible, onClose }: Props) {
     }
   }, [pasteFilesToTerminal, sendTerminalInput]);
 
-  const enqueueTerminalWrite = useCallback((terminal: Terminal, data: string) => {
-    if (!data) {
-      return;
+  const recordOlderHistoryPreview = useCallback((ansi: string) => {
+    if (!ansi) {
+      return 0;
     }
 
-    writeQueueRef.current.push(...chunkTerminalWrite(data));
-    if (!writeInProgressRef.current) {
-      writeInProgressRef.current = true;
-      pumpTerminalWrites(terminal, writeQueueRef, writeInProgressRef, writeTimerRef);
-    }
+    const byteLength = utf8ByteLength(ansi);
+    const plain = stripAnsiForHistoryPreview(ansi);
+    setOlderHistoryPreview((current) => trimHistoryPreview(`${current}${plain}`));
+    return byteLength;
   }, []);
+
+  const pumpTerminalWrites = useCallback(
+    function pump(terminal: Terminal): void {
+      let item = currentWriteRef.current;
+      if (!item) {
+        item =
+          latestWriteQueueRef.current.shift() ??
+          liveWriteQueueRef.current.shift() ??
+          historyWriteQueueRef.current.shift() ??
+          null;
+        currentWriteRef.current = item;
+      }
+
+      if (!item) {
+        writeInProgressRef.current = false;
+        return;
+      }
+
+      const chunk = item.chunks[item.chunkIndex];
+      if (!chunk) {
+        currentWriteRef.current = null;
+        item.onComplete?.();
+        sendTerminalAck(item.seq, item.streamId);
+        writeTimerRef.current = window.setTimeout(() => {
+          writeTimerRef.current = null;
+          pump(terminal);
+        }, 0);
+        return;
+      }
+
+      item.chunkIndex += 1;
+      try {
+        terminal.write(chunk, () => {
+          updateWriteQueueBytes(-utf8ByteLength(chunk));
+
+          if (item.chunkIndex >= item.chunks.length) {
+            currentWriteRef.current = null;
+            item.onComplete?.();
+            sendTerminalAck(item.seq, item.streamId);
+          } else if (
+            item.kind === "history" &&
+            (latestWriteQueueRef.current.length > 0 || liveWriteQueueRef.current.length > 0)
+          ) {
+            currentWriteRef.current = null;
+            historyWriteQueueRef.current.unshift(item);
+          }
+
+          writeTimerRef.current = window.setTimeout(() => {
+            writeTimerRef.current = null;
+            pump(terminal);
+          }, 0);
+        });
+      } catch {
+        latestWriteQueueRef.current = [];
+        liveWriteQueueRef.current = [];
+        historyWriteQueueRef.current = [];
+        currentWriteRef.current = null;
+        writeInProgressRef.current = false;
+        updateWriteQueueBytes(-writeQueueBytesRef.current);
+      }
+    },
+    [sendTerminalAck, updateWriteQueueBytes]
+  );
+
+  const enqueueTerminalWrite = useCallback(
+    (
+      terminal: Terminal,
+      data: string,
+      options: { kind?: TerminalWriteKind; seq?: number; streamId?: string; onComplete?: () => void } = {}
+    ) => {
+      if (!data) {
+        options.onComplete?.();
+        sendTerminalAck(options.seq, options.streamId);
+        return;
+      }
+
+      const item: TerminalWriteItem = {
+        chunks: chunkTerminalWrite(data),
+        chunkIndex: 0,
+        kind: options.kind ?? "live",
+        seq: options.seq,
+        streamId: options.streamId,
+        onComplete: options.onComplete
+      };
+      updateWriteQueueBytes(utf8ByteLength(data));
+
+      if (item.kind === "latest") {
+        latestWriteQueueRef.current.push(item);
+      } else if (item.kind === "history") {
+        historyWriteQueueRef.current.push(item);
+      } else {
+        liveWriteQueueRef.current.push(item);
+      }
+
+      if (!writeInProgressRef.current) {
+        writeInProgressRef.current = true;
+        pumpTerminalWrites(terminal);
+      }
+    },
+    [pumpTerminalWrites, sendTerminalAck, updateWriteQueueBytes]
+  );
 
   useEffect(() => {
     return () => {
@@ -208,16 +502,35 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       if (writeTimerRef.current) {
         window.clearTimeout(writeTimerRef.current);
       }
-      writeQueueRef.current = [];
+      latestWriteQueueRef.current = [];
+      liveWriteQueueRef.current = [];
+      historyWriteQueueRef.current = [];
+      currentWriteRef.current = null;
+      writeQueueBytesRef.current = 0;
       writeInProgressRef.current = false;
     };
   }, []);
 
   useEffect(() => {
     if (!visible) {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && hostRef.current?.contains(active)) {
+        active.blur();
+      }
+      cancelHistoryRequest("idle");
+      socketRef.current?.emit("terminal:visibility", {
+        sessionId: session.id,
+        visible: false,
+        atBottom: atBottomRef.current
+      });
       return;
     }
 
+    socketRef.current?.emit("terminal:visibility", {
+      sessionId: session.id,
+      visible: true,
+      atBottom: atBottomRef.current
+    });
     refitTerminal(true);
     termRef.current?.focus();
     const timers = [
@@ -225,7 +538,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       window.setTimeout(() => refitTerminal(true), 260)
     ];
     return () => timers.forEach((timer) => window.clearTimeout(timer));
-  }, [refitTerminal, visible]);
+  }, [cancelHistoryRequest, refitTerminal, session.id, visible]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -279,10 +592,16 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       transports: ["websocket", "polling"],
       rememberUpgrade: true,
       query: {
+        protocolVersion: String(TERMINAL_PROTOCOL_VERSION),
         sessionId: session.id,
+        clientId: clientIdRef.current,
         cols: terminal.cols,
         rows: terminal.rows,
-        clientProfile: isMobileClient ? "mobile" : "desktop"
+        clientProfile: isMobileClient ? "mobile" : "desktop",
+        mode: "interactive",
+        lastAckSeq: String(lastAckSeqRef.current),
+        historyPolicy: "viewport",
+        tailLines: "500"
       }
     });
 
@@ -290,24 +609,160 @@ export function TerminalDock({ session, visible, onClose }: Props) {
 
     socket.on("connect", () => {
       setStatus("connected");
+      socket.emit("terminal:visibility", {
+        sessionId: session.id,
+        visible,
+        atBottom: atBottomRef.current
+      });
       refitTerminal(true);
     });
-    socket.on("terminal:ready", (payload: { attachCommand: string | null; backend?: string }) => {
-      setAttachCommand(payload.attachCommand);
-      if (payload.backend) {
-        setBackend(payload.backend as "zellij");
+    socket.on("terminal:ready", (payload: unknown) => {
+      const frame = normalizeTerminalReady(payload);
+      protocolVersionRef.current = isProtocolV2Ready(frame) ? 2 : 1;
+      streamIdRef.current = frame.streamId ?? streamIdRef.current;
+      setAttachCommand(frame.attachCommand ?? null);
+      if (frame.backend) {
+        setBackend(frame.backend as "zellij");
       }
+      hasMoreBeforeRef.current = Boolean(frame.canLoadOlderHistory);
+      setHistoryMeta((current) => ({
+        ...current,
+        latest: protocolVersionRef.current >= 2 ? "loading" : "ready",
+        canLoadOlder: Boolean(frame.canLoadOlderHistory),
+        hasMoreBefore: Boolean(frame.canLoadOlderHistory)
+      }));
+      setStatus(protocolVersionRef.current >= 2 ? "loading latest screen" : "connected");
       window.setTimeout(() => refitTerminal(true), 0);
     });
-    socket.on("terminal:data", (data: string) => {
-      enqueueTerminalWrite(terminal, data);
+    socket.on("terminal:history:init", (payload: unknown) => {
+      const frame = normalizeTerminalHistoryInit(payload);
+      if (!frame) {
+        return;
+      }
+      streamIdRef.current = frame.streamId ?? streamIdRef.current;
+      historyCursorRef.current = {
+        oldestLine: frame.oldestLine,
+        newestLine: frame.newestLine
+      };
+      hasMoreBeforeRef.current = frame.hasMoreBefore;
+      receivedHistoryInitRef.current = true;
+      setHistoryMeta((current) => ({
+        ...current,
+        latest: "loading",
+        canLoadOlder: current.canLoadOlder || frame.hasMoreBefore,
+        hasMoreBefore: frame.hasMoreBefore,
+        older: frame.hasMoreBefore ? current.older : "exhausted"
+      }));
+
+      const latestAnsi = `${frame.tailAnsi ?? ""}${frame.viewportAnsi}`;
+      terminal.clear();
+      enqueueTerminalWrite(terminal, latestAnsi, {
+        kind: "latest",
+        seq: frame.snapshotSeq,
+        streamId: frame.streamId,
+        onComplete: () => {
+          setHistoryMeta((current) => ({ ...current, latest: "ready" }));
+          setStatus("live");
+          terminal.scrollToBottom();
+          atBottomRef.current = true;
+          setNewOutputAvailable(false);
+        }
+      });
+    });
+    socket.on("terminal:history:chunk", (payload: unknown) => {
+      const frame = normalizeTerminalHistoryChunk(payload);
+      if (!frame) {
+        return;
+      }
+      if (frame.requestId && activeHistoryRequestRef.current && frame.requestId !== activeHistoryRequestRef.current) {
+        return;
+      }
+
+      const loadedBytes = recordOlderHistoryPreview(frame.ansi);
+      historyCursorRef.current = {
+        ...historyCursorRef.current,
+        oldestLine: frame.fromLine ?? historyCursorRef.current.oldestLine,
+        beforeOffset: frame.fromOffset ?? historyCursorRef.current.beforeOffset
+      };
+      activeHistoryRequestRef.current = null;
+      historyLoadingRef.current = false;
+      hasMoreBeforeRef.current = frame.hasMoreBefore;
+      setHistoryMeta((current) => ({
+        ...current,
+        olderLoadedBytes: current.olderLoadedBytes + loadedBytes,
+        older: frame.hasMoreBefore ? "ready" : "exhausted",
+        hasMoreBefore: frame.hasMoreBefore,
+        canLoadOlder: current.canLoadOlder || frame.hasMoreBefore
+      }));
+    });
+    socket.on("terminal:data", (payload: unknown) => {
+      const frame = normalizeTerminalData(payload);
+      if (!frame) {
+        return;
+      }
+
+      streamIdRef.current = frame.streamId ?? streamIdRef.current;
+      if (frame.kind === "history") {
+        const loadedBytes = recordOlderHistoryPreview(frame.data);
+        setHistoryMeta((current) => ({
+          ...current,
+          olderLoadedBytes: current.olderLoadedBytes + loadedBytes,
+          older: "ready"
+        }));
+        return;
+      }
+
+      if (!atBottomRef.current) {
+        setNewOutputAvailable(true);
+      }
+      setStatus("live");
+      setHistoryMeta((current) => ({
+        ...current,
+        latest: receivedHistoryInitRef.current ? current.latest : "ready"
+      }));
+      enqueueTerminalWrite(terminal, frame.data, {
+        kind: "live",
+        seq: frame.seq,
+        streamId: frame.streamId
+      });
+    });
+    socket.on("terminal:state", (payload: unknown) => {
+      const frame = normalizeTerminalState(payload);
+      if (!frame) {
+        return;
+      }
+      setStatus(frame.state);
+    });
+    socket.on("terminal:flow", (payload: unknown) => {
+      const frame = normalizeTerminalFlow(payload);
+      if (!frame) {
+        return;
+      }
+      setFlowMeta({ paused: frame.paused, reason: frame.reason });
+      setHistoryMeta((current) => ({
+        ...current,
+        older: frame.paused && current.older === "loading" ? "idle" : current.older
+      }));
+    });
+    socket.on("terminal:input:ack", (payload: unknown) => {
+      const frame = normalizeTerminalInputAck(payload);
+      if (!frame) {
+        return;
+      }
+      if (frame.inputId) {
+        pendingInputIdsRef.current.delete(frame.inputId);
+        setPendingInputCount(pendingInputIdsRef.current.size);
+      }
+      if (!frame.accepted) {
+        setStatus(frame.message || "input rejected");
+      }
     });
     socket.on("terminal:resized", (size: { cols?: number; rows?: number; seq?: number }) => {
       if (typeof size.seq === "number") {
-        if (size.seq < lastAckSeqRef.current) {
+        if (size.seq < resizeAckSeqRef.current) {
           return;
         }
-        lastAckSeqRef.current = size.seq;
+        resizeAckSeqRef.current = size.seq;
       }
       const local = sizeRef.current;
       const ackCols = Number(size.cols);
@@ -329,15 +784,18 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       resizeRetryRef.current = 0;
       terminal.refresh(0, Math.max(0, terminal.rows - 1));
     });
-    socket.on("terminal:error", (message: string) => {
-      setStatus(message);
-      terminal.writeln(`\r\n[terminal error] ${message}`);
+    socket.on("terminal:error", (payload: unknown) => {
+      const error = normalizeTerminalError(payload);
+      setStatus(error.message);
+      setHistoryMeta((current) => ({ ...current, latest: current.latest === "ready" ? "ready" : "error" }));
+      terminal.writeln(`\r\n[terminal error] ${error.message}`);
     });
     socket.on("terminal:exit", () => {
       setStatus("detached");
     });
     socket.on("disconnect", () => {
       setStatus("disconnected");
+      setFlowMeta({ paused: false });
     });
 
     const inputFilter = createTerminalInputFilter();
@@ -350,6 +808,23 @@ export function TerminalDock({ session, visible, onClose }: Props) {
     const resizeDisposable = terminal.onResize(() => {
       if (socket.connected) {
         emitResize(socket, terminal);
+      }
+    });
+    const scrollDisposable = terminal.onScroll((viewportY) => {
+      const atBottom = isTerminalScrolledToBottom(terminal);
+      if (atBottomRef.current !== atBottom) {
+        atBottomRef.current = atBottom;
+        socket.emit("terminal:visibility", {
+          sessionId: session.id,
+          visible,
+          atBottom
+        });
+      }
+      if (atBottom) {
+        setNewOutputAvailable(false);
+      }
+      if (!atBottom && viewportY <= 2) {
+        requestOlderHistory("scroll");
       }
     });
 
@@ -400,12 +875,18 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       window.clearInterval(sizeTimer);
       disposable.dispose();
       resizeDisposable.dispose();
+      scrollDisposable.dispose();
       flushTerminalInput();
+      cancelHistoryRequest("idle");
       if (writeTimerRef.current) {
         window.clearTimeout(writeTimerRef.current);
         writeTimerRef.current = null;
       }
-      writeQueueRef.current = [];
+      latestWriteQueueRef.current = [];
+      liveWriteQueueRef.current = [];
+      historyWriteQueueRef.current = [];
+      currentWriteRef.current = null;
+      writeQueueBytesRef.current = 0;
       writeInProgressRef.current = false;
       socket.disconnect();
       terminal.dispose();
@@ -463,7 +944,38 @@ export function TerminalDock({ session, visible, onClose }: Props) {
           ) : (
             <code>{backend} pty</code>
           )}
-          <span className="terminal-status">{uploading ? "uploading" : status}</span>
+          <span className="terminal-status" title={flowMeta.paused ? `flow paused: ${flowMeta.reason ?? "backpressure"}` : status}>
+            {uploading ? "uploading" : flowMeta.paused ? "paused" : status}
+          </span>
+          {pendingInputCount > 0 && <span className="terminal-meta">{pendingInputCount} input</span>}
+          {writeQueueBytes > 0 && <span className="terminal-meta">{Math.ceil(writeQueueBytes / 1024)}KB queue</span>}
+          <button
+            className="icon-button"
+            type="button"
+            title={
+              historyMeta.older === "loading"
+                ? "Loading older history"
+                : historyMeta.hasMoreBefore
+                  ? "Load older history"
+                  : "No older history"
+            }
+            disabled={historyMeta.older === "loading" || !historyMeta.hasMoreBefore}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => requestOlderHistory("button")}
+          >
+            <History size={17} />
+          </button>
+          {newOutputAvailable && (
+            <button
+              className="icon-button terminal-live-jump"
+              type="button"
+              title="Jump to latest output"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={jumpToLiveOutput}
+            >
+              <ArrowDownToLine size={17} />
+            </button>
+          )}
           <button
             className="icon-button"
             type="button"
@@ -485,12 +997,36 @@ export function TerminalDock({ session, visible, onClose }: Props) {
           <button className="icon-button" type="button" title="修复显示" onClick={repairDisplay}>
             <RefreshCw size={17} />
           </button>
-          <button className="icon-button" type="button" title="关闭" onClick={onClose}>
+          <button
+            className="icon-button"
+            type="button"
+            title="关闭"
+            onClick={() => {
+              if (document.activeElement instanceof HTMLElement) {
+                document.activeElement.blur();
+              }
+              onClose();
+            }}
+          >
             <X size={18} />
           </button>
         </div>
       </header>
       <div className="terminal-host" ref={hostRef} />
+      {historyPreviewOpen && olderHistoryPreview && (
+        <aside className="terminal-history-panel">
+          <header>
+            <span>
+              older history
+              {historyMeta.olderLoadedBytes > 0 ? ` / ${Math.ceil(historyMeta.olderLoadedBytes / 1024)}KB` : ""}
+            </span>
+            <button className="icon-button small" type="button" title="Close history" onClick={() => setHistoryPreviewOpen(false)}>
+              <X size={15} />
+            </button>
+          </header>
+          <pre>{olderHistoryPreview}</pre>
+        </aside>
+      )}
     </div>
   );
 
@@ -521,6 +1057,39 @@ function normalizeTerminalDimensions(
     cols: value.cols,
     rows: value.rows
   };
+}
+
+function makeTerminalClientId(sessionId: string): string {
+  const random =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return `${sessionId}-${random}`.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+function stripAnsiForHistoryPreview(value: string): string {
+  return value
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function trimHistoryPreview(value: string): string {
+  if (value.length <= TERMINAL_HISTORY_PREVIEW_MAX_CHARS) {
+    return value;
+  }
+  const tail = value.slice(-TERMINAL_HISTORY_PREVIEW_MAX_CHARS);
+  const firstLineBreak = tail.indexOf("\n");
+  return firstLineBreak >= 0 ? tail.slice(firstLineBreak + 1) : tail;
+}
+
+function isTerminalScrolledToBottom(terminal: Terminal): boolean {
+  const buffer = terminal.buffer.active;
+  const viewportEnd = buffer.viewportY + terminal.rows;
+  return viewportEnd >= buffer.baseY + terminal.rows - 1;
 }
 
 function shouldSendTerminalInputImmediately(data: string): boolean {

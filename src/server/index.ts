@@ -75,6 +75,7 @@ const MAX_UPLOAD_FILES = 8;
 const MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024;
 const TRANSFER_DIR_NAME = "file-transfer";
 const MAX_TRANSFER_LIST_FILES = 1000;
+let acceptedInputSeq = 0;
 const uploadSessionFiles = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -329,35 +330,70 @@ app.post("/api/sessions/:id/input", async (req, res) => {
     return;
   }
 
-  const { data, enter, mode, submitDelayMs } = req.body as Partial<SessionInputRequest>;
+  const body = req.body as Partial<SessionInputRequest> & {
+    inputId?: unknown;
+    maxChars?: unknown;
+    lines?: unknown;
+    includePreview?: unknown;
+  };
+  const { data, enter, mode, submitDelayMs } = body;
+  const inputId = normalizeInputId(body.inputId);
   if (typeof data !== "string" || data.length === 0) {
-    res.status(400).json({ error: "input data is required" });
+    res.status(400).json({ error: "input data is required", inputId, status: "error" });
     return;
   }
   if (data.length > 16_000) {
-    res.status(413).json({ error: "input data is too large" });
+    res.status(413).json({ error: "input data is too large", inputId, status: "error" });
     return;
   }
 
   const inputMode = normalizeInputMode(mode);
-  await sendSessionInput(
-    session,
-    data,
-    enter !== false,
-    store.dataDir,
-    inputMode,
-    parseSubmitDelayMs(submitDelayMs, inputMode === "paste" ? 120 : 0)
-  );
-  const previewLines = parsePreviewLines(req.body?.lines);
+  const inputSeq = (acceptedInputSeq += 1);
+  try {
+    await sendSessionInput(
+      session,
+      data,
+      enter !== false,
+      store.dataDir,
+      inputMode,
+      parseSubmitDelayMs(submitDelayMs, inputMode === "paste" ? 120 : 0)
+    );
+  } catch (error) {
+    res.status(502).json({
+      ok: false,
+      inputId,
+      inputSeq,
+      status: "error",
+      error: errorMessage(error)
+    });
+    return;
+  }
+
+  if (body.includePreview === false) {
+    res.json({
+      ok: true,
+      inputId,
+      inputSeq,
+      status: "accepted",
+      capturedAt: new Date().toISOString()
+    });
+    return;
+  }
+
+  const previewLines = parsePreviewLines(body.lines);
   const previewText = await captureSessionPreview(session, store.dataDir, previewLines, false).catch(() => "");
-  const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.body?.maxChars));
+  const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(body.maxChars));
   const grid = await renderSessionPreviewGrid(session, compactPreview, previewLines, false).catch(() => undefined);
   res.json({
     ok: true,
-    runtime: await getRuntime(session, store.dataDir),
+    inputId,
+    inputSeq,
+    status: "accepted",
+    runtime: await getRuntime(session, store.dataDir).catch(() => fallbackRuntime(session)),
     preview: compactPreview,
     grid,
-    signature: previewSignature(compactPreview, grid)
+    signature: previewSignature(compactPreview, grid),
+    capturedAt: new Date().toISOString()
   });
 });
 
@@ -606,6 +642,20 @@ async function sendSessionInput(
 
 function normalizeInputMode(value: unknown): SessionInputMode {
   return value === "type" ? "type" : "paste";
+}
+
+function normalizeInputId(value: unknown): string {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (/^[a-zA-Z0-9._:-]{1,120}$/.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return crypto.randomUUID();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "input failed";
 }
 
 function parseSubmitDelayMs(value: unknown, fallback: number): number {

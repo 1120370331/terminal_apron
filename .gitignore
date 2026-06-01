@@ -2,6 +2,7 @@ node_modules/
 dist/
 data/
 .local-test-data/
+.local-test-server.pid
 tools/
 file-transfer/*
 !file-transfer/.gitkeep
