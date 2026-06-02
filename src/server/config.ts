@@ -60,6 +60,18 @@ const inferredAuthModes: AuthMethod[] = configuredUsers.some((user) => user.pass
   : configuredUsers.some((user) => userHasSshKeys(user))
     ? ["ssh"]
     : ["none"];
+const terminalHistoryMaxRangeLines = parseBoundedInteger(
+  process.env.TWM_TERMINAL_HISTORY_MAX_RANGE_LINES,
+  5_000,
+  100,
+  20_000
+);
+const terminalHistoryRangeLines = parseBoundedInteger(
+  process.env.TWM_TERMINAL_HISTORY_RANGE_LINES,
+  5_000,
+  20,
+  terminalHistoryMaxRangeLines
+);
 
 export const config = {
   host: process.env.TWM_HOST ?? process.env.HOST ?? "127.0.0.1",
@@ -96,16 +108,11 @@ export const config = {
     64_000,
     4_000_000
   ),
-  terminalHistoryRangeLines: parseBoundedInteger(process.env.TWM_TERMINAL_HISTORY_RANGE_LINES, 800, 20, 5_000),
-  terminalHistoryMaxRangeLines: parseBoundedInteger(
-    process.env.TWM_TERMINAL_HISTORY_MAX_RANGE_LINES,
-    5_000,
-    100,
-    20_000
-  ),
+  terminalHistoryRangeLines,
+  terminalHistoryMaxRangeLines,
   terminalHistoryRangeBytes: parseBoundedInteger(
     process.env.TWM_TERMINAL_HISTORY_RANGE_BYTES,
-    1_000_000,
+    4_000_000,
     64_000,
     8_000_000
   ),

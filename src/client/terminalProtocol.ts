@@ -36,6 +36,11 @@ export interface TerminalHistoryInitFrame {
   tailAnsi?: string;
   oldestLine?: number;
   newestLine?: number;
+  tailFromOffset?: number;
+  tailToOffset?: number;
+  newestOffset?: number;
+  byteLength?: number;
+  lineCount?: number;
   hasMoreBefore: boolean;
 }
 
@@ -46,6 +51,8 @@ export interface TerminalHistoryChunkFrame {
   toLine?: number;
   fromOffset?: number;
   toOffset?: number;
+  byteLength?: number;
+  lineCount?: number;
   ansi: string;
   hasMoreBefore: boolean;
 }
@@ -140,6 +147,11 @@ export function normalizeTerminalHistoryInit(payload: unknown): TerminalHistoryI
     tailAnsi,
     oldestLine: finiteNumberOrUndefined(payload.oldestLine),
     newestLine: finiteNumberOrUndefined(payload.newestLine),
+    tailFromOffset: finiteNumberOrUndefined(payload.tailFromOffset),
+    tailToOffset: finiteNumberOrUndefined(payload.tailToOffset),
+    newestOffset: finiteNumberOrUndefined(payload.newestOffset),
+    byteLength: finiteNumberOrUndefined(payload.byteLength),
+    lineCount: finiteNumberOrUndefined(payload.lineCount),
     hasMoreBefore: payload.hasMoreBefore === true
   };
 }
@@ -156,6 +168,8 @@ export function normalizeTerminalHistoryChunk(payload: unknown): TerminalHistory
     toLine: finiteNumberOrUndefined(payload.toLine),
     fromOffset: finiteNumberOrUndefined(payload.fromOffset),
     toOffset: finiteNumberOrUndefined(payload.toOffset),
+    byteLength: finiteNumberOrUndefined(payload.byteLength),
+    lineCount: finiteNumberOrUndefined(payload.lineCount),
     ansi: typeof payload.ansi === "string" ? payload.ansi : "",
     hasMoreBefore: payload.hasMoreBefore === true
   };

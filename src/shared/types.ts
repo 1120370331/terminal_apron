@@ -92,6 +92,17 @@ export interface SessionPreview {
   grid?: TerminalPreviewGrid;
   signature?: string;
   capturedAt: string;
+  unchanged?: boolean;
+  debug?: SessionPreviewDebug;
+}
+
+export interface SessionPreviewDebug {
+  cache: "hit" | "miss" | "stale" | "refreshing";
+  ageMs?: number;
+  captureMs?: number;
+  renderMs?: number;
+  totalMs?: number;
+  payloadBytes?: number;
 }
 
 export interface SessionUploadFile {

@@ -66,6 +66,11 @@ export interface TerminalHistoryInitFrame {
   tailAnsi?: string;
   oldestLine?: number;
   newestLine?: number;
+  tailFromOffset?: number;
+  tailToOffset?: number;
+  newestOffset?: number;
+  byteLength?: number;
+  lineCount?: number;
   hasMoreBefore: boolean;
 }
 
@@ -77,6 +82,8 @@ export interface TerminalHistoryChunkFrame {
   toLine?: number;
   fromOffset?: number;
   toOffset?: number;
+  byteLength?: number;
+  lineCount?: number;
   ansi: string;
   hasMoreBefore: boolean;
 }

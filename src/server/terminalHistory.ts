@@ -5,15 +5,6 @@ import { config } from "./config.js";
 import { captureZellijPreview, stripZellijHistoryHidingSequences } from "./zellij.js";
 
 const READ_CHUNK_BYTES = 256 * 1024;
-const DEFAULT_COLD_TAIL_LINES = 500;
-const DEFAULT_COLD_TAIL_BYTES = 1_000_000;
-const DEFAULT_HISTORY_RANGE_LINES = 1_000;
-const DEFAULT_HISTORY_RANGE_BYTES = 8_000_000;
-const DEFAULT_SNAPSHOT_VIEWPORT_LINES = 120;
-const MAX_COLD_TAIL_LINES = 800;
-const MAX_HISTORY_RANGE_LINES = 20_000;
-const MAX_HISTORY_RANGE_BYTES = 100_000_000;
-const MAX_SNAPSHOT_VIEWPORT_LINES = 1_200;
 
 export interface TerminalHistoryOffsetCursor {
   beforeOffset: number;
@@ -71,6 +62,8 @@ export interface TerminalLatestSnapshot {
   cursor: TerminalHistoryOffsetCursor;
   tailFromOffset: number;
   tailToOffset: number;
+  tailByteLength: number;
+  tailLineCount: number;
   hasMoreBefore: boolean;
   capturedAt: string;
 }
@@ -155,13 +148,9 @@ export async function captureTerminalLatestSnapshot(
   options: TerminalLatestSnapshotOptions
 ): Promise<TerminalLatestSnapshot> {
   const dataDir = options.dataDir ?? config.dataDir;
-  const viewportLines = normalizePositiveInteger(
-    options.viewportLines,
-    DEFAULT_SNAPSHOT_VIEWPORT_LINES,
-    MAX_SNAPSHOT_VIEWPORT_LINES
-  );
-  const tailLines = normalizePositiveInteger(options.tailLines, DEFAULT_COLD_TAIL_LINES, MAX_COLD_TAIL_LINES);
-  const maxTailBytes = normalizeMaxBytes(options.maxTailBytes, DEFAULT_COLD_TAIL_BYTES);
+  const viewportLines = normalizeSnapshotViewportLines(options.viewportLines);
+  const tailLines = normalizeColdTailLines(options.tailLines);
+  const maxTailBytes = normalizeColdTailBytes(options.maxTailBytes);
 
   throwIfAborted(options.signal);
   const [viewportAnsi, tailRange] = await Promise.all([
@@ -186,6 +175,8 @@ export async function captureTerminalLatestSnapshot(
     cursor: tailRange.cursor,
     tailFromOffset: tailRange.fromOffset,
     tailToOffset: tailRange.toOffset,
+    tailByteLength: tailRange.byteLength,
+    tailLineCount: tailRange.lineCount,
     hasMoreBefore: tailRange.hasMoreBefore,
     capturedAt: new Date().toISOString()
   };
@@ -196,8 +187,8 @@ export function loadTerminalHistoryTail(options: TerminalHistoryTailOptions): Pr
     session: options.session,
     requestId: options.requestId,
     dataDir: options.dataDir,
-    tailLines: normalizePositiveInteger(options.tailLines, DEFAULT_COLD_TAIL_LINES, MAX_COLD_TAIL_LINES),
-    maxBytes: normalizeMaxBytes(options.maxBytes, DEFAULT_COLD_TAIL_BYTES),
+    tailLines: normalizeColdTailLines(options.tailLines),
+    maxBytes: normalizeColdTailBytes(options.maxBytes),
     signal: options.signal
   });
 }
@@ -216,8 +207,11 @@ export async function loadTerminalHistoryRange(options: TerminalHistoryRangeOpti
     return emptyHistoryRange(options.session.id, options.requestId, newestOffset);
   }
 
-  const lineLimit = normalizeLineLimit(options.tailLines ?? options.limitLines, DEFAULT_HISTORY_RANGE_LINES);
-  const maxBytes = normalizeMaxBytes(options.maxBytes, DEFAULT_HISTORY_RANGE_BYTES);
+  const isTailRequest = options.tailLines !== undefined;
+  const lineLimit = isTailRequest
+    ? normalizeColdTailLines(options.tailLines)
+    : normalizeRangeLineLimit(options.limitLines);
+  const maxBytes = isTailRequest ? normalizeColdTailBytes(options.maxBytes) : normalizeRangeBytes(options.maxBytes);
   const result = await readTranscriptBeforeOffset(transcriptPath, toOffset, maxBytes, lineLimit, options.signal);
   const ansi = stripZellijHistoryHidingSequences(result.buffer.toString("utf8"));
   const fromOffset = result.fromOffset;
@@ -311,8 +305,17 @@ function normalizeOffset(value: number | undefined, newestOffset: number): numbe
   return Math.max(0, Math.min(newestOffset, Math.floor(parsed)));
 }
 
-function normalizeLineLimit(value: number | undefined, fallback: number): number {
-  return normalizePositiveInteger(value, fallback, MAX_HISTORY_RANGE_LINES);
+function normalizeSnapshotViewportLines(value: number | undefined): number {
+  return normalizePositiveInteger(value, config.terminalSnapshotViewportLines, config.terminalSnapshotViewportLines);
+}
+
+function normalizeColdTailLines(value: number | undefined): number {
+  return normalizePositiveInteger(value, config.terminalHistoryColdTailLines, config.terminalHistoryColdTailLines);
+}
+
+function normalizeRangeLineLimit(value: number | undefined): number {
+  const fallback = Math.min(config.terminalHistoryRangeLines, config.terminalHistoryMaxRangeLines);
+  return normalizePositiveInteger(value, fallback, config.terminalHistoryMaxRangeLines);
 }
 
 function normalizePositiveInteger(value: number | undefined, fallback: number, max: number): number {
@@ -321,10 +324,18 @@ function normalizePositiveInteger(value: number | undefined, fallback: number, m
   return Math.max(1, Math.min(max, Math.floor(normalized)));
 }
 
-function normalizeMaxBytes(value: number | undefined, fallback: number): number {
+function normalizeColdTailBytes(value: number | undefined): number {
+  return normalizeMaxBytes(value, config.terminalHistoryColdTailBytes, config.terminalHistoryColdTailBytes);
+}
+
+function normalizeRangeBytes(value: number | undefined): number {
+  return normalizeMaxBytes(value, config.terminalHistoryRangeBytes, config.terminalHistoryRangeBytes);
+}
+
+function normalizeMaxBytes(value: number | undefined, fallback: number, max: number): number {
   const parsed = Number(value);
   const normalized = Number.isFinite(parsed) ? parsed : fallback;
-  return Math.max(1, Math.min(config.nativeHistoryBytes, MAX_HISTORY_RANGE_BYTES, Math.floor(normalized)));
+  return Math.max(1, Math.min(config.nativeHistoryBytes, max, Math.floor(normalized)));
 }
 
 function zellijTranscriptPath(dataDir: string, sessionId: string): string {

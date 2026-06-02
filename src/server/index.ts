@@ -52,6 +52,8 @@ import type {
   FileTransferUploadResponse,
   SessionInputMode,
   SessionInputRequest,
+  SessionPreview,
+  SessionPreviewDebug,
   SessionUploadResponse,
   SystemMetrics,
   TerminalPreviewGrid,
@@ -71,11 +73,19 @@ const stores = new Map<string, Promise<SessionStore>>();
 const restoreQueuedStores = new Set<string>();
 const nativeSessions = new NativeSessionManager();
 const DEFAULT_PREVIEW_MAX_CHARS = 120_000;
+const PREVIEW_CACHE_FRESH_MS = 1_800;
+const PREVIEW_CACHE_STALE_MS = 30_000;
+const FULL_PREVIEW_CACHE_FRESH_MS = 15_000;
+const FULL_PREVIEW_CACHE_STALE_MS = 60_000;
+const PREVIEW_MAX_CONCURRENT = 2;
 const MAX_UPLOAD_FILES = 8;
 const MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024;
 const TRANSFER_DIR_NAME = "file-transfer";
 const MAX_TRANSFER_LIST_FILES = 1000;
 let acceptedInputSeq = 0;
+let activePreviewJobs = 0;
+const previewJobQueue: Array<() => void> = [];
+const sessionPreviewCache = new Map<string, PreviewCacheEntry>();
 const uploadSessionFiles = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -85,6 +95,12 @@ const uploadSessionFiles = multer({
 }).array("files", MAX_UPLOAD_FILES);
 
 app.use(express.json({ limit: "1mb" }));
+
+interface PreviewCacheEntry {
+  value?: SessionPreview;
+  capturedAtMs: number;
+  inFlight?: Promise<SessionPreview>;
+}
 
 async function storeForUser(user: AuthUser): Promise<SessionStore> {
   const userDataDir = path.resolve(dataDirForUser(user.name));
@@ -358,6 +374,7 @@ app.post("/api/sessions/:id/input", async (req, res) => {
       inputMode,
       parseSubmitDelayMs(submitDelayMs, inputMode === "paste" ? 120 : 0)
     );
+    invalidateSessionPreviewCache(session, store.dataDir);
   } catch (error) {
     res.status(502).json({
       ok: false,
@@ -380,20 +397,23 @@ app.post("/api/sessions/:id/input", async (req, res) => {
     return;
   }
 
-  const previewLines = parsePreviewLines(body.lines);
-  const previewText = await captureSessionPreview(session, store.dataDir, previewLines, false).catch(() => "");
-  const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(body.maxChars));
-  const grid = await renderSessionPreviewGrid(session, compactPreview, previewLines, false).catch(() => undefined);
+  const preview = await loadSessionPreview(session, store.dataDir, {
+    lines: parsePreviewLines(body.lines),
+    maxChars: parsePreviewMaxChars(body.maxChars),
+    full: false,
+    allowStale: false,
+    forceRefresh: true
+  }).catch(() => emptySessionPreview(session.id));
   res.json({
     ok: true,
     inputId,
     inputSeq,
     status: "accepted",
     runtime: await getRuntime(session, store.dataDir).catch(() => fallbackRuntime(session)),
-    preview: compactPreview,
-    grid,
-    signature: previewSignature(compactPreview, grid),
-    capturedAt: new Date().toISOString()
+    preview: preview.text,
+    grid: preview.grid,
+    signature: preview.signature,
+    capturedAt: preview.capturedAt
   });
 });
 
@@ -454,16 +474,22 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
   }
   const previewLines = parsePreviewLines(req.query.lines);
   const previewFull = parsePreviewFull(req.query.full);
-  const previewText = await captureSessionPreview(session, store.dataDir, previewLines, previewFull).catch(() => "");
-  const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.query.maxChars));
-  const grid = await renderSessionPreviewGrid(session, compactPreview, previewLines, previewFull).catch(() => undefined);
-  res.json({
-    sessionId: session.id,
-    text: compactPreview,
-    grid,
-    signature: previewSignature(compactPreview, grid),
-    capturedAt: new Date().toISOString()
+  const preview = await loadSessionPreview(session, store.dataDir, {
+    lines: previewLines,
+    maxChars: parsePreviewMaxChars(req.query.maxChars),
+    full: previewFull,
+    allowStale: true,
+    forceRefresh: parsePreviewForce(req.query.force)
   });
+  const knownSignature = normalizePreviewSignature(req.query.signature);
+  if (knownSignature && preview.signature === knownSignature) {
+    const unchanged = unchangedSessionPreview(preview);
+    setPreviewTimingHeader(res, unchanged.debug);
+    res.json(unchanged);
+    return;
+  }
+  setPreviewTimingHeader(res, preview.debug);
+  res.json(preview);
 });
 
 registerTerminalSockets(io, storeForUser, nativeSessions);
@@ -573,6 +599,213 @@ async function getRuntimeSnapshot(session: TerminalSession, dataDir = config.dat
     return zellijRuntimeSnapshot(session);
   }
   return getRuntime(session, dataDir);
+}
+
+async function loadSessionPreview(
+  session: TerminalSession,
+  dataDir: string,
+  options: { lines: number; maxChars: number; full: boolean; allowStale: boolean; forceRefresh?: boolean }
+): Promise<SessionPreview> {
+  const key = previewCacheKey(session, dataDir, options);
+  const now = Date.now();
+  const cached = sessionPreviewCache.get(key);
+  const freshMs = options.full ? FULL_PREVIEW_CACHE_FRESH_MS : PREVIEW_CACHE_FRESH_MS;
+  const staleMs = options.full ? FULL_PREVIEW_CACHE_STALE_MS : PREVIEW_CACHE_STALE_MS;
+
+  if (!options.forceRefresh && cached?.value) {
+    const ageMs = now - cached.capturedAtMs;
+    if (ageMs < freshMs) {
+      return withPreviewDebug(cached.value, {
+        cache: "hit",
+        ageMs,
+        payloadBytes: previewPayloadBytes(cached.value)
+      });
+    }
+    if (options.allowStale && ageMs < staleMs) {
+      if (!cached.inFlight) {
+        const inFlight = refreshSessionPreview(session, dataDir, options, key, cached).catch((error) => {
+          sessionPreviewCache.set(key, { value: cached.value, capturedAtMs: cached.capturedAtMs });
+          throw error;
+        });
+        sessionPreviewCache.set(key, { ...cached, inFlight });
+        void inFlight.catch(() => undefined);
+      }
+      return withPreviewDebug(cached.value, {
+        cache: cached.inFlight ? "refreshing" : "stale",
+        ageMs,
+        payloadBytes: previewPayloadBytes(cached.value)
+      });
+    }
+  }
+
+  if (!options.forceRefresh && cached?.inFlight) {
+    return cached.inFlight;
+  }
+
+  const inFlight = refreshSessionPreview(session, dataDir, options, key, cached);
+  sessionPreviewCache.set(key, {
+    value: cached?.value,
+    capturedAtMs: cached?.capturedAtMs ?? 0,
+    inFlight
+  });
+  return inFlight;
+}
+
+async function refreshSessionPreview(
+  session: TerminalSession,
+  dataDir: string,
+  options: { lines: number; maxChars: number; full: boolean },
+  key: string,
+  previous?: PreviewCacheEntry
+): Promise<SessionPreview> {
+  const startedAt = Date.now();
+  const preview = await runPreviewJob(async () => {
+    const captureStartedAt = Date.now();
+    const previewText = await captureSessionPreview(session, dataDir, options.lines, options.full).catch(() => "");
+    const captureMs = Date.now() - captureStartedAt;
+    const compactPreview = compactPreviewPayload(previewText, options.maxChars);
+    const renderStartedAt = Date.now();
+    const grid = await renderSessionPreviewGrid(session, compactPreview, options.lines, options.full).catch(
+      () => undefined
+    );
+    const renderMs = Date.now() - renderStartedAt;
+    return {
+      sessionId: session.id,
+      text: compactPreview,
+      grid,
+      signature: previewSignature(compactPreview, grid),
+      capturedAt: new Date().toISOString(),
+      debug: {
+        cache: previous?.value ? "stale" : "miss",
+        captureMs,
+        renderMs,
+        totalMs: Date.now() - startedAt
+      }
+    } satisfies SessionPreview;
+  });
+
+  const value = withPreviewDebug(preview, {
+    ...preview.debug,
+    cache: previous?.value ? "stale" : "miss",
+    totalMs: Date.now() - startedAt,
+    payloadBytes: previewPayloadBytes(preview)
+  });
+  sessionPreviewCache.set(key, {
+    value,
+    capturedAtMs: Date.now()
+  });
+  return value;
+}
+
+function runPreviewJob<T>(run: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const start = () => {
+      activePreviewJobs += 1;
+      run()
+        .then(resolve, reject)
+        .finally(() => {
+          activePreviewJobs = Math.max(0, activePreviewJobs - 1);
+          previewJobQueue.shift()?.();
+        });
+    };
+
+    if (activePreviewJobs < PREVIEW_MAX_CONCURRENT) {
+      start();
+    } else {
+      previewJobQueue.push(start);
+    }
+  });
+}
+
+function previewCacheKey(
+  session: TerminalSession,
+  dataDir: string,
+  options: { lines: number; maxChars: number; full: boolean }
+): string {
+  return [
+    path.resolve(dataDir),
+    session.id,
+    session.tmuxName,
+    options.full ? "full" : "viewport",
+    options.lines,
+    options.maxChars
+  ].join("\u001f");
+}
+
+function invalidateSessionPreviewCache(session: TerminalSession, dataDir: string): void {
+  const prefix = `${path.resolve(dataDir)}\u001f${session.id}\u001f`;
+  for (const key of sessionPreviewCache.keys()) {
+    if (key.startsWith(prefix)) {
+      sessionPreviewCache.delete(key);
+    }
+  }
+}
+
+function withPreviewDebug(preview: SessionPreview, debug: Partial<SessionPreviewDebug>): SessionPreview {
+  return {
+    ...preview,
+    debug: {
+      cache: debug.cache ?? preview.debug?.cache ?? "miss",
+      ageMs: debug.ageMs ?? preview.debug?.ageMs,
+      captureMs: debug.captureMs ?? preview.debug?.captureMs,
+      renderMs: debug.renderMs ?? preview.debug?.renderMs,
+      totalMs: debug.totalMs ?? preview.debug?.totalMs,
+      payloadBytes: debug.payloadBytes ?? preview.debug?.payloadBytes
+    }
+  };
+}
+
+function previewPayloadBytes(preview: SessionPreview): number {
+  return Buffer.byteLength(JSON.stringify({ text: preview.text, grid: preview.grid }), "utf8");
+}
+
+function setPreviewTimingHeader(
+  res: express.Response,
+  debug: SessionPreviewDebug | undefined
+): void {
+  if (!debug) {
+    return;
+  }
+  const parts = [
+    `preview;desc="${debug.cache}"`,
+    typeof debug.captureMs === "number" ? `zellij;dur=${debug.captureMs}` : "",
+    typeof debug.renderMs === "number" ? `render;dur=${debug.renderMs}` : "",
+    typeof debug.totalMs === "number" ? `total;dur=${debug.totalMs}` : ""
+  ].filter(Boolean);
+  if (parts.length) {
+    res.setHeader("Server-Timing", parts.join(", "));
+  }
+}
+
+function emptySessionPreview(sessionId: string): SessionPreview {
+  return {
+    sessionId,
+    text: "",
+    signature: "",
+    capturedAt: new Date().toISOString()
+  };
+}
+
+function unchangedSessionPreview(preview: SessionPreview): SessionPreview {
+  return withPreviewDebug(
+    {
+      sessionId: preview.sessionId,
+      text: "",
+      signature: preview.signature,
+      capturedAt: preview.capturedAt,
+      unchanged: true
+    },
+    {
+      ...preview.debug,
+      payloadBytes: previewPayloadBytes({
+        sessionId: preview.sessionId,
+        text: "",
+        signature: preview.signature,
+        capturedAt: preview.capturedAt,
+        unchanged: true
+      })
+    }
+  );
 }
 
 async function captureSessionPreview(session: TerminalSession, dataDir: string, lines = 500, full = true) {
@@ -1030,6 +1263,14 @@ function parsePreviewMaxChars(value: unknown): number {
 
 function parsePreviewFull(value: unknown): boolean {
   return value !== "false";
+}
+
+function parsePreviewForce(value: unknown): boolean {
+  return value === "true";
+}
+
+function normalizePreviewSignature(value: unknown): string {
+  return typeof value === "string" && /^[a-f0-9]{40}$/i.test(value) ? value : "";
 }
 
 function compactPreviewPayload(value: string, maxChars: number): string {

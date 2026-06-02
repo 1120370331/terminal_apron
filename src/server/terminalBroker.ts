@@ -381,6 +381,11 @@ export class TerminalBroker {
         snapshotSeq,
         viewportAnsi: snapshot.viewportAnsi,
         tailAnsi: snapshot.tailAnsi,
+        tailFromOffset: snapshot.tailFromOffset,
+        tailToOffset: snapshot.tailToOffset,
+        newestOffset: snapshot.cursor.newestOffset,
+        byteLength: snapshot.tailByteLength,
+        lineCount: snapshot.tailLineCount,
         hasMoreBefore: snapshot.hasMoreBefore
       });
       subscriber.pendingLiveAfterSeq = null;
@@ -423,6 +428,8 @@ export class TerminalBroker {
         requestId,
         fromOffset: range.fromOffset,
         toOffset: range.toOffset,
+        byteLength: range.byteLength,
+        lineCount: range.lineCount,
         ansi: payload?.format === "plain" ? stripAnsi(range.ansi) : range.ansi,
         hasMoreBefore: range.hasMoreBefore
       });
@@ -482,7 +489,7 @@ export class TerminalBroker {
       if (!this.term) {
         throw new Error("zellij attach is not ready");
       }
-      const inputSeq = this.nextSeq();
+      const inputSeq = this.lastSeq;
       this.term.write(input.data);
       this.scheduleSave();
       this.emitInputAck(subscriber, {

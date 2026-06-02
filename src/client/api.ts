@@ -161,8 +161,18 @@ export const api = {
     request<TerminalSession>(`/api/sessions/${id}/kill`, {
       method: "POST"
     }),
-  preview: (id: string, lines = 500, maxChars = 500_000, full = true) =>
-    request<SessionPreview>(`/api/sessions/${id}/preview?lines=${lines}&maxChars=${maxChars}&full=${full}`)
+  preview: (id: string, lines = 500, maxChars = 500_000, full = true, force = false, signature = "") => {
+    const params = new URLSearchParams({
+      lines: String(lines),
+      maxChars: String(maxChars),
+      full: String(full),
+      force: String(force)
+    });
+    if (signature) {
+      params.set("signature", signature);
+    }
+    return request<SessionPreview>(`/api/sessions/${id}/preview?${params.toString()}`);
+  }
 };
 
 function uploadFileName(file: File, index: number): string {

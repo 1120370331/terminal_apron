@@ -54,6 +54,8 @@ const REMOTE_PREVIEW_MIN_REFRESH_MS = 2500;
 const REMOTE_FULL_PREVIEW_REFRESH_MS = 30_000;
 const LOCAL_PREVIEW_MAX_CHARS = 500_000;
 const REMOTE_PREVIEW_MAX_CHARS = 120_000;
+const LOCAL_PREVIEW_MAX_CONCURRENT = 2;
+const REMOTE_PREVIEW_MAX_CONCURRENT = 1;
 const PREVIEW_REVEAL_TIMEOUT_MS = 1500;
 const QUICK_INPUT_ECHO_DELAY_MS = 180;
 const QUICK_INPUT_REFRESH_RETRY_MS = 900;
@@ -156,7 +158,7 @@ function isTerminalInputFocused(): boolean {
   if (!(active instanceof HTMLElement)) {
     return false;
   }
-  return Boolean(active.closest(".terminal-dock"));
+  return Boolean(active.closest(".terminal-dock, .quick-input"));
 }
 
 function resolveThemeMode(mode: ThemeMode): "light" | "dark" {
@@ -616,6 +618,8 @@ export function App() {
   const layoutSaveSeqRef = useRef(0);
   const previewsRef = useRef<Record<string, SessionPreview>>({});
   const previewInFlightRef = useRef<Set<string>>(new Set());
+  const previewActiveRequestsRef = useRef(0);
+  const previewQueueRef = useRef<Array<() => void>>([]);
   const lastFullPreviewAtRef = useRef<Record<string, number>>({});
   const quickInputTimersRef = useRef<Record<string, number[]>>({});
   const userStorageReadyRef = useRef<string | null>(null);
@@ -627,6 +631,7 @@ export function App() {
     : settings.previewRefreshMs;
   const fullPreviewRefreshMs = remoteBrowserHost ? REMOTE_FULL_PREVIEW_REFRESH_MS : FULL_PREVIEW_REFRESH_MS;
   const previewMaxChars = remoteBrowserHost ? REMOTE_PREVIEW_MAX_CHARS : LOCAL_PREVIEW_MAX_CHARS;
+  const previewMaxConcurrent = remoteBrowserHost ? REMOTE_PREVIEW_MAX_CONCURRENT : LOCAL_PREVIEW_MAX_CONCURRENT;
 
   const clearQuickInputTimers = useCallback((sessionId: string) => {
     const timers = quickInputTimersRef.current[sessionId] ?? [];
@@ -897,6 +902,9 @@ export function App() {
 
   const applySessionPreview = useCallback(
     (sessionId: string, preview: SessionPreview, full: boolean) => {
+      if (preview.unchanged) {
+        return;
+      }
       setPreviews((current) => {
         const nextPreview = full ? preview : mergeFastPreview(current[sessionId], preview, settings.previewLines);
         return samePreview(current[sessionId], nextPreview) ? current : { ...current, [sessionId]: nextPreview };
@@ -905,15 +913,43 @@ export function App() {
     [settings.previewLines]
   );
 
+  const runPreviewRequest = useCallback(
+    <T,>(request: () => Promise<T>): Promise<T> =>
+      new Promise<T>((resolve, reject) => {
+        const start = () => {
+          previewActiveRequestsRef.current += 1;
+          request()
+            .then(resolve, reject)
+            .finally(() => {
+              previewActiveRequestsRef.current = Math.max(0, previewActiveRequestsRef.current - 1);
+              previewQueueRef.current.shift()?.();
+            });
+        };
+
+        if (previewActiveRequestsRef.current < previewMaxConcurrent) {
+          start();
+        } else {
+          previewQueueRef.current.push(start);
+        }
+      }),
+    [previewMaxConcurrent]
+  );
+
   const refreshSessionPreview = useCallback(
-    async (sessionId: string, full = false): Promise<SessionPreview | null> => {
+    async (sessionId: string, full = false, force = false): Promise<SessionPreview | null> => {
       if (previewInFlightRef.current.has(sessionId)) {
         return null;
       }
 
       previewInFlightRef.current.add(sessionId);
       try {
-        const preview = await api.preview(sessionId, settings.previewLines, previewMaxChars, full);
+        const knownSignature = force ? "" : previewContentSignature(previewsRef.current[sessionId]);
+        const preview = await runPreviewRequest(() =>
+          api.preview(sessionId, settings.previewLines, previewMaxChars, full, force, knownSignature)
+        );
+        if (preview.unchanged) {
+          return previewsRef.current[sessionId] ?? null;
+        }
         if (full) {
           lastFullPreviewAtRef.current[sessionId] = Date.now();
         }
@@ -923,7 +959,7 @@ export function App() {
         previewInFlightRef.current.delete(sessionId);
       }
     },
-    [applySessionPreview, previewMaxChars, settings.previewLines]
+    [applySessionPreview, previewMaxChars, runPreviewRequest, settings.previewLines]
   );
 
   useEffect(() => {
@@ -959,9 +995,17 @@ export function App() {
         const now = Date.now();
         const previous = previewsRef.current[sessionId];
         const lastFullAt = lastFullPreviewAtRef.current[sessionId] ?? 0;
-        const shouldLoadFull = Boolean(previous?.grid) && now - lastFullAt >= fullPreviewRefreshMs;
-        const preview = await api.preview(sessionId, settings.previewLines, previewMaxChars, shouldLoadFull);
+        const shouldLoadFull =
+          !remoteBrowserHost && Boolean(previous?.grid) && now - lastFullAt >= fullPreviewRefreshMs;
+        const knownSignature = shouldLoadFull ? "" : previewContentSignature(previous);
+        const preview = await runPreviewRequest(() =>
+          api.preview(sessionId, settings.previewLines, previewMaxChars, shouldLoadFull, false, knownSignature)
+        );
         if (cancelled || !visibleIds.has(sessionId)) {
+          return;
+        }
+
+        if (preview.unchanged) {
           return;
         }
 
@@ -1001,6 +1045,8 @@ export function App() {
     auth,
     fullPreviewRefreshMs,
     previewMaxChars,
+    remoteBrowserHost,
+    runPreviewRequest,
     previewRefreshMs,
     previewTargetKey,
     settings.previewLines
@@ -1123,6 +1169,15 @@ export function App() {
     void saveLayout(organized);
   }, [filtered, isMobile, saveLayout, settings]);
 
+  const closeTerminal = useCallback(
+    (terminal: TerminalSession) => {
+      setActiveTerminal(null);
+      void refreshSessionPreview(terminal.id, false, true);
+      void loadSessions();
+    },
+    [loadSessions, refreshSessionPreview]
+  );
+
   const renderSessionCard = (session: TerminalSession) => (
     <SessionCard
       session={session}
@@ -1175,7 +1230,7 @@ export function App() {
           setQuickInputPhase(session.id, inputId, "echoing", { inputSeq: result.inputSeq });
         }, QUICK_INPUT_ECHO_DELAY_MS);
         scheduleQuickInputTimer(session.id, () => {
-          void refreshSessionPreview(session.id, false)
+          void refreshSessionPreview(session.id, false, true)
             .then(() => {
               setQuickInputPhase(session.id, inputId, "updated", { inputSeq: result.inputSeq });
               scheduleQuickInputTimer(
@@ -1431,7 +1486,7 @@ export function App() {
           key={terminal.id}
           session={terminal}
           visible={activeTerminal?.id === terminal.id}
-          onClose={() => setActiveTerminal(null)}
+          onClose={() => closeTerminal(terminal)}
         />
       ))}
 

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { Server, Socket } from "socket.io";
+import { config } from "./config.js";
 import { SessionStore } from "./db.js";
 import { userFromCookie } from "./auth.js";
 import { resolveBackend } from "./backend.js";
@@ -95,7 +96,7 @@ function parseSubscribeOptions(socket: Socket): TerminalBrokerSubscribeOptions {
     rows: clampDimension(query.rows, 36, 10, MAX_TERMINAL_ROWS),
     lastAckSeq: clampDimension(query.lastAckSeq, 0, 0, Number.MAX_SAFE_INTEGER),
     historyPolicy: parseHistoryPolicy(query.historyPolicy, protocolVersion),
-    tailLines: clampDimension(query.tailLines, 500, 20, 800)
+    tailLines: clampDimension(query.tailLines, config.terminalHistoryColdTailLines, 20, config.terminalHistoryColdTailLines)
   };
 }
 

@@ -34,9 +34,10 @@ const ZELLIJ_WEB_ROWS = 36;
 const TERMINAL_SCROLLBACK_ROWS = 200_000;
 const TERMINAL_INPUT_BATCH_MS = 12;
 const TERMINAL_WRITE_CHUNK_CHARS = 8192;
-const TERMINAL_HISTORY_REQUEST_LINES = 800;
-const TERMINAL_HISTORY_REQUEST_MAX_BYTES = 256_000;
-const TERMINAL_HISTORY_PREVIEW_MAX_CHARS = 80_000;
+const TERMINAL_HISTORY_RETAINED_LINES = 100_000;
+const TERMINAL_HISTORY_ROW_HEIGHT = 18;
+const TERMINAL_HISTORY_OVERSCAN_ROWS = 18;
+const TERMINAL_HISTORY_INITIAL_RENDER_ROWS = 120;
 
 type LatestHistoryStatus = "waiting" | "loading" | "ready" | "error";
 type OlderHistoryStatus = "idle" | "loading" | "ready" | "exhausted" | "error";
@@ -59,6 +60,7 @@ interface TerminalHistoryCursor {
   oldestLine?: number;
   newestLine?: number;
   beforeOffset?: number;
+  newestOffset?: number;
 }
 
 interface TerminalWriteItem {
@@ -70,8 +72,16 @@ interface TerminalWriteItem {
   onComplete?: () => void;
 }
 
+interface TerminalHistoryVirtualRange {
+  start: number;
+  end: number;
+}
+
+type TerminalHistoryScrollTarget = { type: "bottom" } | { type: "offset"; top: number };
+
 export function TerminalDock({ session, visible, onClose }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const historyScrollRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<Socket | null>(null);
@@ -100,6 +110,10 @@ export function TerminalDock({ session, visible, onClose }: Props) {
   const activeHistoryRequestRef = useRef<string | null>(null);
   const hasMoreBeforeRef = useRef(false);
   const historyLoadingRef = useRef(false);
+  const historyLayerOpenRef = useRef(false);
+  const historyLinesRef = useRef<string[]>([]);
+  const historyDroppedLineCountRef = useRef(0);
+  const pendingHistoryScrollRef = useRef<TerminalHistoryScrollTarget | null>(null);
   const atBottomRef = useRef(true);
   const receivedHistoryInitRef = useRef(false);
   const [attachCommand, setAttachCommand] = useState<string | null>(null);
@@ -110,8 +124,11 @@ export function TerminalDock({ session, visible, onClose }: Props) {
   const [writeQueueBytes, setWriteQueueBytes] = useState(0);
   const [pendingInputCount, setPendingInputCount] = useState(0);
   const [newOutputAvailable, setNewOutputAvailable] = useState(false);
-  const [historyPreviewOpen, setHistoryPreviewOpen] = useState(false);
-  const [olderHistoryPreview, setOlderHistoryPreview] = useState("");
+  const [historyLayerOpen, setHistoryLayerOpen] = useState(false);
+  const [historyLineCount, setHistoryLineCount] = useState(0);
+  const [historyDroppedLineCount, setHistoryDroppedLineCount] = useState(0);
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const [historyVirtualRange, setHistoryVirtualRange] = useState<TerminalHistoryVirtualRange>({ start: 0, end: 0 });
   const [flowMeta, setFlowMeta] = useState<TerminalFlowMeta>({ paused: false });
   const [historyMeta, setHistoryMeta] = useState<TerminalHistoryMeta>({
     latest: "waiting",
@@ -127,6 +144,35 @@ export function TerminalDock({ session, visible, onClose }: Props) {
   const updateWriteQueueBytes = useCallback((delta: number) => {
     writeQueueBytesRef.current = Math.max(0, writeQueueBytesRef.current + delta);
     setWriteQueueBytes(writeQueueBytesRef.current);
+  }, []);
+
+  const updateHistoryVirtualRange = useCallback(() => {
+    const scroll = historyScrollRef.current;
+    const total = historyLinesRef.current.length;
+    if (!scroll || total === 0) {
+      setHistoryVirtualRange((current) => (current.start === 0 && current.end === 0 ? current : { start: 0, end: 0 }));
+      return;
+    }
+
+    const visibleRows = Math.ceil(scroll.clientHeight / TERMINAL_HISTORY_ROW_HEIGHT);
+    const start = Math.max(0, Math.floor(scroll.scrollTop / TERMINAL_HISTORY_ROW_HEIGHT) - TERMINAL_HISTORY_OVERSCAN_ROWS);
+    const end = Math.min(total, start + visibleRows + TERMINAL_HISTORY_OVERSCAN_ROWS * 2);
+    setHistoryVirtualRange((current) => (current.start === start && current.end === end ? current : { start, end }));
+  }, []);
+
+  const openHistoryLayer = useCallback((target: "bottom" = "bottom") => {
+    if (!historyLayerOpenRef.current) {
+      pendingHistoryScrollRef.current = { type: target };
+    }
+    historyLayerOpenRef.current = true;
+    setHistoryLayerOpen(true);
+  }, []);
+
+  const closeHistoryLayer = useCallback(() => {
+    historyLayerOpenRef.current = false;
+    pendingHistoryScrollRef.current = null;
+    setHistoryLayerOpen(false);
+    window.setTimeout(() => termRef.current?.focus(), 0);
   }, []);
 
   const sendTerminalAck = useCallback(
@@ -200,7 +246,18 @@ export function TerminalDock({ session, visible, onClose }: Props) {
   const requestOlderHistory = useCallback(
     (source: "button" | "scroll" = "button") => {
       const socket = socketRef.current;
-      if (!socket?.connected || historyLoadingRef.current || !hasMoreBeforeRef.current) {
+      if (!hasMoreBeforeRef.current) {
+        if (historyLinesRef.current.length > 0) {
+          openHistoryLayer();
+        }
+        return;
+      }
+
+      openHistoryLayer();
+      if (typeof historyCursorRef.current.beforeOffset !== "number") {
+        return;
+      }
+      if (!socket?.connected || historyLoadingRef.current) {
         return;
       }
 
@@ -208,20 +265,15 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       activeHistoryRequestRef.current = requestId;
       historyLoadingRef.current = true;
       setHistoryMeta((current) => ({ ...current, older: "loading" }));
-      if (source === "button") {
-        setHistoryPreviewOpen(true);
-      }
       socket.emit("terminal:history:request", {
         sessionId: session.id,
         requestId,
         beforeLine: historyCursorRef.current.oldestLine,
         beforeOffset: historyCursorRef.current.beforeOffset,
-        limitLines: TERMINAL_HISTORY_REQUEST_LINES,
-        maxBytes: TERMINAL_HISTORY_REQUEST_MAX_BYTES,
         format: "ansi"
       });
     },
-    [session.id]
+    [openHistoryLayer, session.id]
   );
 
   const jumpToLiveOutput = useCallback(() => {
@@ -229,6 +281,9 @@ export function TerminalDock({ session, visible, onClose }: Props) {
     if (!terminal) {
       return;
     }
+    historyLayerOpenRef.current = false;
+    pendingHistoryScrollRef.current = null;
+    setHistoryLayerOpen(false);
     terminal.scrollToBottom();
     atBottomRef.current = true;
     setNewOutputAvailable(false);
@@ -379,14 +434,55 @@ export function TerminalDock({ session, visible, onClose }: Props) {
     }
   }, [pasteFilesToTerminal, sendTerminalInput]);
 
-  const recordOlderHistoryPreview = useCallback((ansi: string) => {
+  const recordOlderHistoryLines = useCallback((ansi: string, placement: "prepend" | "append" = "prepend") => {
+    const byteLength = utf8ByteLength(ansi);
     if (!ansi) {
       return 0;
     }
 
-    const byteLength = utf8ByteLength(ansi);
-    const plain = stripAnsiForHistoryPreview(ansi);
-    setOlderHistoryPreview((current) => trimHistoryPreview(`${current}${plain}`));
+    const incomingLines = plainHistoryRowsFromAnsi(ansi, termRef.current?.cols ?? ZELLIJ_WEB_COLS);
+    if (incomingLines.length === 0) {
+      return byteLength;
+    }
+
+    const scroll = historyScrollRef.current;
+    const previousCount = historyLinesRef.current.length;
+    const previousTop = scroll?.scrollTop ?? 0;
+    const nextLines =
+      placement === "prepend" ? [...incomingLines, ...historyLinesRef.current] : [...historyLinesRef.current, ...incomingLines];
+    let droppedLines = 0;
+
+    if (nextLines.length > TERMINAL_HISTORY_RETAINED_LINES) {
+      droppedLines = nextLines.length - TERMINAL_HISTORY_RETAINED_LINES;
+      historyLinesRef.current =
+        placement === "prepend"
+          ? nextLines.slice(0, TERMINAL_HISTORY_RETAINED_LINES)
+          : nextLines.slice(nextLines.length - TERMINAL_HISTORY_RETAINED_LINES);
+    } else {
+      historyLinesRef.current = nextLines;
+    }
+
+    if (droppedLines > 0) {
+      historyDroppedLineCountRef.current += droppedLines;
+      setHistoryDroppedLineCount(historyDroppedLineCountRef.current);
+    }
+
+    if (historyLayerOpenRef.current) {
+      if (previousCount === 0) {
+        pendingHistoryScrollRef.current = { type: "bottom" };
+      } else if (placement === "prepend") {
+        const retainedIncomingLines = Math.min(incomingLines.length, historyLinesRef.current.length);
+        if (retainedIncomingLines > 0 && !pendingHistoryScrollRef.current) {
+          pendingHistoryScrollRef.current = {
+            type: "offset",
+            top: previousTop + retainedIncomingLines * TERMINAL_HISTORY_ROW_HEIGHT
+          };
+        }
+      }
+    }
+
+    setHistoryLineCount(historyLinesRef.current.length);
+    setHistoryVersion((current) => current + 1);
     return byteLength;
   }, []);
 
@@ -492,6 +588,37 @@ export function TerminalDock({ session, visible, onClose }: Props) {
   );
 
   useEffect(() => {
+    if (!historyLayerOpen) {
+      return;
+    }
+
+    const scroll = historyScrollRef.current;
+    if (!scroll) {
+      return;
+    }
+
+    const target = pendingHistoryScrollRef.current;
+    if (target?.type === "bottom") {
+      scroll.scrollTop = scroll.scrollHeight;
+      pendingHistoryScrollRef.current = null;
+    } else if (target?.type === "offset") {
+      scroll.scrollTop = target.top;
+      pendingHistoryScrollRef.current = null;
+    }
+
+    updateHistoryVirtualRange();
+  }, [historyLayerOpen, historyLineCount, historyVersion, updateHistoryVirtualRange]);
+
+  const handleHistoryLayerScroll = useCallback(() => {
+    updateHistoryVirtualRange();
+    const scroll = historyScrollRef.current;
+    if (!scroll || scroll.scrollTop > TERMINAL_HISTORY_ROW_HEIGHT * 2) {
+      return;
+    }
+    requestOlderHistory("scroll");
+  }, [requestOlderHistory, updateHistoryVirtualRange]);
+
+  useEffect(() => {
     return () => {
       if (copiedTimerRef.current) {
         window.clearTimeout(copiedTimerRef.current);
@@ -517,6 +644,9 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       if (active instanceof HTMLElement && hostRef.current?.contains(active)) {
         active.blur();
       }
+      historyLayerOpenRef.current = false;
+      pendingHistoryScrollRef.current = null;
+      setHistoryLayerOpen(false);
       cancelHistoryRequest("idle");
       socketRef.current?.emit("terminal:visibility", {
         sessionId: session.id,
@@ -600,8 +730,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
         clientProfile: isMobileClient ? "mobile" : "desktop",
         mode: "interactive",
         lastAckSeq: String(lastAckSeqRef.current),
-        historyPolicy: "viewport",
-        tailLines: "500"
+        historyPolicy: "viewport"
       }
     });
 
@@ -642,7 +771,9 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       streamIdRef.current = frame.streamId ?? streamIdRef.current;
       historyCursorRef.current = {
         oldestLine: frame.oldestLine,
-        newestLine: frame.newestLine
+        newestLine: frame.newestLine,
+        beforeOffset: frame.tailFromOffset,
+        newestOffset: frame.newestOffset
       };
       hasMoreBeforeRef.current = frame.hasMoreBefore;
       receivedHistoryInitRef.current = true;
@@ -678,7 +809,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
         return;
       }
 
-      const loadedBytes = recordOlderHistoryPreview(frame.ansi);
+      const loadedBytes = recordOlderHistoryLines(frame.ansi, "prepend");
       historyCursorRef.current = {
         ...historyCursorRef.current,
         oldestLine: frame.fromLine ?? historyCursorRef.current.oldestLine,
@@ -703,7 +834,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
 
       streamIdRef.current = frame.streamId ?? streamIdRef.current;
       if (frame.kind === "history") {
-        const loadedBytes = recordOlderHistoryPreview(frame.data);
+        const loadedBytes = recordOlderHistoryLines(frame.data, "append");
         setHistoryMeta((current) => ({
           ...current,
           olderLoadedBytes: current.olderLoadedBytes + loadedBytes,
@@ -786,6 +917,13 @@ export function TerminalDock({ session, visible, onClose }: Props) {
     });
     socket.on("terminal:error", (payload: unknown) => {
       const error = normalizeTerminalError(payload);
+      if (error.code === "history-failed" && activeHistoryRequestRef.current) {
+        activeHistoryRequestRef.current = null;
+        historyLoadingRef.current = false;
+        setHistoryMeta((current) => ({ ...current, older: "error" }));
+        setStatus(error.message);
+        return;
+      }
       setStatus(error.message);
       setHistoryMeta((current) => ({ ...current, latest: current.latest === "ready" ? "ready" : "error" }));
       terminal.writeln(`\r\n[terminal error] ${error.message}`);
@@ -906,10 +1044,26 @@ export function TerminalDock({ session, visible, onClose }: Props) {
     isMobileClient,
     pasteFilesToTerminal,
     refitTerminal,
+    requestOlderHistory,
+    recordOlderHistoryLines,
     sendTerminalInput,
     session.id,
     usesStableZellijWidth
   ]);
+
+  const historyRangeStart =
+    historyVirtualRange.end > historyVirtualRange.start
+      ? Math.min(historyVirtualRange.start, historyLineCount)
+      : Math.max(0, historyLineCount - TERMINAL_HISTORY_INITIAL_RENDER_ROWS);
+  const historyRangeEnd =
+    historyVirtualRange.end > historyVirtualRange.start
+      ? Math.min(historyVirtualRange.end, historyLineCount)
+      : historyLineCount;
+  const visibleHistoryLines = historyLinesRef.current.slice(historyRangeStart, historyRangeEnd);
+  const historySpacerHeight = Math.max(historyLineCount, 1) * TERMINAL_HISTORY_ROW_HEIGHT;
+  const historyLoadedKb = Math.ceil(historyMeta.olderLoadedBytes / 1024);
+  const canOpenHistory = historyLineCount > 0 || historyMeta.hasMoreBefore || historyMeta.older === "loading";
+  const canRequestOlderHistory = historyMeta.hasMoreBefore && historyMeta.older !== "loading";
 
   return (
     <div
@@ -956,12 +1110,20 @@ export function TerminalDock({ session, visible, onClose }: Props) {
               historyMeta.older === "loading"
                 ? "Loading older history"
                 : historyMeta.hasMoreBefore
-                  ? "Load older history"
-                  : "No older history"
+                  ? "Open older history"
+                  : historyLineCount > 0
+                    ? "Open loaded history"
+                    : "No older history"
             }
-            disabled={historyMeta.older === "loading" || !historyMeta.hasMoreBefore}
+            disabled={!canOpenHistory}
             onMouseDown={(event) => event.preventDefault()}
-            onClick={() => requestOlderHistory("button")}
+            onClick={() => {
+              if (historyMeta.hasMoreBefore && historyMeta.older !== "loading") {
+                requestOlderHistory("button");
+              } else {
+                openHistoryLayer();
+              }
+            }}
           >
             <History size={17} />
           </button>
@@ -1012,21 +1174,78 @@ export function TerminalDock({ session, visible, onClose }: Props) {
           </button>
         </div>
       </header>
-      <div className="terminal-host" ref={hostRef} />
-      {historyPreviewOpen && olderHistoryPreview && (
-        <aside className="terminal-history-panel">
-          <header>
-            <span>
-              older history
-              {historyMeta.olderLoadedBytes > 0 ? ` / ${Math.ceil(historyMeta.olderLoadedBytes / 1024)}KB` : ""}
-            </span>
-            <button className="icon-button small" type="button" title="Close history" onClick={() => setHistoryPreviewOpen(false)}>
-              <X size={15} />
-            </button>
-          </header>
-          <pre>{olderHistoryPreview}</pre>
-        </aside>
-      )}
+      <div className="terminal-body">
+        <div className="terminal-host" ref={hostRef} />
+        {historyLayerOpen && (
+          <section className="terminal-history-layer" aria-label="Older terminal history">
+            <header className="terminal-history-layer-header">
+              <div className="terminal-history-heading">
+                <History size={16} />
+                <div>
+                  <strong>older history</strong>
+                  <span>
+                    {historyLineCount.toLocaleString()} lines
+                    {historyMeta.olderLoadedBytes > 0 ? ` / ${historyLoadedKb.toLocaleString()}KB loaded` : ""}
+                    {historyDroppedLineCount > 0 ? ` / ${historyDroppedLineCount.toLocaleString()} dropped` : ""}
+                  </span>
+                </div>
+              </div>
+              <div className="terminal-history-actions">
+                <button
+                  className="secondary-button terminal-history-button"
+                  type="button"
+                  disabled={!canRequestOlderHistory}
+                  onClick={() => requestOlderHistory("button")}
+                >
+                  {historyMeta.older === "loading" ? "Loading" : historyMeta.hasMoreBefore ? "Load more" : "Oldest"}
+                </button>
+                <button className="secondary-button terminal-history-button" type="button" onClick={jumpToLiveOutput}>
+                  Live
+                </button>
+                <button className="icon-button small" type="button" title="Close history" onClick={closeHistoryLayer}>
+                  <X size={15} />
+                </button>
+              </div>
+            </header>
+            <div className="terminal-history-scroll" ref={historyScrollRef} onScroll={handleHistoryLayerScroll}>
+              {historyLineCount > 0 ? (
+                <div className="terminal-history-virtual" style={{ height: historySpacerHeight }}>
+                  <div
+                    className="terminal-history-lines"
+                    style={{ transform: `translateY(${historyRangeStart * TERMINAL_HISTORY_ROW_HEIGHT}px)` }}
+                  >
+                    {visibleHistoryLines.map((line, index) => (
+                      <div className="terminal-history-line" key={`${historyRangeStart + index}-${historyVersion}`}>
+                        {line || " "}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="terminal-history-empty">
+                  {historyMeta.older === "loading" ? "Loading older history..." : "No older history loaded"}
+                </div>
+              )}
+            </div>
+            <footer className="terminal-history-footer">
+              <span>
+                {historyMeta.older === "loading"
+                  ? "loading older history"
+                  : historyMeta.older === "exhausted"
+                    ? "oldest retained history reached"
+                    : historyMeta.older === "error"
+                      ? "history load failed"
+                      : historyMeta.hasMoreBefore
+                        ? "more history available"
+                        : "loaded history"}
+              </span>
+              <button className="secondary-button terminal-history-button" type="button" onClick={jumpToLiveOutput}>
+                Return to live
+              </button>
+            </footer>
+          </section>
+        )}
+      </div>
     </div>
   );
 
@@ -1077,13 +1296,77 @@ function stripAnsiForHistoryPreview(value: string): string {
     .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
-function trimHistoryPreview(value: string): string {
-  if (value.length <= TERMINAL_HISTORY_PREVIEW_MAX_CHARS) {
-    return value;
+function plainHistoryRowsFromAnsi(value: string, cols: number): string[] {
+  const plain = stripAnsiForHistoryPreview(value)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+  if (!plain) {
+    return [];
   }
-  const tail = value.slice(-TERMINAL_HISTORY_PREVIEW_MAX_CHARS);
-  const firstLineBreak = tail.indexOf("\n");
-  return firstLineBreak >= 0 ? tail.slice(firstLineBreak + 1) : tail;
+
+  const lines = plain.split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return wrapPlainHistoryLines(lines, cols);
+}
+
+function wrapPlainHistoryLines(lines: string[], cols: number): string[] {
+  const width = Math.max(20, Math.floor(cols || ZELLIJ_WEB_COLS));
+  const rows: string[] = [];
+  for (const line of lines) {
+    if (line === "") {
+      rows.push("");
+      continue;
+    }
+
+    let row = "";
+    let rowWidth = 0;
+    for (const char of Array.from(line)) {
+      const charWidth = historyCharWidth(char, rowWidth);
+      if (row && rowWidth + charWidth > width) {
+        rows.push(row);
+        row = "";
+        rowWidth = 0;
+      }
+      row += char;
+      rowWidth += charWidth;
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function historyCharWidth(char: string, column: number): number {
+  if (char === "\t") {
+    return 4 - (column % 4);
+  }
+  const code = char.codePointAt(0) ?? 0;
+  if (
+    (code >= 0x0300 && code <= 0x036f) ||
+    (code >= 0x1ab0 && code <= 0x1aff) ||
+    (code >= 0x1dc0 && code <= 0x1dff) ||
+    (code >= 0x20d0 && code <= 0x20ff) ||
+    (code >= 0xfe20 && code <= 0xfe2f)
+  ) {
+    return 0;
+  }
+  if (
+    (code >= 0x1100 && code <= 0x115f) ||
+    code === 0x2329 ||
+    code === 0x232a ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe10 && code <= 0xfe19) ||
+    (code >= 0xfe30 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6)
+  ) {
+    return 2;
+  }
+  return 1;
 }
 
 function isTerminalScrolledToBottom(terminal: Terminal): boolean {
