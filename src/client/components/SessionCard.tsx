@@ -2,6 +2,8 @@ import {
   ChangeEvent,
   ClipboardEvent,
   FormEvent,
+  KeyboardEvent,
+  PointerEvent,
   WheelEvent,
   memo,
   useCallback,
@@ -98,12 +100,20 @@ function SessionCardComponent({
   const [copied, setCopied] = useState(false);
   const previewRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvasRenderRef = useRef<{ canvas: HTMLCanvasElement; key: string } | null>(null);
   const quickInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const copiedTimerRef = useRef<number | null>(null);
   const composingRef = useRef(false);
   const stickToBottomRef = useRef(true);
   const userPreviewScrollRef = useRef(false);
+  const previewPanRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    scrollLeft: number;
+    scrollTop: number;
+  } | null>(null);
   const deferredPreview = useDeferredValue(displayedPreview);
   const output = deferredPreview?.text || (isLive ? "" : "terminal is not running");
   const grid = deferredPreview?.grid;
@@ -164,14 +174,25 @@ function SessionCardComponent({
     }
     const previewElement = previewRef.current;
     const availableWidth = previewElement ? contentWidth(previewElement) : undefined;
+    const renderKey = [
+      deferredPreview?.signature || gridSignature(grid),
+      Math.round(availableWidth || 0),
+      terminalFontSize,
+      terminalScale,
+      window.devicePixelRatio || 1
+    ].join(":");
+    if (canvasRenderRef.current?.canvas === canvasRef.current && canvasRenderRef.current.key === renderKey) {
+      return;
+    }
     drawPreviewCanvas(canvasRef.current, grid, availableWidth, {
       fontSize: terminalFontSize,
       scale: terminalScale
     });
+    canvasRenderRef.current = { canvas: canvasRef.current, key: renderKey };
     if (previewElement && stickToBottomRef.current) {
       previewElement.scrollTop = previewElement.scrollHeight;
     }
-  }, [grid, showCanvas, terminalFontSize, terminalScale]);
+  }, [deferredPreview?.signature, grid, showCanvas, terminalFontSize, terminalScale]);
 
   useLayoutEffect(() => {
     if (!showCanvas) {
@@ -232,24 +253,67 @@ function SessionCardComponent({
 
     userPreviewScrollRef.current = true;
     event.stopPropagation();
-    if (canScrollX && (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY))) {
-      event.preventDefault();
-      target.scrollLeft += event.shiftKey ? event.deltaY : event.deltaX;
+  };
+
+  const handlePreviewPointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    if (!showCanvas || event.pointerType !== "mouse" || event.button !== 0) {
       return;
     }
-
-    if (!canScrollY) {
-      return;
-    }
-
-    const atTop = target.scrollTop <= 0;
-    const atBottom = target.scrollTop + target.clientHeight >= target.scrollHeight - 1;
-    if ((event.deltaY < 0 && atTop) || (event.deltaY > 0 && atBottom)) {
-      return;
-    }
-
+    const target = event.currentTarget;
+    userPreviewScrollRef.current = true;
+    previewPanRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      scrollLeft: target.scrollLeft,
+      scrollTop: target.scrollTop
+    };
+    target.setPointerCapture(event.pointerId);
+    target.classList.add("panning");
     event.preventDefault();
-    target.scrollTop += event.deltaY;
+    event.stopPropagation();
+  };
+
+  const handlePreviewPointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    const pan = previewPanRef.current;
+    if (!pan || pan.pointerId !== event.pointerId) {
+      return;
+    }
+    const target = event.currentTarget;
+    target.scrollLeft = pan.scrollLeft - (event.clientX - pan.startX);
+    target.scrollTop = pan.scrollTop - (event.clientY - pan.startY);
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  const stopPreviewPan = (event: PointerEvent<HTMLDivElement>) => {
+    if (previewPanRef.current?.pointerId !== event.pointerId) {
+      return;
+    }
+    previewPanRef.current = null;
+    event.currentTarget.classList.remove("panning");
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const handlePreviewKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const target = event.currentTarget;
+    const page = Math.max(80, target.clientHeight * 0.85);
+    if (event.key === "PageUp") {
+      target.scrollBy({ top: -page, behavior: "smooth" });
+    } else if (event.key === "PageDown") {
+      target.scrollBy({ top: page, behavior: "smooth" });
+    } else if (event.key === "Home" && (event.ctrlKey || event.metaKey)) {
+      target.scrollTo({ top: 0, behavior: "smooth" });
+    } else if (event.key === "End" && (event.ctrlKey || event.metaKey)) {
+      target.scrollTo({ top: target.scrollHeight, behavior: "smooth" });
+    } else {
+      return;
+    }
+    userPreviewScrollRef.current = true;
+    event.preventDefault();
+    event.stopPropagation();
   };
 
   const resumeLatestPreview = () => {
@@ -451,8 +515,14 @@ function SessionCardComponent({
           className={showCanvas ? "preview terminal-grid-preview" : "preview ansi-preview selectable-preview"}
           style={previewStyle}
           ref={previewRef}
+          tabIndex={0}
           onScroll={trackPreviewScroll}
           onWheel={handlePreviewWheel}
+          onKeyDown={handlePreviewKeyDown}
+          onPointerDown={handlePreviewPointerDown}
+          onPointerMove={handlePreviewPointerMove}
+          onPointerUp={stopPreviewPan}
+          onPointerCancel={stopPreviewPan}
           onMouseDown={(event) => {
             event.stopPropagation();
             if (selectMode) {
@@ -467,11 +537,11 @@ function SessionCardComponent({
             <code className="ansi-preview-content">{renderedOutput}</code>
           )}
         </div>
-        {historyPaused && hasPendingPreview && (
+        {historyPaused && (
           <button
             className="preview-latest"
             type="button"
-            title="回到最新"
+            title={hasPendingPreview ? "有新输出，回到最新" : "回到最新"}
             onClick={resumeLatestPreview}
             onMouseDown={(event) => event.stopPropagation()}
           >

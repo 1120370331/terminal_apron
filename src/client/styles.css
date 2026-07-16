@@ -761,17 +761,32 @@ select {
 }
 
 .terminal-grid-preview {
+  display: flex;
+  align-items: flex-start;
   line-height: 0;
   overflow: auto;
   -webkit-overflow-scrolling: touch;
   touch-action: pan-x pan-y;
   user-select: none;
+  cursor: grab;
+}
+
+.terminal-grid-preview.panning {
+  cursor: grabbing;
+  scroll-behavior: auto;
 }
 
 .terminal-preview-canvas {
   display: block;
+  flex: 0 0 auto;
+  margin-top: auto;
   max-width: none;
   transform-origin: top left;
+}
+
+.preview:focus-visible {
+  outline: 2px solid #7fb6ff;
+  outline-offset: -2px;
 }
 
 .preview-latest {

@@ -832,8 +832,7 @@ async function renderSessionPreviewGrid(
       return renderPreviewGrid(previewText, {
         cols: size.cols,
         rows: full ? lines : size.rows,
-        preserveViewport: true,
-        padRows: !full
+        preserveViewport: true
       });
     }
   }

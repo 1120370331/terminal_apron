@@ -516,9 +516,8 @@ function normalizeVisibleLayout(layout: Layout[]): { layout: Layout[]; offsetY: 
     return { layout, offsetY: 0 };
   }
 
-  const offsetY = Math.min(...layout.map((item) => item.y));
   return {
-    offsetY,
+    offsetY: 0,
     layout: layout.map((item) => {
       const w = Math.max(item.minW ?? MIN_CARD_COLUMNS, Math.min(GRID_COLUMNS, item.w));
       return {
@@ -526,7 +525,7 @@ function normalizeVisibleLayout(layout: Layout[]): { layout: Layout[]; offsetY: 
         w,
         h: Math.max(item.minH ?? MIN_LAYOUT_ROWS, item.h),
         x: Math.max(0, Math.min(GRID_COLUMNS - w, item.x)),
-        y: Math.max(0, item.y - offsetY),
+        y: Math.max(0, item.y),
         minW: MIN_CARD_COLUMNS,
         minH: MIN_LAYOUT_ROWS
       };
@@ -901,16 +900,15 @@ export function App() {
   }, [auth, sessionsLoaded, previewRevealReady, previewRevealTargetKey, previewRevealTargets.length]);
 
   const applySessionPreview = useCallback(
-    (sessionId: string, preview: SessionPreview, full: boolean) => {
+    (sessionId: string, preview: SessionPreview, _full: boolean) => {
       if (preview.unchanged) {
         return;
       }
       setPreviews((current) => {
-        const nextPreview = full ? preview : mergeFastPreview(current[sessionId], preview, settings.previewLines);
-        return samePreview(current[sessionId], nextPreview) ? current : { ...current, [sessionId]: nextPreview };
+        return samePreview(current[sessionId], preview) ? current : { ...current, [sessionId]: preview };
       });
     },
-    [settings.previewLines]
+    []
   );
 
   const runPreviewRequest = useCallback(
@@ -995,9 +993,8 @@ export function App() {
         const now = Date.now();
         const previous = previewsRef.current[sessionId];
         const lastFullAt = lastFullPreviewAtRef.current[sessionId] ?? 0;
-        const shouldLoadFull =
-          !remoteBrowserHost && Boolean(previous?.grid) && now - lastFullAt >= fullPreviewRefreshMs;
-        const knownSignature = shouldLoadFull ? "" : previewContentSignature(previous);
+        const shouldLoadFull = true;
+        const knownSignature = now - lastFullAt >= fullPreviewRefreshMs ? "" : previewContentSignature(previous);
         const preview = await runPreviewRequest(() =>
           api.preview(sessionId, settings.previewLines, previewMaxChars, shouldLoadFull, false, knownSignature)
         );
@@ -1015,11 +1012,7 @@ export function App() {
 
         applySessionPreview(sessionId, preview, shouldLoadFull);
       } catch {
-        if (!cancelled) {
-          setPreviews((current) =>
-            current[sessionId]?.text === "" ? current : { ...current, [sessionId]: emptyPreview(sessionId) }
-          );
-        }
+        // Retain the last successful frame during transient capture failures.
       } finally {
         previewInFlightRef.current.delete(sessionId);
       }

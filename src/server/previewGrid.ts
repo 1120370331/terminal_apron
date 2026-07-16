@@ -31,7 +31,6 @@ interface RenderPreviewGridOptions {
   cols?: number;
   rows?: number;
   preserveViewport?: boolean;
-  padRows?: boolean;
 }
 
 export async function renderPreviewGrid(
@@ -45,7 +44,7 @@ export async function renderPreviewGrid(
   const cols = clampNumber(options.cols, detectPreviewColumns(data), PREVIEW_MIN_COLS, PREVIEW_MAX_COLS);
   const rowsToKeep = clampNumber(options.rows, PREVIEW_DEFAULT_ROWS, 10, PREVIEW_MAX_ROWS);
   if (options.preserveViewport) {
-    return renderDumpScreenGrid(data, cols, rowsToKeep, Boolean(options.padRows));
+    return renderDumpScreenGrid(data, cols, rowsToKeep);
   }
 
   const screen = new Headless.Terminal({
@@ -88,21 +87,25 @@ export async function renderPreviewGrid(
   }
 }
 
-function renderDumpScreenGrid(data: string, cols: number, rowsToKeep: number, padRows: boolean): TerminalPreviewGrid {
+function renderDumpScreenGrid(data: string, cols: number, rowsToKeep: number): TerminalPreviewGrid {
   let rawRows = data.split(/\r?\n/);
   if (rawRows.length > rowsToKeep) {
     rawRows = rawRows.slice(-rowsToKeep);
   }
-  while (padRows && rawRows.length < rowsToKeep) {
-    rawRows.push("");
-  }
 
   const renderedCols = Math.max(cols, ...rawRows.map((line) => visibleColumns(line.replace(ANSI_PATTERN, "").trimEnd())));
+  const rows = rawRows.map((line) => ({
+    segments: trimTrailingDefaultSpaces(parseAnsiLine(line))
+  }));
+  while (rows.length && isEmptyRow(rows[0])) {
+    rows.shift();
+  }
+  while (rows.length && isEmptyRow(rows[rows.length - 1])) {
+    rows.pop();
+  }
   return {
     cols: Math.min(PREVIEW_MAX_COLS, renderedCols),
-    rows: rawRows.map((line) => ({
-      segments: trimTrailingDefaultSpaces(parseAnsiLine(line))
-    }))
+    rows
   };
 }
 
