@@ -1,6 +1,4 @@
 import {
-  ChangeEvent,
-  ClipboardEvent,
   FormEvent,
   KeyboardEvent,
   PointerEvent,
@@ -25,7 +23,7 @@ import {
   Edit3,
   ExternalLink,
   Grip,
-  Paperclip,
+  History,
   Play,
   RotateCcw,
   Send,
@@ -34,29 +32,21 @@ import {
   TextCursorInput
 } from "lucide-react";
 import type { SessionPreview, TerminalPreviewGrid, TerminalPreviewSegment, TerminalSession } from "../../shared/types";
-import { filesFromClipboardData, readClipboardFiles, readClipboardText, writeClipboardText } from "../clipboard";
-
-export type QuickInputPhase = "sending" | "sent" | "echoing" | "updated" | "error";
-
-export interface QuickInputStatus {
-  inputId: string;
-  phase: QuickInputPhase;
-  inputSeq?: number;
-  message?: string;
-  updatedAt: number;
-}
+import { characterColumns } from "../../shared/unicodeWidth";
+import { resolveCodexStatus } from "../../shared/codexStatus";
+import { readClipboardText, writeClipboardText } from "../clipboard";
 
 interface Props {
   session: TerminalSession;
   preview?: SessionPreview;
-  quickInputStatus?: QuickInputStatus;
+  backgroundImage: string | null;
   previewFontSize: number;
   previewScale: number;
   onOpen: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
+  onCodexHistory: () => void;
   onQuickInput: (value: string) => Promise<void>;
-  onPasteFiles: (files: File[]) => Promise<string>;
   onArchive: () => void;
   onRestore: () => void;
   onKill: () => void;
@@ -74,14 +64,14 @@ const MOBILE_QUERY = "(max-width: 720px)";
 function SessionCardComponent({
   session,
   preview,
-  quickInputStatus,
+  backgroundImage,
   previewFontSize,
   previewScale,
   onOpen,
   onEdit,
   onDuplicate,
+  onCodexHistory,
   onQuickInput,
-  onPasteFiles,
   onArchive,
   onRestore,
   onKill
@@ -92,7 +82,7 @@ function SessionCardComponent({
   const backend = runtime?.backend ?? session.backend;
   const [quickInput, setQuickInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [uploading, setUploading] = useState(false);
+  const [continuing, setContinuing] = useState(false);
   const [displayedPreview, setDisplayedPreview] = useState<SessionPreview | undefined>(preview);
   const [historyPaused, setHistoryPaused] = useState(false);
   const [hasPendingPreview, setHasPendingPreview] = useState(false);
@@ -101,12 +91,9 @@ function SessionCardComponent({
   const previewRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasRenderRef = useRef<{ canvas: HTMLCanvasElement; key: string } | null>(null);
-  const quickInputRef = useRef<HTMLInputElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const quickInputRef = useRef<HTMLTextAreaElement | null>(null);
   const copiedTimerRef = useRef<number | null>(null);
-  const composingRef = useRef(false);
   const stickToBottomRef = useRef(true);
-  const userPreviewScrollRef = useRef(false);
   const previewPanRef = useRef<{
     pointerId: number;
     startX: number;
@@ -115,7 +102,7 @@ function SessionCardComponent({
     scrollTop: number;
   } | null>(null);
   const deferredPreview = useDeferredValue(displayedPreview);
-  const output = deferredPreview?.text || (isLive ? "" : "terminal is not running");
+  const output = normalizeTerminalText(deferredPreview?.text || (isLive ? "" : "terminal is not running"));
   const grid = deferredPreview?.grid;
   const showCanvas = Boolean(grid && !selectMode);
   const compactOutput = useMemo(() => compactPreview(output), [output]);
@@ -124,24 +111,10 @@ function SessionCardComponent({
   const terminalFontSize = normalizedPreviewFontSize(previewFontSize);
   const terminalScale = normalizedPreviewScale(previewScale);
   const previewStyle = {
-    "--list-terminal-font-size": `${terminalFontSize * terminalScale}px`
+    "--list-terminal-font-size": `${terminalFontSize * terminalScale}px`,
+    "--terminal-background-image": backgroundImage ? `url("${backgroundImage}")` : "none"
   } as CSSProperties;
-  const quickInputPhase = quickInputStatus?.phase;
-  const inputControlsDisabled = sending || uploading || quickInputPhase === "sending";
-  const quickStatusLabel = quickInputPhase ? quickInputStatusLabel(quickInputPhase) : sending ? "sending" : uploading ? "uploading" : "";
-  const quickStatusClass = quickInputPhase ?? (sending || uploading ? "sending" : "sent");
-  const quickStatusTitle = quickInputStatus
-    ? [quickInputStatus.message, quickInputStatus.inputSeq ? `seq ${quickInputStatus.inputSeq}` : quickInputStatus.inputId]
-        .filter(Boolean)
-        .join(" / ")
-    : quickStatusLabel;
-  const cardClassName = [
-    "session-card",
-    session.archived ? "archived" : "",
-    quickInputPhase ? `quick-input-${quickInputPhase}` : ""
-  ]
-    .filter(Boolean)
-    .join(" ");
+  const codexStatus = resolveCodexStatus(session, preview);
 
   useEffect(() => {
     if (!preview && !displayedPreview) {
@@ -179,6 +152,7 @@ function SessionCardComponent({
       Math.round(availableWidth || 0),
       terminalFontSize,
       terminalScale,
+      backgroundImage ?? "",
       window.devicePixelRatio || 1
     ].join(":");
     if (canvasRenderRef.current?.canvas === canvasRef.current && canvasRenderRef.current.key === renderKey) {
@@ -192,7 +166,7 @@ function SessionCardComponent({
     if (previewElement && stickToBottomRef.current) {
       previewElement.scrollTop = previewElement.scrollHeight;
     }
-  }, [deferredPreview?.signature, grid, showCanvas, terminalFontSize, terminalScale]);
+  }, [backgroundImage, deferredPreview?.signature, grid, showCanvas, terminalFontSize, terminalScale]);
 
   useLayoutEffect(() => {
     if (!showCanvas) {
@@ -232,15 +206,10 @@ function SessionCardComponent({
     const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
     const isAtBottom = distanceToBottom < 24;
     stickToBottomRef.current = isAtBottom;
+    setHistoryPaused(target.scrollHeight > target.clientHeight && !isAtBottom);
     if (isAtBottom) {
-      userPreviewScrollRef.current = false;
-      setHistoryPaused(false);
       setHasPendingPreview(false);
-      return;
     }
-
-    const shouldPause = target.scrollHeight > target.clientHeight && (userPreviewScrollRef.current || selectMode);
-    setHistoryPaused(shouldPause);
   };
 
   const handlePreviewWheel = (event: WheelEvent<HTMLDivElement>) => {
@@ -251,7 +220,6 @@ function SessionCardComponent({
       return;
     }
 
-    userPreviewScrollRef.current = true;
     event.stopPropagation();
   };
 
@@ -260,7 +228,6 @@ function SessionCardComponent({
       return;
     }
     const target = event.currentTarget;
-    userPreviewScrollRef.current = true;
     previewPanRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -311,13 +278,11 @@ function SessionCardComponent({
     } else {
       return;
     }
-    userPreviewScrollRef.current = true;
     event.preventDefault();
     event.stopPropagation();
   };
 
   const resumeLatestPreview = () => {
-    userPreviewScrollRef.current = false;
     stickToBottomRef.current = true;
     setHistoryPaused(false);
     setDisplayedPreview(preview);
@@ -361,96 +326,34 @@ function SessionCardComponent({
     });
   };
 
-  const insertQuickInputText = useCallback((text: string, pad = false) => {
-    if (!text) {
-      quickInputRef.current?.focus();
-      return;
-    }
-
-    const input = quickInputRef.current;
-    setQuickInput((current) => {
-      const start = input?.selectionStart ?? current.length;
-      const end = input?.selectionEnd ?? start;
-      const before = current.slice(0, start);
-      const after = current.slice(end);
-      const prefix = pad && before && !/\s$/.test(before) ? " " : "";
-      const suffix = pad && after && !/^\s/.test(after) ? " " : "";
-      const next = `${before}${prefix}${text}${suffix}${after}`;
-      const cursor = before.length + prefix.length + text.length;
-      window.requestAnimationFrame(() => {
-        input?.focus();
-        input?.setSelectionRange(cursor, cursor);
-      });
-      return next;
-    });
-  }, []);
-
-  const appendFilesToQuickInput = async (files: File[]) => {
-    if (files.length === 0) {
-      quickInputRef.current?.focus();
-      return;
-    }
-    if (inputControlsDisabled) {
-      return;
-    }
-
-    setUploading(true);
-    try {
-      const terminalText = await onPasteFiles(files);
-      insertQuickInputText(terminalText, true);
-    } finally {
-      setUploading(false);
-      quickInputRef.current?.focus();
-    }
-  };
-
   const pasteClipboardToInput = async () => {
     try {
-      const files = await readClipboardFiles();
-      if (files.length > 0) {
-        await appendFilesToQuickInput(files);
+      const text = await readClipboardText();
+      if (!text) {
+        quickInputRef.current?.focus();
         return;
       }
-    } catch {
-      // Fall back to text clipboard below.
-    }
-
-    try {
-      const text = await readClipboardText();
-      if (text) {
-        insertQuickInputText(text);
-      } else {
-        quickInputRef.current?.focus();
-      }
+      const input = quickInputRef.current;
+      setQuickInput((current) => {
+        const start = input?.selectionStart ?? current.length;
+        const end = input?.selectionEnd ?? start;
+        const next = `${current.slice(0, start)}${text}${current.slice(end)}`;
+        const cursor = start + text.length;
+        window.requestAnimationFrame(() => {
+          input?.focus();
+          input?.setSelectionRange(cursor, cursor);
+        });
+        return next;
+      });
     } catch {
       quickInputRef.current?.focus();
     }
-  };
-
-  const pasteFilesToInput = async (event: ClipboardEvent<HTMLInputElement>) => {
-    const files = filesFromClipboardData(event.clipboardData);
-    if (files.length === 0) {
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-    await appendFilesToQuickInput(files);
-  };
-
-  const selectFilesForInput = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.currentTarget.files ?? []);
-    event.currentTarget.value = "";
-    await appendFilesToQuickInput(files);
   };
 
   const submitQuickInput = async (event: FormEvent) => {
     event.preventDefault();
-    if (composingRef.current) {
-      return;
-    }
-    const value = (quickInputRef.current?.value ?? quickInput).trimEnd();
-    if (!value || inputControlsDisabled) {
+    const value = quickInput.trimEnd();
+    if (!value || sending) {
       return;
     }
 
@@ -458,17 +361,69 @@ function SessionCardComponent({
     try {
       await onQuickInput(value);
       setQuickInput("");
-    } catch {
-      // Parent owns the visible error state; keep the input so it can be retried.
     } finally {
       setSending(false);
     }
   };
 
+  const continueCodex = async () => {
+    if (codexStatus.state !== "error" || continuing || sending) {
+      return;
+    }
+    setContinuing(true);
+    try {
+      await onQuickInput("continue");
+    } finally {
+      setContinuing(false);
+    }
+  };
+
   return (
-    <article className={cardClassName}>
+    <article
+      className={[
+        "session-card",
+        session.archived ? "archived" : ""
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
       <div className="session-accent" style={{ background: session.color }} />
       <header className="session-card-header">
+        <button
+          className={`codex-session-status ${codexStatus.state} ${
+            codexStatus.state === "error" ? "actionable" : ""
+          }`}
+          type="button"
+          tabIndex={0}
+          aria-label={
+            codexStatus.state === "error"
+              ? `${codexStatus.label}，会话 ${session.name}，点击发送 continue`
+              : `${codexStatus.label}，会话 ${session.name}`
+          }
+          aria-disabled={codexStatus.state !== "error" || continuing}
+          onMouseDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            void continueCodex();
+          }}
+        >
+          <span className="codex-session-status-swatch" />
+          <span className="codex-session-status-copy">
+            <strong>{continuing ? "正在继续" : codexStatus.label}</strong>
+            <span>{codexStatus.conversationTitle || session.name}</span>
+          </span>
+          <span className="codex-status-details">
+            <strong>{codexStatus.conversationTitle || session.name}</strong>
+            <span>{codexStatus.label}</span>
+            {codexStatus.conversationId && <code>{codexStatus.conversationId}</code>}
+            {codexStatus.errorCode && <code>{codexStatus.errorCode}</code>}
+            {codexStatus.errorMessage && <span>{codexStatus.errorMessage}</span>}
+            {codexStatus.state === "error" && <span>点击发送 continue 并继续本轮对话</span>}
+            <code>{runtime?.currentCommand || "Codex 未启动"}</code>
+            <span title={livePath}>{livePath}</span>
+          </span>
+        </button>
         <button className="drag-handle" type="button" title="拖拽排列">
           <Grip size={15} />
         </button>
@@ -523,19 +478,10 @@ function SessionCardComponent({
           onPointerMove={handlePreviewPointerMove}
           onPointerUp={stopPreviewPan}
           onPointerCancel={stopPreviewPan}
-          onMouseDown={(event) => {
-            event.stopPropagation();
-            if (selectMode) {
-              userPreviewScrollRef.current = true;
-            }
-          }}
+          onMouseDown={(event) => event.stopPropagation()}
           onTouchStart={(event) => event.stopPropagation()}
         >
-          {showCanvas ? (
-            <canvas className="terminal-preview-canvas" ref={canvasRef} />
-          ) : (
-            <code className="ansi-preview-content">{renderedOutput}</code>
-          )}
+          {showCanvas ? <canvas className="terminal-preview-canvas" ref={canvasRef} /> : renderedOutput}
         </div>
         {historyPaused && (
           <button
@@ -552,57 +498,32 @@ function SessionCardComponent({
 
       {!session.archived && (
         <form className="quick-input" onSubmit={submitQuickInput} onMouseDown={(event) => event.stopPropagation()}>
-          <input
+          <textarea
             ref={quickInputRef}
-            id={`quick-input-${session.id}`}
-            name={`quick-input-${session.id}`}
-            autoComplete="off"
-            spellCheck={false}
+            rows={1}
             value={quickInput}
             onChange={(event) => setQuickInput(event.target.value)}
-            onPaste={(event) => void pasteFilesToInput(event)}
-            onCompositionStart={() => {
-              composingRef.current = true;
-            }}
-            onCompositionEnd={() => {
-              composingRef.current = false;
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }
             }}
             placeholder="Type to terminal..."
-            disabled={inputControlsDisabled}
-          />
-          <input
-            ref={fileInputRef}
-            className="hidden-file-input"
-            type="file"
-            multiple
-            onChange={(event) => void selectFilesForInput(event)}
+            disabled={sending}
           />
           <button
             className="icon-button small"
             type="button"
-            disabled={inputControlsDisabled}
-            title="Attach image or file"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <Paperclip size={15} />
-          </button>
-          <button
-            className="icon-button small"
-            type="button"
-            disabled={inputControlsDisabled}
-            title="Paste clipboard text or image"
+            disabled={sending}
+            title="Paste clipboard"
             onClick={() => void pasteClipboardToInput()}
           >
             <ClipboardPaste size={15} />
           </button>
-          <button className="icon-button small" type="submit" disabled={inputControlsDisabled || !quickInput.trim()} title="Send">
+          <button className="icon-button small" type="submit" disabled={sending || !quickInput.trim()} title="Send">
             <Send size={15} />
           </button>
-          {quickStatusLabel && (
-            <span className={`quick-input-status ${quickStatusClass}`} title={quickStatusTitle} aria-live="polite">
-              {quickStatusLabel}
-            </span>
-          )}
         </form>
       )}
 
@@ -631,6 +552,9 @@ function SessionCardComponent({
               <button className="icon-button small" type="button" onClick={onDuplicate} title="复制配置">
                 <Copy size={16} />
               </button>
+              <button className="icon-button small" type="button" onClick={onCodexHistory} title="Codex 历史对话">
+                <History size={16} />
+              </button>
               <button className="icon-button small" type="button" onClick={onArchive} title="归档">
                 <Archive size={16} />
               </button>
@@ -656,33 +580,10 @@ function areSessionCardPropsEqual(previous: Props, next: Props): boolean {
   return (
     previous.previewFontSize === next.previewFontSize &&
     previous.previewScale === next.previewScale &&
+    previous.backgroundImage === next.backgroundImage &&
     previewSignature(previous.preview) === previewSignature(next.preview) &&
-    quickInputStatusSignature(previous.quickInputStatus) === quickInputStatusSignature(next.quickInputStatus) &&
     sessionCardSignature(previous.session) === sessionCardSignature(next.session)
   );
-}
-
-function quickInputStatusLabel(phase: QuickInputPhase): string {
-  if (phase === "sent") {
-    return "sent";
-  }
-  if (phase === "echoing") {
-    return "echoing";
-  }
-  if (phase === "updated") {
-    return "updated";
-  }
-  if (phase === "error") {
-    return "error";
-  }
-  return "sending";
-}
-
-function quickInputStatusSignature(status?: QuickInputStatus): string {
-  if (!status) {
-    return "";
-  }
-  return [status.inputId, status.phase, status.inputSeq ?? "", status.message ?? "", status.updatedAt].join("\u001f");
 }
 
 function previewSignature(preview?: SessionPreview): string {
@@ -750,7 +651,13 @@ function sessionCardSignature(session: TerminalSession): string {
     String(runtime?.exists ?? ""),
     runtime?.currentPath ?? "",
     runtime?.currentCommand ?? "",
-    String(runtime?.windows ?? "")
+    String(runtime?.windows ?? ""),
+    session.codexStatus?.state ?? "",
+    session.codexStatus?.conversationId ?? "",
+    session.codexStatus?.turnId ?? "",
+    session.codexStatus?.errorCode ?? "",
+    session.codexStatus?.errorMessage ?? "",
+    session.codexStatus?.updatedAt ?? ""
   ].join("\u001f");
 }
 
@@ -806,8 +713,7 @@ function drawPreviewCanvas(
 
   context.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
   context.imageSmoothingEnabled = false;
-  context.fillStyle = "#111614";
-  context.fillRect(0, 0, naturalWidth, naturalHeight);
+  context.clearRect(0, 0, naturalWidth, naturalHeight);
 
   for (let rowIndex = 0; rowIndex < grid.rows.length; rowIndex += 1) {
     const row = grid.rows[rowIndex];
@@ -864,20 +770,12 @@ function drawCanvasSegment(
 function drawCellAlignedText(context: CanvasRenderingContext2D, value: string, x: number, y: number, cellWidth: number): void {
   let cursor = x;
   for (const char of Array.from(value)) {
-    const columns = charColumns(char);
+    const columns = characterColumns(char);
     if (char !== " ") {
       context.fillText(char, cursor, y);
     }
     cursor += columns * cellWidth;
   }
-}
-
-function charColumns(char: string): number {
-  const codePoint = char.codePointAt(0) ?? 0;
-  if (codePoint === 0) {
-    return 0;
-  }
-  return codePoint > 0xff ? 2 : 1;
 }
 
 function compactPreview(value: string): string {
@@ -941,6 +839,17 @@ function renderAnsi(value: string): ReactNode[] {
 
 function stripAnsi(value: string): string {
   return value.replace(ANSI_PATTERN, "");
+}
+
+function normalizeTerminalText(value: string): string {
+  return value
+    .split("\n")
+    .map((line) => {
+      const normalized = line.endsWith("\r") ? line.slice(0, -1) : line;
+      const carriageReturn = normalized.lastIndexOf("\r");
+      return carriageReturn >= 0 ? normalized.slice(carriageReturn + 1) : normalized;
+    })
+    .join("\n");
 }
 
 function applySgr(current: CSSProperties, sequence: string): CSSProperties {

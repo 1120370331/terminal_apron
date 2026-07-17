@@ -1,6 +1,7 @@
 import Headless from "@xterm/headless";
 import type { IBufferCell, Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { TerminalPreviewGrid, TerminalPreviewRow, TerminalPreviewSegment } from "../shared/types.js";
+import { characterColumns } from "../shared/unicodeWidth.js";
 
 const PREVIEW_MIN_COLS = 20;
 const PREVIEW_DEFAULT_COLS = 120;
@@ -88,12 +89,11 @@ export async function renderPreviewGrid(
 }
 
 function renderDumpScreenGrid(data: string, cols: number, rowsToKeep: number): TerminalPreviewGrid {
-  let rawRows = data.split(/\r?\n/);
+  let rawRows = normalizeTerminalRows(data);
   if (rawRows.length > rowsToKeep) {
     rawRows = rawRows.slice(-rowsToKeep);
   }
 
-  const renderedCols = Math.max(cols, ...rawRows.map((line) => visibleColumns(line.replace(ANSI_PATTERN, "").trimEnd())));
   const rows = rawRows.map((line) => ({
     segments: trimTrailingDefaultSpaces(parseAnsiLine(line))
   }));
@@ -103,8 +103,9 @@ function renderDumpScreenGrid(data: string, cols: number, rowsToKeep: number): T
   while (rows.length && isEmptyRow(rows[rows.length - 1])) {
     rows.pop();
   }
+
   return {
-    cols: Math.min(PREVIEW_MAX_COLS, renderedCols),
+    cols,
     rows
   };
 }
@@ -326,7 +327,7 @@ function trimTrailingDefaultSpaces(segments: TerminalPreviewSegment[]): Terminal
 }
 
 function visibleColumns(value: string): number {
-  return Array.from(value).reduce((count, char) => count + charColumns(char), 0);
+  return Array.from(value).reduce((count, char) => count + characterColumns(char), 0);
 }
 
 function detectPreviewColumns(value: string): number {
@@ -336,14 +337,6 @@ function detectPreviewColumns(value: string): number {
     maxColumns = Math.max(maxColumns, visibleColumns(line.trimEnd()));
   }
   return Math.max(PREVIEW_MIN_COLS, Math.min(PREVIEW_MAX_COLS, maxColumns || PREVIEW_DEFAULT_COLS));
-}
-
-function charColumns(char: string): number {
-  const codePoint = char.codePointAt(0) ?? 0;
-  if (codePoint === 0) {
-    return 0;
-  }
-  return codePoint > 0xff ? 2 : 1;
 }
 
 function clampByte(value: number): number {
@@ -369,4 +362,12 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
     return fallback;
   }
   return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function normalizeTerminalRows(value: string): string[] {
+  return value.split("\n").map((line) => {
+    const withoutTrailingCr = line.endsWith("\r") ? line.slice(0, -1) : line;
+    const carriageReturn = withoutTrailingCr.lastIndexOf("\r");
+    return carriageReturn >= 0 ? withoutTrailingCr.slice(carriageReturn + 1) : withoutTrailingCr;
+  });
 }

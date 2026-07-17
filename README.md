@@ -6,9 +6,7 @@
 
 - Web 面板管理多个 terminal，会话支持名称、分组、标签、路径、颜色、布局、归档和复制配置。
 - 每个 terminal 对应一个 Zellij session。网页断开或 Web 服务重启时，Zellij session 不会被杀掉。
-- 列表卡片可以直接发送输入，服务端会以粘贴模式写入目标 pane，并在短暂等待后发送 Enter，适合 Codex 这类交互式 composer。
-- 列表输入行和完整终端窗口支持通过 Ctrl+V 粘贴图片或文件；文件会先上传到项目内 `file-transfer/<user>/` 传输目录，再把路径写入输入位置。
-- 顶部工具栏提供文件传输面板，可上传、刷新、下载、删除和复制传输目录/文件路径，用于不同设备之间交换远程文件。
+- 列表卡片可以直接发送输入，服务端会把文本写入目标 pane 并发送 Enter。
 - 列表预览和完整终端都会尽量保留历史，并有上限避免卡顿。
 - 登录认证支持密码和 SSH 签名登录。
 - 推荐通过 Tailscale tailnet 访问，不建议把终端面板暴露到公网。
@@ -45,8 +43,7 @@ TWM_COOKIE_SECURE=false
 # TWM_USERS_JSON='[{"name":"alice","password":"alice-pass"},{"name":"bob","authorizedKeysFile":"~/.ssh/bob_authorized_keys"}]'
 # TWM_USERS_FILE=./users.json
 
-TWM_NATIVE_HISTORY_BYTES=50000000
-TWM_TERMINAL_ATTACH_HISTORY_LINES=5000
+TWM_NATIVE_HISTORY_BYTES=8000000
 TWM_PREVIEW_MAX_LINES=5000
 TWM_ZELLIJ_SCROLLBACK=50000
 ```

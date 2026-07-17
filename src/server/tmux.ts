@@ -86,24 +86,20 @@ export async function sendTmuxInput(
   session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
   data: string,
   enter = false,
-  submitDelayMs = 0
+  submitDelayMs = 160
 ): Promise<void> {
   await ensureTmuxSession(session);
   const bufferName = `twm_input_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   await runTmux(["set-buffer", "-b", bufferName, data], 5000);
   await runTmux(["paste-buffer", "-d", "-b", bufferName, "-t", session.tmuxName], 5000);
   if (enter) {
-    await delay(submitDelayMs);
+    await delay(Math.max(120, Math.min(12_000, Math.floor(submitDelayMs))));
     await runTmux(["send-keys", "-t", session.tmuxName, "Enter"], 5000);
   }
 }
 
 function delay(ms: number): Promise<void> {
-  const duration = Math.max(0, Math.min(1000, Math.floor(ms)));
-  if (duration === 0) {
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => setTimeout(resolve, duration));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export async function runtimeInfo(session: TerminalSession): Promise<SessionRuntime> {

@@ -43,6 +43,10 @@ function Get-ConfiguredHost {
 function Resolve-MonitorHost {
   param([string] $HostValue)
 
+  if ($HostValue -eq "0.0.0.0" -or $HostValue -eq "::") {
+    return "127.0.0.1"
+  }
+
   if ($HostValue.ToLowerInvariant() -ne "tailscale") {
     return $HostValue
   }

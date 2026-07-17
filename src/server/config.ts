@@ -60,18 +60,6 @@ const inferredAuthModes: AuthMethod[] = configuredUsers.some((user) => user.pass
   : configuredUsers.some((user) => userHasSshKeys(user))
     ? ["ssh"]
     : ["none"];
-const terminalHistoryMaxRangeLines = parseBoundedInteger(
-  process.env.TWM_TERMINAL_HISTORY_MAX_RANGE_LINES,
-  5_000,
-  100,
-  20_000
-);
-const terminalHistoryRangeLines = parseBoundedInteger(
-  process.env.TWM_TERMINAL_HISTORY_RANGE_LINES,
-  5_000,
-  20,
-  terminalHistoryMaxRangeLines
-);
 
 export const config = {
   host: process.env.TWM_HOST ?? process.env.HOST ?? "127.0.0.1",
@@ -87,38 +75,11 @@ export const config = {
   authorizedKeysFile,
   cookieSecure: process.env.TWM_COOKIE_SECURE === "true",
   sshNamespace: "terminal-web-monitor",
-  nativeHistoryBytes: parseBoundedInteger(process.env.TWM_NATIVE_HISTORY_BYTES, 50_000_000, 1_000_000, 200_000_000),
-  nativeScreenScrollback: parseBoundedInteger(process.env.TWM_NATIVE_SCREEN_SCROLLBACK, 50_000, 5_000, 200_000),
-  terminalAttachHistoryLines: parseBoundedInteger(
-    process.env.TWM_TERMINAL_ATTACH_HISTORY_LINES,
-    5_000,
-    5_000,
-    200_000
-  ),
-  terminalSnapshotViewportLines: parseBoundedInteger(
-    process.env.TWM_TERMINAL_SNAPSHOT_VIEWPORT_LINES,
-    120,
-    20,
-    1_200
-  ),
-  terminalHistoryColdTailLines: parseBoundedInteger(process.env.TWM_TERMINAL_HISTORY_COLD_TAIL_LINES, 500, 20, 800),
-  terminalHistoryColdTailBytes: parseBoundedInteger(
-    process.env.TWM_TERMINAL_HISTORY_COLD_TAIL_BYTES,
-    512_000,
-    64_000,
-    4_000_000
-  ),
-  terminalHistoryRangeLines,
-  terminalHistoryMaxRangeLines,
-  terminalHistoryRangeBytes: parseBoundedInteger(
-    process.env.TWM_TERMINAL_HISTORY_RANGE_BYTES,
-    4_000_000,
-    64_000,
-    8_000_000
-  ),
+  nativeHistoryBytes: parseBoundedInteger(process.env.TWM_NATIVE_HISTORY_BYTES, 8_000_000, 240_000, 50_000_000),
+  nativeScreenScrollback: parseBoundedInteger(process.env.TWM_NATIVE_SCREEN_SCROLLBACK, 50_000, 1_000, 200_000),
   previewMaxLines: parseBoundedInteger(process.env.TWM_PREVIEW_MAX_LINES, 5_000, 100, 20_000),
-  tmuxHistoryLimit: parseBoundedInteger(process.env.TWM_TMUX_HISTORY_LIMIT, 50_000, 5_000, 200_000),
-  zellijScrollback: parseBoundedInteger(process.env.TWM_ZELLIJ_SCROLLBACK, 50_000, 5_000, 200_000)
+  tmuxHistoryLimit: parseBoundedInteger(process.env.TWM_TMUX_HISTORY_LIMIT, 50_000, 1_000, 200_000),
+  zellijScrollback: parseBoundedInteger(process.env.TWM_ZELLIJ_SCROLLBACK, 50_000, 1_000, 200_000)
 };
 
 export function configuredUser(name: string | undefined): ConfigUser | undefined {

@@ -6,7 +6,6 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server as SocketServer } from "socket.io";
-import multer from "multer";
 import { config, dataDirForUser } from "./config.js";
 import { SessionStore } from "./db.js";
 import {
@@ -31,34 +30,38 @@ import {
 import {
   captureZellijPreview,
   ensureZellijSession,
+  getZellijTrackedCwd,
   killZellijSession,
   saveZellijSessionState,
   sendZellijInput,
+  setZellijTrackedCwd,
   zellijHealth,
   zellijPreviewSize,
   zellijRuntimeInfo,
   zellijRuntimeSnapshot
 } from "./zellij.js";
-import { registerTerminalSockets } from "./terminalSocket.js";
+import { hasActiveZellijWebClient, registerTerminalSockets } from "./terminalSocket.js";
 import { nodePtyHealth } from "./pty.js";
 import { backendHealth, resolveBackend } from "./backend.js";
 import { NativeSessionManager } from "./nativeSessions.js";
 import { renderPreviewGrid } from "./previewGrid.js";
+import {
+  codexResumeCommand,
+  findCodexConversation,
+  getCodexSessionStatus,
+  listCodexConversations
+} from "./codex.js";
+import { resolveDirectoryChange } from "./shellCwd.js";
+import { selectNativeDirectory } from "./nativeDirectoryPicker.js";
+import { resolveCodexStatus } from "../shared/codexStatus.js";
 import type {
   CreateSessionInput,
   AuthUser,
-  FileTransferEntry,
-  FileTransferListResponse,
-  FileTransferUploadResponse,
-  SessionInputMode,
-  SessionInputRequest,
-  SessionPreview,
-  SessionPreviewDebug,
-  SessionUploadResponse,
   SystemMetrics,
   TerminalPreviewGrid,
   TerminalSession,
-  UpdateSessionInput
+  UpdateSessionInput,
+  UserPreferences
 } from "../shared/types.js";
 
 const app = express();
@@ -71,36 +74,12 @@ const io = new SocketServer(server, {
 });
 const stores = new Map<string, Promise<SessionStore>>();
 const restoreQueuedStores = new Set<string>();
+const observedCodexSessions = new Set<string>();
+let codexStateSnapshotRunning = false;
 const nativeSessions = new NativeSessionManager();
 const DEFAULT_PREVIEW_MAX_CHARS = 120_000;
-const PREVIEW_CACHE_FRESH_MS = 1_800;
-const PREVIEW_CACHE_STALE_MS = 30_000;
-const FULL_PREVIEW_CACHE_FRESH_MS = 15_000;
-const FULL_PREVIEW_CACHE_STALE_MS = 60_000;
-const PREVIEW_MAX_CONCURRENT = 2;
-const MAX_UPLOAD_FILES = 8;
-const MAX_UPLOAD_FILE_BYTES = 50 * 1024 * 1024;
-const TRANSFER_DIR_NAME = "file-transfer";
-const MAX_TRANSFER_LIST_FILES = 1000;
-let acceptedInputSeq = 0;
-let activePreviewJobs = 0;
-const previewJobQueue: Array<() => void> = [];
-const sessionPreviewCache = new Map<string, PreviewCacheEntry>();
-const uploadSessionFiles = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    files: MAX_UPLOAD_FILES,
-    fileSize: MAX_UPLOAD_FILE_BYTES
-  }
-}).array("files", MAX_UPLOAD_FILES);
 
 app.use(express.json({ limit: "1mb" }));
-
-interface PreviewCacheEntry {
-  value?: SessionPreview;
-  capturedAtMs: number;
-  inFlight?: Promise<SessionPreview>;
-}
 
 async function storeForUser(user: AuthUser): Promise<SessionStore> {
   const userDataDir = path.resolve(dataDirForUser(user.name));
@@ -198,55 +177,61 @@ app.get("/api/system/metrics", (_req, res) => {
   res.json(readSystemMetrics());
 });
 
-app.get("/api/file-transfer/files", async (_req, res) => {
-  const user = res.locals.user as AuthUser;
-  const rootDir = await ensureTransferRoot(user);
-  res.json(await fileTransferListPayload(rootDir));
+app.get("/api/preferences", async (_req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  res.json(await store.preferences());
 });
 
-app.post("/api/file-transfer/files", (req, res, next) => {
-  uploadSessionFiles(req, res, (error) => {
-    if (error) {
-      res.status(error instanceof multer.MulterError ? 413 : 400).json({
-        error: error instanceof Error ? error.message : "upload failed"
-      });
+app.patch("/api/preferences", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  res.json(await store.updatePreferences(req.body as Partial<UserPreferences>));
+});
+
+app.post(
+  "/api/backgrounds",
+  express.raw({ type: ["image/png", "image/jpeg", "image/webp", "image/gif", "image/avif"], limit: "12mb" }),
+  async (req, res) => {
+    const buffer = Buffer.isBuffer(req.body) ? req.body : null;
+    const extension = backgroundImageExtension(req.headers["content-type"]);
+    if (!buffer?.length || !extension) {
+      res.status(400).json({ error: "请选择 PNG、JPEG、WebP、GIF 或 AVIF 图片" });
       return;
     }
-    void handleFileTransferUpload(req, res).catch(next);
-  });
+
+    const store = await storeForUser(res.locals.user as AuthUser);
+    const name = `${crypto.randomUUID()}.${extension}`;
+    const directory = path.join(store.dataDir, "backgrounds");
+    await fs.promises.mkdir(directory, { recursive: true });
+    await fs.promises.writeFile(path.join(directory, name), buffer, { flag: "wx" });
+    res.status(201).json({ url: `/api/backgrounds/${name}`, name });
+  }
+);
+
+app.get("/api/backgrounds/:name", async (req, res) => {
+  const name = req.params.name;
+  if (!/^[a-f0-9-]+\.(?:png|jpg|webp|gif|avif)$/.test(name)) {
+    res.status(404).json({ error: "background not found" });
+    return;
+  }
+  const store = await storeForUser(res.locals.user as AuthUser);
+  const filePath = path.join(store.dataDir, "backgrounds", name);
+  if (!fs.existsSync(filePath)) {
+    res.status(404).json({ error: "background not found" });
+    return;
+  }
+  res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+  res.sendFile(filePath);
 });
 
-app.delete("/api/file-transfer/files", async (req, res) => {
-  const user = res.locals.user as AuthUser;
-  const rootDir = await ensureTransferRoot(user);
-  const relativePath = typeof req.body?.path === "string" ? req.body.path : "";
-  const targetPath = resolveTransferFilePathOrRespond(rootDir, relativePath, res);
-  if (!targetPath) {
-    return;
+app.post("/api/filesystem/select-directory", async (req, res) => {
+  const initialPath = typeof req.body?.initialPath === "string" ? req.body.initialPath : undefined;
+  try {
+    res.json({ path: await selectNativeDirectory(initialPath) });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : String(error)
+    });
   }
-  const stat = await fs.promises.stat(targetPath).catch(() => null);
-  if (!stat?.isFile()) {
-    res.status(404).json({ error: "file not found" });
-    return;
-  }
-  await fs.promises.unlink(targetPath);
-  res.json({ ok: true });
-});
-
-app.get("/api/file-transfer/download", async (req, res) => {
-  const user = res.locals.user as AuthUser;
-  const rootDir = await ensureTransferRoot(user);
-  const relativePath = typeof req.query.path === "string" ? req.query.path : "";
-  const targetPath = resolveTransferFilePathOrRespond(rootDir, relativePath, res);
-  if (!targetPath) {
-    return;
-  }
-  const stat = await fs.promises.stat(targetPath).catch(() => null);
-  if (!stat?.isFile()) {
-    res.status(404).json({ error: "file not found" });
-    return;
-  }
-  res.download(targetPath, path.basename(targetPath));
 });
 
 app.get("/api/sessions", async (req, res) => {
@@ -255,13 +240,71 @@ app.get("/api/sessions", async (req, res) => {
   const sessions = await store.all();
   const visible = includeArchived ? sessions : sessions.filter((session) => !session.archived);
   const enriched = await Promise.all(
-    visible.map(async (session) => ({
-      ...session,
-      runtime: await getRuntimeSnapshot(session, store.dataDir).catch(() => fallbackRuntime(session))
-    }))
+    visible.map(async (session) => {
+      const runtime = await getRuntimeSnapshot(session, store.dataDir).catch(() => fallbackRuntime(session));
+      return {
+        ...session,
+        runtime,
+        codexStatus: getCodexSessionStatus(
+          runtime.currentPath || session.cwd,
+          runtime.currentCommand,
+          runtime.exists,
+          reservedCodexConversationIds(visible, session.id),
+          session.createdAt
+        )
+      };
+    })
   );
   res.json(enriched);
 });
+
+app.get("/api/codex/statuses", async (_req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  res.json(await collectCodexStatuses(store));
+});
+
+async function collectCodexStatuses(store: SessionStore): Promise<Record<string, ReturnType<typeof resolveCodexStatus>>> {
+  const sessions = (await store.all()).filter((session) => !session.archived);
+  await disableDuplicateCodexResumeAssignments(store, sessions);
+  const entries = await Promise.all(
+    sessions.map(async (session) => {
+      if (hasActiveZellijWebClient(session.tmuxName)) {
+        const status = session.codexConversationId
+          ? getCodexSessionStatus(
+              session.cwd,
+              `codex resume ${session.codexConversationId}`,
+              Boolean(session.codexAutoResume)
+            )
+          : { state: "stopped" as const, label: "Codex 未启动" };
+        return { session, status };
+      }
+      const runtime = await getRuntimeSnapshot(session, store.dataDir).catch(() => fallbackRuntime(session));
+      const rolloutStatus = getCodexSessionStatus(
+        runtime.currentPath || session.cwd,
+        runtime.currentCommand,
+        runtime.exists,
+        reservedCodexConversationIds(sessions, session.id),
+        session.createdAt
+      );
+      const previewText = runtime.exists
+        ? await captureSessionPreview(session, store.dataDir, 80, false).catch(() => "")
+        : "";
+      const status = resolveCodexStatus(
+        { ...session, runtime, codexStatus: rolloutStatus },
+        {
+          sessionId: session.id,
+          text: previewText,
+          capturedAt: new Date().toISOString()
+        }
+      );
+      return { session, status };
+    })
+  );
+  for (const entry of entries) {
+    await persistCodexResumeState(store, entry.session, entry.status);
+  }
+  return Object.fromEntries(entries.map((entry) => [entry.session.id, entry.status]));
+}
 
 app.post("/api/sessions", async (req, res) => {
   const store = await storeForUser(res.locals.user as AuthUser);
@@ -291,7 +334,9 @@ app.post("/api/sessions/:id/duplicate", async (req, res) => {
     cwd: source.cwd,
     shell: source.shell,
     backend: source.backend,
-    color: source.color
+    color: source.color,
+    backgroundMode: source.backgroundMode,
+    backgroundImage: source.backgroundImage
   });
 
   const updated =
@@ -317,6 +362,9 @@ app.patch("/api/sessions/:id", async (req, res) => {
   if (!updated) {
     res.status(404).json({ error: "session not found" });
     return;
+  }
+  if (typeof req.body?.cwd === "string" && req.body.cwd.trim()) {
+    setZellijTrackedCwd(updated.tmuxName, updated.cwd);
   }
   res.json({
     ...updated,
@@ -346,86 +394,34 @@ app.post("/api/sessions/:id/input", async (req, res) => {
     return;
   }
 
-  const body = req.body as Partial<SessionInputRequest> & {
-    inputId?: unknown;
-    maxChars?: unknown;
-    lines?: unknown;
-    includePreview?: unknown;
+  const { data, enter, submitDelayMs } = req.body as {
+    data?: unknown;
+    enter?: unknown;
+    submitKey?: unknown;
+    submitDelayMs?: unknown;
   };
-  const { data, enter, mode, submitDelayMs } = body;
-  const inputId = normalizeInputId(body.inputId);
   if (typeof data !== "string" || data.length === 0) {
-    res.status(400).json({ error: "input data is required", inputId, status: "error" });
+    res.status(400).json({ error: "input data is required" });
     return;
   }
   if (data.length > 16_000) {
-    res.status(413).json({ error: "input data is too large", inputId, status: "error" });
+    res.status(413).json({ error: "input data is too large" });
     return;
   }
 
-  const inputMode = normalizeInputMode(mode);
-  const inputSeq = (acceptedInputSeq += 1);
-  try {
-    await sendSessionInput(
-      session,
-      data,
-      enter !== false,
-      store.dataDir,
-      inputMode,
-      parseSubmitDelayMs(submitDelayMs, inputMode === "paste" ? 120 : 0)
-    );
-    invalidateSessionPreviewCache(session, store.dataDir);
-  } catch (error) {
-    res.status(502).json({
-      ok: false,
-      inputId,
-      inputSeq,
-      status: "error",
-      error: errorMessage(error)
-    });
-    return;
+  await sendSessionInput(session, data, enter !== false, store.dataDir, parseSubmitDelayMs(submitDelayMs, 160));
+  if (enter !== false) {
+    const currentCwd = getZellijTrackedCwd(session.tmuxName) ?? session.cwd;
+    const changedCwd = resolveDirectoryChange(data, currentCwd);
+    if (changedCwd) {
+      await store.update(session.id, { cwd: changedCwd });
+      session.cwd = changedCwd;
+      setZellijTrackedCwd(session.tmuxName, changedCwd);
+    }
   }
-
-  if (body.includePreview === false) {
-    res.json({
-      ok: true,
-      inputId,
-      inputSeq,
-      status: "accepted",
-      capturedAt: new Date().toISOString()
-    });
-    return;
-  }
-
-  const preview = await loadSessionPreview(session, store.dataDir, {
-    lines: parsePreviewLines(body.lines),
-    maxChars: parsePreviewMaxChars(body.maxChars),
-    full: false,
-    allowStale: false,
-    forceRefresh: true
-  }).catch(() => emptySessionPreview(session.id));
   res.json({
     ok: true,
-    inputId,
-    inputSeq,
-    status: "accepted",
-    runtime: await getRuntime(session, store.dataDir).catch(() => fallbackRuntime(session)),
-    preview: preview.text,
-    grid: preview.grid,
-    signature: preview.signature,
-    capturedAt: preview.capturedAt
-  });
-});
-
-app.post("/api/sessions/:id/uploads", (req, res, next) => {
-  uploadSessionFiles(req, res, (error) => {
-    if (error) {
-      res.status(error instanceof multer.MulterError ? 413 : 400).json({
-        error: error instanceof Error ? error.message : "upload failed"
-      });
-      return;
-    }
-    void handleSessionUpload(req, res).catch(next);
+    runtime: await getRuntimeSnapshot(session, store.dataDir).catch(() => fallbackRuntime(session))
   });
 });
 
@@ -474,22 +470,65 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
   }
   const previewLines = parsePreviewLines(req.query.lines);
   const previewFull = parsePreviewFull(req.query.full);
-  const preview = await loadSessionPreview(session, store.dataDir, {
-    lines: previewLines,
-    maxChars: parsePreviewMaxChars(req.query.maxChars),
-    full: previewFull,
-    allowStale: true,
-    forceRefresh: parsePreviewForce(req.query.force)
+  const previewText = await captureSessionPreview(session, store.dataDir, previewLines, previewFull).catch(() => "");
+  const compactPreview = compactPreviewPayload(previewText, parsePreviewMaxChars(req.query.maxChars));
+  const grid = await renderSessionPreviewGrid(session, compactPreview, previewLines, previewFull).catch(() => undefined);
+  res.json({
+    sessionId: session.id,
+    text: compactPreview,
+    grid,
+    signature: previewSignature(compactPreview, grid),
+    capturedAt: new Date().toISOString()
   });
-  const knownSignature = normalizePreviewSignature(req.query.signature);
-  if (knownSignature && preview.signature === knownSignature) {
-    const unchanged = unchangedSessionPreview(preview);
-    setPreviewTimingHeader(res, unchanged.debug);
-    res.json(unchanged);
+});
+
+app.get("/api/sessions/:id/codex/conversations", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  const session = await store.get(req.params.id);
+  if (!session) {
+    res.status(404).json({ error: "session not found" });
     return;
   }
-  setPreviewTimingHeader(res, preview.debug);
-  res.json(preview);
+
+  const cwd = getZellijTrackedCwd(session.tmuxName) ?? session.cwd;
+  try {
+    res.json({
+      cwd,
+      conversations: listCodexConversations(cwd)
+    });
+  } catch (error) {
+    res.status(503).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post("/api/sessions/:id/codex/resume", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  const session = await store.get(req.params.id);
+  if (!session) {
+    res.status(404).json({ error: "session not found" });
+    return;
+  }
+
+  const conversationId = typeof req.body?.conversationId === "string" ? req.body.conversationId.trim() : "";
+  const runtime = await getRuntimeSnapshot(session, store.dataDir).catch(() => undefined);
+  const cwd = getZellijTrackedCwd(session.tmuxName) ?? session.cwd;
+  if (/\bcodex(?:\.exe)?\b/i.test(runtime?.currentCommand || "")) {
+    res.status(409).json({ error: "Codex is already running in this terminal" });
+    return;
+  }
+  const conversation = findCodexConversation(cwd, conversationId);
+  if (!conversation) {
+    res.status(404).json({ error: "Codex conversation not found for this project path" });
+    return;
+  }
+
+  const command = codexResumeCommand(conversation.id);
+  await sendSessionInput(session, command, true, store.dataDir);
+  await store.update(session.id, {
+    codexConversationId: conversation.id,
+    codexAutoResume: true
+  });
+  res.json({ ok: true, command, conversation });
 });
 
 registerTerminalSockets(io, storeForUser, nativeSessions);
@@ -509,6 +548,8 @@ app.use((req, res, next) => {
 });
 
 await storeForUser({ name: config.adminUser, method: "password" });
+const codexStateSnapshotTimer = setInterval(() => void snapshotKnownCodexStates(), 15_000);
+codexStateSnapshotTimer.unref();
 server.listen(config.port, config.host, () => {
   console.log(`terminal-web-monitor listening on http://${config.host}:${config.port}`);
   console.log(`data dir: ${config.dataDir}`);
@@ -522,6 +563,10 @@ async function shutdown(signal: string) {
   }
   shutdownStarted = true;
   console.log(`received ${signal}; saving zellij sessions before shutdown`);
+  clearInterval(codexStateSnapshotTimer);
+  await snapshotKnownCodexStates().catch((error) => {
+    console.error("Failed to snapshot Codex sessions during shutdown", error);
+  });
   await saveKnownZellijSessions().catch((error) => {
     console.error("Failed to save zellij sessions during shutdown", error);
   });
@@ -531,6 +576,25 @@ async function shutdown(signal: string) {
 
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+async function snapshotKnownCodexStates() {
+  if (codexStateSnapshotRunning) {
+    return;
+  }
+  codexStateSnapshotRunning = true;
+  try {
+    const storeResults = await Promise.allSettled(Array.from(stores.values()));
+    for (const result of storeResults) {
+      if (result.status === "fulfilled") {
+        await collectCodexStatuses(result.value).catch((error) => {
+          console.error(`Failed to snapshot Codex sessions in ${result.value.dataDir}`, error);
+        });
+      }
+    }
+  } finally {
+    codexStateSnapshotRunning = false;
+  }
+}
 
 async function saveKnownZellijSessions() {
   const storeResults = await Promise.allSettled(Array.from(stores.values()));
@@ -561,12 +625,102 @@ function queueStoreSessionRestore(store: SessionStore) {
 
 async function restoreActiveSessions(store: SessionStore) {
   const sessions = (await store.all()).filter((session) => !session.archived);
-  const results = await Promise.allSettled(sessions.map((session) => ensureSession(session, store.dataDir)));
+  await disableDuplicateCodexResumeAssignments(store, sessions);
+  const results = await Promise.allSettled(
+    sessions.map(async (session) => {
+      await ensureSession(session, store.dataDir);
+      await restoreCodexConversation(store, session, store.dataDir);
+    })
+  );
   results.forEach((result, index) => {
     if (result.status === "rejected") {
       console.error(`Failed to restore session ${sessions[index]?.id}`, result.reason);
     }
   });
+}
+
+async function restoreCodexConversation(store: SessionStore, session: TerminalSession, dataDir: string) {
+  if (!session.codexAutoResume || !session.codexConversationId) {
+    return;
+  }
+  const runtime = await getRuntime(session, dataDir).catch(() => undefined);
+  if (!runtime?.exists || isCodexRuntimeCommand(runtime.currentCommand)) {
+    return;
+  }
+  const conversation = findCodexConversation(runtime.currentPath || session.cwd, session.codexConversationId);
+  if (!conversation) {
+    console.warn(`Skipping Codex restore for ${session.name}: conversation ${session.codexConversationId} not found`);
+    await store.update(session.id, { codexConversationId: undefined, codexAutoResume: false });
+    return;
+  }
+  await sendSessionInput(session, codexResumeCommand(conversation.id), true, dataDir, 220);
+  console.log(`Restored Codex conversation ${conversation.id} in ${session.name}`);
+}
+
+async function persistCodexResumeState(
+  store: SessionStore,
+  session: TerminalSession,
+  status: ReturnType<typeof resolveCodexStatus>
+) {
+  if (status.state !== "stopped" && status.conversationId) {
+    const conversation = findCodexConversation(session.cwd, status.conversationId);
+    if (!conversation) {
+      if (session.codexConversationId || session.codexAutoResume) {
+        await store.update(session.id, { codexConversationId: undefined, codexAutoResume: false });
+      }
+      return;
+    }
+    observedCodexSessions.add(session.id);
+    if (session.codexConversationId !== status.conversationId || !session.codexAutoResume) {
+      await store.update(session.id, {
+        codexConversationId: status.conversationId,
+        codexAutoResume: true
+      });
+    }
+    return;
+  }
+  if (
+    status.state !== "stopped" &&
+    !status.conversationId &&
+    (session.codexConversationId || session.codexAutoResume)
+  ) {
+    await store.update(session.id, { codexConversationId: undefined, codexAutoResume: false });
+    return;
+  }
+  if (status.state === "stopped" && session.codexAutoResume && observedCodexSessions.has(session.id)) {
+    observedCodexSessions.delete(session.id);
+    await store.update(session.id, { codexAutoResume: false });
+  }
+}
+
+function isCodexRuntimeCommand(value: string): boolean {
+  return /(?:^|[\\/\s])codex(?:\.js|\.exe)?(?:\s|$)/i.test(value) || /@openai[\\/]codex/i.test(value);
+}
+
+function reservedCodexConversationIds(sessions: TerminalSession[], currentSessionId: string): string[] {
+  return sessions.flatMap((session) =>
+    session.id !== currentSessionId && session.codexConversationId ? [session.codexConversationId] : []
+  );
+}
+
+async function disableDuplicateCodexResumeAssignments(
+  store: SessionStore,
+  sessions: TerminalSession[]
+): Promise<void> {
+  const owners = new Set<string>();
+  for (const session of [...sessions].sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
+    const conversationId = session.codexConversationId;
+    if (!session.codexAutoResume || !conversationId) {
+      continue;
+    }
+    if (!owners.has(conversationId)) {
+      owners.add(conversationId);
+      continue;
+    }
+    session.codexConversationId = undefined;
+    session.codexAutoResume = false;
+    await store.update(session.id, { codexConversationId: undefined, codexAutoResume: false });
+  }
 }
 
 async function ensureSession(session: TerminalSession, dataDir = config.dataDir) {
@@ -599,213 +753,6 @@ async function getRuntimeSnapshot(session: TerminalSession, dataDir = config.dat
     return zellijRuntimeSnapshot(session);
   }
   return getRuntime(session, dataDir);
-}
-
-async function loadSessionPreview(
-  session: TerminalSession,
-  dataDir: string,
-  options: { lines: number; maxChars: number; full: boolean; allowStale: boolean; forceRefresh?: boolean }
-): Promise<SessionPreview> {
-  const key = previewCacheKey(session, dataDir, options);
-  const now = Date.now();
-  const cached = sessionPreviewCache.get(key);
-  const freshMs = options.full ? FULL_PREVIEW_CACHE_FRESH_MS : PREVIEW_CACHE_FRESH_MS;
-  const staleMs = options.full ? FULL_PREVIEW_CACHE_STALE_MS : PREVIEW_CACHE_STALE_MS;
-
-  if (!options.forceRefresh && cached?.value) {
-    const ageMs = now - cached.capturedAtMs;
-    if (ageMs < freshMs) {
-      return withPreviewDebug(cached.value, {
-        cache: "hit",
-        ageMs,
-        payloadBytes: previewPayloadBytes(cached.value)
-      });
-    }
-    if (options.allowStale && ageMs < staleMs) {
-      if (!cached.inFlight) {
-        const inFlight = refreshSessionPreview(session, dataDir, options, key, cached).catch((error) => {
-          sessionPreviewCache.set(key, { value: cached.value, capturedAtMs: cached.capturedAtMs });
-          throw error;
-        });
-        sessionPreviewCache.set(key, { ...cached, inFlight });
-        void inFlight.catch(() => undefined);
-      }
-      return withPreviewDebug(cached.value, {
-        cache: cached.inFlight ? "refreshing" : "stale",
-        ageMs,
-        payloadBytes: previewPayloadBytes(cached.value)
-      });
-    }
-  }
-
-  if (!options.forceRefresh && cached?.inFlight) {
-    return cached.inFlight;
-  }
-
-  const inFlight = refreshSessionPreview(session, dataDir, options, key, cached);
-  sessionPreviewCache.set(key, {
-    value: cached?.value,
-    capturedAtMs: cached?.capturedAtMs ?? 0,
-    inFlight
-  });
-  return inFlight;
-}
-
-async function refreshSessionPreview(
-  session: TerminalSession,
-  dataDir: string,
-  options: { lines: number; maxChars: number; full: boolean },
-  key: string,
-  previous?: PreviewCacheEntry
-): Promise<SessionPreview> {
-  const startedAt = Date.now();
-  const preview = await runPreviewJob(async () => {
-    const captureStartedAt = Date.now();
-    const previewText = await captureSessionPreview(session, dataDir, options.lines, options.full).catch(() => "");
-    const captureMs = Date.now() - captureStartedAt;
-    const compactPreview = compactPreviewPayload(previewText, options.maxChars);
-    const renderStartedAt = Date.now();
-    const grid = await renderSessionPreviewGrid(session, compactPreview, options.lines, options.full).catch(
-      () => undefined
-    );
-    const renderMs = Date.now() - renderStartedAt;
-    return {
-      sessionId: session.id,
-      text: compactPreview,
-      grid,
-      signature: previewSignature(compactPreview, grid),
-      capturedAt: new Date().toISOString(),
-      debug: {
-        cache: previous?.value ? "stale" : "miss",
-        captureMs,
-        renderMs,
-        totalMs: Date.now() - startedAt
-      }
-    } satisfies SessionPreview;
-  });
-
-  const value = withPreviewDebug(preview, {
-    ...preview.debug,
-    cache: previous?.value ? "stale" : "miss",
-    totalMs: Date.now() - startedAt,
-    payloadBytes: previewPayloadBytes(preview)
-  });
-  sessionPreviewCache.set(key, {
-    value,
-    capturedAtMs: Date.now()
-  });
-  return value;
-}
-
-function runPreviewJob<T>(run: () => Promise<T>): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const start = () => {
-      activePreviewJobs += 1;
-      run()
-        .then(resolve, reject)
-        .finally(() => {
-          activePreviewJobs = Math.max(0, activePreviewJobs - 1);
-          previewJobQueue.shift()?.();
-        });
-    };
-
-    if (activePreviewJobs < PREVIEW_MAX_CONCURRENT) {
-      start();
-    } else {
-      previewJobQueue.push(start);
-    }
-  });
-}
-
-function previewCacheKey(
-  session: TerminalSession,
-  dataDir: string,
-  options: { lines: number; maxChars: number; full: boolean }
-): string {
-  return [
-    path.resolve(dataDir),
-    session.id,
-    session.tmuxName,
-    options.full ? "full" : "viewport",
-    options.lines,
-    options.maxChars
-  ].join("\u001f");
-}
-
-function invalidateSessionPreviewCache(session: TerminalSession, dataDir: string): void {
-  const prefix = `${path.resolve(dataDir)}\u001f${session.id}\u001f`;
-  for (const key of sessionPreviewCache.keys()) {
-    if (key.startsWith(prefix)) {
-      sessionPreviewCache.delete(key);
-    }
-  }
-}
-
-function withPreviewDebug(preview: SessionPreview, debug: Partial<SessionPreviewDebug>): SessionPreview {
-  return {
-    ...preview,
-    debug: {
-      cache: debug.cache ?? preview.debug?.cache ?? "miss",
-      ageMs: debug.ageMs ?? preview.debug?.ageMs,
-      captureMs: debug.captureMs ?? preview.debug?.captureMs,
-      renderMs: debug.renderMs ?? preview.debug?.renderMs,
-      totalMs: debug.totalMs ?? preview.debug?.totalMs,
-      payloadBytes: debug.payloadBytes ?? preview.debug?.payloadBytes
-    }
-  };
-}
-
-function previewPayloadBytes(preview: SessionPreview): number {
-  return Buffer.byteLength(JSON.stringify({ text: preview.text, grid: preview.grid }), "utf8");
-}
-
-function setPreviewTimingHeader(
-  res: express.Response,
-  debug: SessionPreviewDebug | undefined
-): void {
-  if (!debug) {
-    return;
-  }
-  const parts = [
-    `preview;desc="${debug.cache}"`,
-    typeof debug.captureMs === "number" ? `zellij;dur=${debug.captureMs}` : "",
-    typeof debug.renderMs === "number" ? `render;dur=${debug.renderMs}` : "",
-    typeof debug.totalMs === "number" ? `total;dur=${debug.totalMs}` : ""
-  ].filter(Boolean);
-  if (parts.length) {
-    res.setHeader("Server-Timing", parts.join(", "));
-  }
-}
-
-function emptySessionPreview(sessionId: string): SessionPreview {
-  return {
-    sessionId,
-    text: "",
-    signature: "",
-    capturedAt: new Date().toISOString()
-  };
-}
-
-function unchangedSessionPreview(preview: SessionPreview): SessionPreview {
-  return withPreviewDebug(
-    {
-      sessionId: preview.sessionId,
-      text: "",
-      signature: preview.signature,
-      capturedAt: preview.capturedAt,
-      unchanged: true
-    },
-    {
-      ...preview.debug,
-      payloadBytes: previewPayloadBytes({
-        sessionId: preview.sessionId,
-        text: "",
-        signature: preview.signature,
-        capturedAt: preview.capturedAt,
-        unchanged: true
-      })
-    }
-  );
 }
 
 async function captureSessionPreview(session: TerminalSession, dataDir: string, lines = 500, full = true) {
@@ -857,8 +804,7 @@ async function sendSessionInput(
   data: string,
   enter: boolean,
   dataDir = config.dataDir,
-  mode: SessionInputMode = "paste",
-  submitDelayMs = 0
+  submitDelayMs = 160
 ) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
@@ -866,341 +812,10 @@ async function sendSessionInput(
     return;
   }
   if (backend === "zellij") {
-    await sendZellijInput(session, data, enter, { mode, submitDelayMs });
+    await sendZellijInput(session, data, enter, submitDelayMs);
     return;
   }
   await nativeSessions.write(session, data, enter, dataDir, submitDelayMs);
-}
-
-function normalizeInputMode(value: unknown): SessionInputMode {
-  return value === "type" ? "type" : "paste";
-}
-
-function normalizeInputId(value: unknown): string {
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (/^[a-zA-Z0-9._:-]{1,120}$/.test(trimmed)) {
-      return trimmed;
-    }
-  }
-  return crypto.randomUUID();
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "input failed";
-}
-
-function parseSubmitDelayMs(value: unknown, fallback: number): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-  return Math.max(0, Math.min(1000, Math.floor(parsed)));
-}
-
-async function handleFileTransferUpload(
-  req: express.Request,
-  res: express.Response<FileTransferUploadResponse | { error: string }>
-) {
-  const user = res.locals.user as AuthUser;
-  const rootDir = await ensureTransferRoot(user);
-  const files = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
-  if (files.length === 0) {
-    res.status(400).json({ error: "upload files are required" });
-    return;
-  }
-
-  const savedFiles = await saveTransferFiles(files, rootDir);
-  res.json({
-    rootPath: rootDir,
-    terminalText: savedFiles.map((file) => file.terminalText).join(" "),
-    files: savedFiles
-  });
-}
-
-async function handleSessionUpload(
-  req: express.Request,
-  res: express.Response<SessionUploadResponse | { error: string }>
-) {
-  const store = await storeForUser(res.locals.user as AuthUser);
-  const session = await store.get(String(req.params.id ?? ""));
-  if (!session) {
-    res.status(404).json({ error: "session not found" });
-    return;
-  }
-
-  const files = Array.isArray(req.files) ? (req.files as Express.Multer.File[]) : [];
-  if (files.length === 0) {
-    res.status(400).json({ error: "upload files are required" });
-    return;
-  }
-
-  const rootDir = await ensureTransferRoot(res.locals.user as AuthUser);
-  const savedFiles = await saveTransferFiles(files, rootDir, session.shell);
-
-  res.json({
-    files: savedFiles.map((file) => ({
-      originalName: file.originalName,
-      fileName: file.name,
-      mimeType: file.mimeType,
-      size: file.size,
-      path: file.path,
-      terminalText: file.terminalText
-    })),
-    terminalText: savedFiles.map((file) => file.terminalText).join(" ")
-  });
-}
-
-type SavedTransferEntry = FileTransferEntry & {
-  originalName: string;
-};
-
-async function saveTransferFiles(
-  files: Express.Multer.File[],
-  rootDir: string,
-  shell?: string
-): Promise<SavedTransferEntry[]> {
-  await fs.promises.mkdir(rootDir, { recursive: true });
-  const usedNames = new Set<string>();
-  const savedFiles: SavedTransferEntry[] = [];
-
-  for (let index = 0; index < files.length; index += 1) {
-    const file = files[index];
-    const requestedName = safeUploadFileName(file.originalname, file.mimetype, index);
-    const filePath = await uniqueTransferFilePath(rootDir, requestedName, usedNames);
-    await fs.promises.writeFile(filePath, file.buffer);
-    const stat = await fs.promises.stat(filePath);
-    savedFiles.push(
-      transferEntryFromPath(rootDir, filePath, stat, shell, file.originalname || path.basename(filePath), file.mimetype)
-    );
-  }
-
-  return savedFiles;
-}
-
-async function fileTransferListPayload(rootDir: string): Promise<FileTransferListResponse> {
-  const files = await listTransferFiles(rootDir);
-  return {
-    rootPath: rootDir,
-    terminalText: quotePathForTerminal(rootDir, undefined),
-    files
-  };
-}
-
-async function ensureTransferRoot(user: AuthUser): Promise<string> {
-  const rootDir = path.resolve(process.cwd(), TRANSFER_DIR_NAME, safePathSegment(user.name));
-  await fs.promises.mkdir(rootDir, { recursive: true });
-  return rootDir;
-}
-
-async function listTransferFiles(rootDir: string): Promise<FileTransferEntry[]> {
-  const entries: FileTransferEntry[] = [];
-  await collectTransferFiles(rootDir, rootDir, entries);
-  return entries.sort((left, right) => Date.parse(right.modifiedAt) - Date.parse(left.modifiedAt));
-}
-
-async function collectTransferFiles(rootDir: string, directory: string, entries: FileTransferEntry[]): Promise<void> {
-  if (entries.length >= MAX_TRANSFER_LIST_FILES) {
-    return;
-  }
-
-  const items = await fs.promises.readdir(directory, { withFileTypes: true }).catch(() => []);
-  for (const item of items) {
-    if (entries.length >= MAX_TRANSFER_LIST_FILES) {
-      return;
-    }
-    const itemPath = path.join(directory, item.name);
-    if (item.isDirectory()) {
-      await collectTransferFiles(rootDir, itemPath, entries);
-      continue;
-    }
-    if (!item.isFile()) {
-      continue;
-    }
-    const stat = await fs.promises.stat(itemPath).catch(() => null);
-    if (stat?.isFile()) {
-      entries.push(transferEntryFromPath(rootDir, itemPath, stat));
-    }
-  }
-}
-
-function transferEntryFromPath(
-  rootDir: string,
-  filePath: string,
-  stat: fs.Stats,
-  shell?: string,
-  originalName?: string,
-  mimeType?: string
-): SavedTransferEntry {
-  const relativePath = toTransferRelativePath(rootDir, filePath);
-  const name = path.basename(filePath);
-  return {
-    name,
-    originalName: originalName || name,
-    relativePath,
-    path: filePath,
-    terminalText: quotePathForTerminal(filePath, shell),
-    size: stat.size,
-    modifiedAt: stat.mtime.toISOString(),
-    mimeType: mimeType || mimeTypeForFileName(name)
-  };
-}
-
-async function uniqueTransferFilePath(rootDir: string, fileName: string, usedNames: Set<string>): Promise<string> {
-  let candidateName = uniqueUploadFileName(fileName, usedNames);
-  let candidatePath = path.join(rootDir, candidateName);
-  if (!(await pathExists(candidatePath))) {
-    return candidatePath;
-  }
-
-  const extension = path.extname(candidateName);
-  const stem = candidateName.slice(0, candidateName.length - extension.length) || "file";
-  for (let index = 2; index < 10_000; index += 1) {
-    candidateName = `${stem}-${index}${extension}`;
-    candidatePath = path.join(rootDir, candidateName);
-    if (!usedNames.has(candidateName) && !(await pathExists(candidatePath))) {
-      usedNames.add(candidateName);
-      return candidatePath;
-    }
-  }
-
-  candidateName = `${stem}-${Date.now()}${extension}`;
-  usedNames.add(candidateName);
-  return path.join(rootDir, candidateName);
-}
-
-async function pathExists(filePath: string): Promise<boolean> {
-  return fs.promises
-    .access(filePath)
-    .then(() => true)
-    .catch(() => false);
-}
-
-function resolveTransferFilePath(rootDir: string, relativePath: string): string {
-  const targetPath = path.resolve(rootDir, relativePath);
-  const relative = path.relative(rootDir, targetPath);
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error("invalid file path");
-  }
-  return targetPath;
-}
-
-function resolveTransferFilePathOrRespond(
-  rootDir: string,
-  relativePath: string,
-  res: express.Response
-): string | null {
-  try {
-    return resolveTransferFilePath(rootDir, relativePath);
-  } catch {
-    res.status(400).json({ error: "invalid file path" });
-    return null;
-  }
-}
-
-function toTransferRelativePath(rootDir: string, filePath: string): string {
-  return path.relative(rootDir, filePath).split(path.sep).join("/");
-}
-
-function safeUploadFileName(originalName: string | undefined, mimeType: string | undefined, index: number): string {
-  const baseName = (originalName ?? "").split(/[\\/]/).pop()?.trim() ?? "";
-  const fallback = `clipboard-${index + 1}${extensionForMimeType(mimeType)}`;
-  const cleaned = (baseName || fallback)
-    .replace(/[\x00-\x1f<>:"/\\|?*]+/g, "_")
-    .replace(/\s+/g, " ")
-    .replace(/^\.+/, "")
-    .trim();
-  const safeName = cleaned || fallback;
-  if (safeName.length <= 180) {
-    return safeName;
-  }
-  const extension = path.extname(safeName);
-  const stem = safeName.slice(0, Math.max(1, 180 - extension.length));
-  return `${stem}${extension}`;
-}
-
-function uniqueUploadFileName(fileName: string, usedNames: Set<string>): string {
-  if (!usedNames.has(fileName)) {
-    usedNames.add(fileName);
-    return fileName;
-  }
-
-  const extension = path.extname(fileName);
-  const stem = fileName.slice(0, fileName.length - extension.length) || "file";
-  for (let index = 2; index < 10_000; index += 1) {
-    const candidate = `${stem}-${index}${extension}`;
-    if (!usedNames.has(candidate)) {
-      usedNames.add(candidate);
-      return candidate;
-    }
-  }
-  const fallback = `${stem}-${Date.now()}${extension}`;
-  usedNames.add(fallback);
-  return fallback;
-}
-
-function extensionForMimeType(mimeType: string | undefined): string {
-  const normalized = mimeType?.toLowerCase() ?? "";
-  if (normalized === "image/png") {
-    return ".png";
-  }
-  if (normalized === "image/jpeg") {
-    return ".jpg";
-  }
-  if (normalized === "image/gif") {
-    return ".gif";
-  }
-  if (normalized === "image/webp") {
-    return ".webp";
-  }
-  if (normalized === "application/pdf") {
-    return ".pdf";
-  }
-  if (normalized.startsWith("text/")) {
-    return ".txt";
-  }
-  return ".bin";
-}
-
-function mimeTypeForFileName(fileName: string): string {
-  const extension = path.extname(fileName).toLowerCase();
-  if (extension === ".png") {
-    return "image/png";
-  }
-  if (extension === ".jpg" || extension === ".jpeg") {
-    return "image/jpeg";
-  }
-  if (extension === ".gif") {
-    return "image/gif";
-  }
-  if (extension === ".webp") {
-    return "image/webp";
-  }
-  if (extension === ".pdf") {
-    return "application/pdf";
-  }
-  if ([".txt", ".md", ".json", ".csv", ".log"].includes(extension)) {
-    return "text/plain";
-  }
-  return "application/octet-stream";
-}
-
-function quotePathForTerminal(filePath: string, shell: string | undefined): string {
-  const normalizedShell = shell?.toLowerCase() ?? "";
-  if (process.platform === "win32" && normalizedShell.includes("cmd")) {
-    return `"${filePath.replace(/"/g, '\\"')}"`;
-  }
-  return `'${filePath.replace(/'/g, "'\\''")}'`;
-}
-
-function safePathSegment(value: string): string {
-  return value.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^\.+/, "") || "session";
-}
-
-function uploadStamp(): string {
-  const timestamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
-  const suffix = crypto.randomBytes(4).toString("hex");
-  return `${timestamp}-${suffix}`;
 }
 
 function nextCopyName(name: string, existingNames: string[]): string {
@@ -1264,12 +879,12 @@ function parsePreviewFull(value: unknown): boolean {
   return value !== "false";
 }
 
-function parsePreviewForce(value: unknown): boolean {
-  return value === "true";
-}
-
-function normalizePreviewSignature(value: unknown): string {
-  return typeof value === "string" && /^[a-f0-9]{40}$/i.test(value) ? value : "";
+function parseSubmitDelayMs(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(120, Math.min(12_000, Math.floor(parsed)));
 }
 
 function compactPreviewPayload(value: string, maxChars: number): string {
@@ -1309,6 +924,26 @@ function previewSignature(text: string, grid?: TerminalPreviewGrid): string {
     }
   }
   return hash.digest("hex");
+}
+
+function backgroundImageExtension(contentType: string | string[] | undefined): string | null {
+  const normalized = Array.isArray(contentType) ? contentType[0] : contentType?.split(";")[0].trim().toLowerCase();
+  if (normalized === "image/png") {
+    return "png";
+  }
+  if (normalized === "image/jpeg") {
+    return "jpg";
+  }
+  if (normalized === "image/webp") {
+    return "webp";
+  }
+  if (normalized === "image/gif") {
+    return "gif";
+  }
+  if (normalized === "image/avif") {
+    return "avif";
+  }
+  return null;
 }
 
 interface CpuSnapshot {

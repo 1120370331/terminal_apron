@@ -7,7 +7,6 @@ import type { Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { SessionRuntime, TerminalSession } from "../shared/types.js";
 import { config } from "./config.js";
 import { loadPty, type PtyProcess } from "./pty.js";
-import { emitTerminalData } from "./terminalData.js";
 
 const MAX_TERMINAL_COLS = 4096;
 const MAX_TERMINAL_ROWS = 2048;
@@ -97,7 +96,7 @@ export class NativeSessionManager {
       entry.output = tailByUtf8Bytes(entry.output + data, config.nativeHistoryBytes);
       queueTranscriptWrite(entry, data);
       for (const client of entry.clients) {
-        emitTerminalData(client, data);
+        client.emit("terminal:data", data);
       }
     });
 
@@ -130,7 +129,7 @@ export class NativeSessionManager {
 
     const attachHistory = await loadTranscript(dataDir, session.id);
     if (attachHistory) {
-      emitTerminalData(socket, attachHistory);
+      socket.emit("terminal:data", attachHistory);
     }
 
     socket.on("terminal:input", (data: string) => {
@@ -166,12 +165,12 @@ export class NativeSessionManager {
     data: string,
     enter = false,
     dataDir = config.dataDir,
-    submitDelayMs = 0
+    submitDelayMs = 160
   ): Promise<void> {
     const entry = await this.ensure(session, dataDir);
     entry.term.write(data);
     if (enter) {
-      await delay(submitDelayMs);
+      await delay(Math.max(120, Math.min(12_000, Math.floor(submitDelayMs))));
       entry.term.write("\r");
     }
   }
@@ -213,20 +212,16 @@ function writeHeadless(screen: HeadlessTerminal, data: string): Promise<void> {
   });
 }
 
-function delay(ms: number): Promise<void> {
-  const duration = Math.max(0, Math.min(1000, Math.floor(ms)));
-  if (duration === 0) {
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => setTimeout(resolve, duration));
-}
-
 function sessionKeyForDataDir(dataDir: string, sessionId: string): string {
   return `${path.resolve(dataDir)}:${sessionId}`;
 }
 
 function transcriptPathForSession(dataDir: string, sessionId: string): string {
   return path.join(dataDir, "transcripts", `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.ansi`);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function loadTranscript(dataDir: string, sessionId: string): Promise<string> {

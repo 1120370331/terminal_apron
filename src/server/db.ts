@@ -5,14 +5,17 @@ import os from "node:os";
 import type {
   CreateSessionInput,
   GridItemLayout,
+  TerminalBackgroundMode,
   TerminalBackend,
   TerminalSession,
-  UpdateSessionInput
+  UpdateSessionInput,
+  UserPreferences
 } from "../shared/types.js";
 
 interface StoreShape {
   version: 1;
   sessions: TerminalSession[];
+  preferences?: UserPreferences;
 }
 
 const DEFAULT_COLORS = ["#2f80ed", "#00a676", "#f2994a", "#9b51e0", "#eb5757", "#00897b"];
@@ -45,9 +48,25 @@ function normalizeBackend(value: TerminalBackend | undefined): TerminalBackend {
   return "zellij";
 }
 
+function normalizeBackgroundMode(value: TerminalBackgroundMode | undefined): TerminalBackgroundMode {
+  return value === "none" || value === "image" ? value : "inherit";
+}
+
+function normalizeBackgroundImage(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed?.startsWith("/api/backgrounds/") ? trimmed : undefined;
+}
+
+function normalizeCodexConversationId(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed || "")
+    ? trimmed
+    : undefined;
+}
+
 export class SessionStore {
   private readonly dbPath: string;
-  private mutationQueue: Promise<unknown> = Promise.resolve();
+  private mutationQueue: Promise<void> = Promise.resolve();
 
   constructor(readonly dataDir: string) {
     this.dbPath = path.join(dataDir, "sessions.json");
@@ -70,8 +89,29 @@ export class SessionStore {
     return (await this.read()).sessions.find((session) => session.id === id) ?? null;
   }
 
+  async preferences(): Promise<UserPreferences> {
+    return (await this.read()).preferences ?? { terminalBackgroundImage: null };
+  }
+
+  async updatePreferences(patch: Partial<UserPreferences>): Promise<UserPreferences> {
+    return this.mutate(async () => {
+      const db = await this.read();
+      const current = db.preferences ?? { terminalBackgroundImage: null };
+      const preferences: UserPreferences = {
+        terminalBackgroundImage:
+          "terminalBackgroundImage" in patch
+            ? normalizeBackgroundImage(patch.terminalBackgroundImage ?? undefined) ?? null
+            : current.terminalBackgroundImage
+      };
+      db.preferences = preferences;
+      await this.write(db);
+      return preferences;
+    });
+  }
+
   async create(input: CreateSessionInput): Promise<TerminalSession> {
-    return this.mutate(async (db) => {
+    return this.mutate(async () => {
+      const db = await this.read();
       const id = randomUUID();
       const timestamp = now();
       const index = db.sessions.length;
@@ -85,6 +125,8 @@ export class SessionStore {
         backend: normalizeBackend(input.backend),
         tmuxName: tmuxNameFromId(id),
         color: input.color?.trim() || DEFAULT_COLORS[index % DEFAULT_COLORS.length],
+        backgroundMode: normalizeBackgroundMode(input.backgroundMode),
+        backgroundImage: normalizeBackgroundImage(input.backgroundImage),
         archived: false,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -99,12 +141,14 @@ export class SessionStore {
       };
 
       db.sessions.push(session);
+      await this.write(db);
       return session;
     });
   }
 
   async update(id: string, patch: UpdateSessionInput): Promise<TerminalSession | null> {
-    return this.mutate(async (db) => {
+    return this.mutate(async () => {
+      const db = await this.read();
       const index = db.sessions.findIndex((session) => session.id === id);
       if (index === -1) {
         return null;
@@ -120,6 +164,19 @@ export class SessionStore {
         ...("shell" in patch ? { shell: patch.shell?.trim() || undefined } : {}),
         ...("backend" in patch ? { backend: normalizeBackend(patch.backend) } : {}),
         ...("color" in patch ? { color: patch.color?.trim() || existing.color } : {}),
+        ...("backgroundMode" in patch ? { backgroundMode: normalizeBackgroundMode(patch.backgroundMode) } : {}),
+        ...("backgroundImage" in patch ? { backgroundImage: normalizeBackgroundImage(patch.backgroundImage) } : {}),
+        ...("codexConversationId" in patch
+          ? { codexConversationId: normalizeCodexConversationId(patch.codexConversationId) }
+          : {}),
+        ...("codexAutoResume" in patch
+          ? {
+              codexAutoResume: Boolean(
+                patch.codexAutoResume &&
+                  normalizeCodexConversationId(patch.codexConversationId ?? existing.codexConversationId)
+              )
+            }
+          : {}),
         ...("layout" in patch ? { layout: normalizeLayout(patch.layout, existing.layout) } : {}),
         ...("archived" in patch
           ? { archived: Boolean(patch.archived), archivedAt: patch.archived ? now() : undefined }
@@ -128,12 +185,14 @@ export class SessionStore {
       };
 
       db.sessions[index] = updated;
+      await this.write(db);
       return updated;
     });
   }
 
   async markStopped(id: string): Promise<TerminalSession | null> {
-    return this.mutate(async (db) => {
+    return this.mutate(async () => {
+      const db = await this.read();
       const index = db.sessions.findIndex((session) => session.id === id);
       if (index === -1) {
         return null;
@@ -146,6 +205,7 @@ export class SessionStore {
         archivedAt: now(),
         updatedAt: now()
       };
+      await this.write(db);
       return db.sessions[index];
     });
   }
@@ -153,127 +213,46 @@ export class SessionStore {
   private async read(): Promise<StoreShape> {
     await this.initDirectoryOnly();
     const raw = (await fs.readFile(this.dbPath, "utf8")).replace(/^\uFEFF/, "");
-    try {
-      return normalizeStoreShape(JSON.parse(raw) as StoreShape);
-    } catch (error) {
-      const recovered = parseRecoverableStore(raw);
-      if (!recovered) {
-        await this.backupCorruptDb(raw);
-        const empty: StoreShape = { version: 1, sessions: [] };
-        await this.write(empty);
-        console.error(`Reset unreadable session store at ${this.dbPath}`, error);
-        return empty;
-      }
-
-      await this.backupCorruptDb(raw);
-      await this.write(recovered);
-      console.error(`Recovered session store at ${this.dbPath}`, error);
-      return recovered;
-    }
-  }
-
-  private async mutate<T>(operation: (db: StoreShape) => Promise<T> | T): Promise<T> {
-    const run = async () => {
-      const db = await this.read();
-      const result = await operation(db);
-      await this.write(db);
-      return result;
+    const parsed = JSON.parse(raw) as StoreShape;
+    return {
+      version: 1,
+      preferences: {
+        terminalBackgroundImage: normalizeBackgroundImage(parsed.preferences?.terminalBackgroundImage ?? undefined) ?? null
+      },
+      sessions: Array.isArray(parsed.sessions)
+        ? parsed.sessions.map((session) => ({
+            ...session,
+            backend: normalizeBackend(session.backend),
+            backgroundMode: normalizeBackgroundMode(session.backgroundMode),
+            backgroundImage: normalizeBackgroundImage(session.backgroundImage),
+            codexConversationId: normalizeCodexConversationId(session.codexConversationId),
+            codexAutoResume: Boolean(
+              session.codexAutoResume && normalizeCodexConversationId(session.codexConversationId)
+            )
+          }))
+        : []
     };
-    const queued = this.mutationQueue.then(run, run);
-    this.mutationQueue = queued.catch(() => undefined);
-    return queued;
   }
 
   private async write(db: StoreShape): Promise<void> {
     await this.initDirectoryOnly();
-    const tmp = `${this.dbPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
+    const tmp = `${this.dbPath}.${process.pid}.${randomUUID()}.tmp`;
     await fs.writeFile(tmp, `${JSON.stringify(db, null, 2)}\n`, "utf8");
     await fs.rename(tmp, this.dbPath);
   }
 
-  private async backupCorruptDb(raw: string): Promise<void> {
-    const backupPath = `${this.dbPath}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    await fs.writeFile(backupPath, raw, "utf8").catch(() => undefined);
+  private mutate<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutationQueue.then(operation, operation);
+    this.mutationQueue = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
   }
 
   private async initDirectoryOnly(): Promise<void> {
     await fs.mkdir(this.dataDir, { recursive: true });
   }
-}
-
-function normalizeStoreShape(parsed: StoreShape): StoreShape {
-  return {
-    version: 1,
-    sessions: Array.isArray(parsed.sessions)
-      ? parsed.sessions.map((session) => ({
-          ...session,
-          backend: normalizeBackend(session.backend)
-        }))
-      : []
-  };
-}
-
-function parseRecoverableStore(raw: string): StoreShape | null {
-  const prefix = firstJsonObjectPrefix(raw);
-  if (!prefix || prefix === raw) {
-    return null;
-  }
-
-  try {
-    return normalizeStoreShape(JSON.parse(prefix) as StoreShape);
-  } catch {
-    return null;
-  }
-}
-
-function firstJsonObjectPrefix(raw: string): string | null {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  let started = false;
-  for (let index = 0; index < raw.length; index += 1) {
-    const char = raw[index];
-    if (!started) {
-      if (/\s/.test(char)) {
-        continue;
-      }
-      if (char !== "{") {
-        return null;
-      }
-      started = true;
-      depth = 1;
-      continue;
-    }
-
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === "\"") {
-        inString = false;
-      }
-      continue;
-    }
-
-    if (char === "\"") {
-      inString = true;
-      continue;
-    }
-    if (char === "{") {
-      depth += 1;
-      continue;
-    }
-    if (char !== "}") {
-      continue;
-    }
-
-    depth -= 1;
-    if (depth === 0) {
-      return raw.slice(0, index + 1);
-    }
-  }
-  return null;
 }
 
 function normalizeLayout(
@@ -290,7 +269,6 @@ function normalizeLayout(
     w: Math.max(2, Number(layout.w) || fallback?.w || 4),
     h: Math.max(2, Number(layout.h) || fallback?.h || 4),
     minW: Math.max(2, Number(layout.minW) || 3),
-    minH: Math.max(2, Number(layout.minH) || 3),
-    gridColumns: Math.max(1, Number(layout.gridColumns) || fallback?.gridColumns || 12)
+    minH: Math.max(2, Number(layout.minH) || 3)
   };
 }

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Headless from "@xterm/headless";
 import type { Terminal as HeadlessTerminal } from "@xterm/headless";
-import type { SessionInputMode, SessionRuntime, TerminalSession } from "../shared/types.js";
+import type { SessionRuntime, TerminalSession } from "../shared/types.js";
 import { config } from "./config.js";
 import { loadPty } from "./pty.js";
 
@@ -11,7 +11,6 @@ interface RunOptions {
   cwd?: string;
   input?: string;
   timeoutMs?: number;
-  maxBufferBytes?: number;
 }
 
 interface ZellijPane {
@@ -40,8 +39,6 @@ const ZELLIJ_SESSION_LIST_TTL_MS = 750;
 const ZELLIJ_VERSION_TTL_MS = 60_000;
 const ZELLIJ_RUNTIME_CACHE_TTL_MS = 10_000;
 const ZELLIJ_PREVIEW_MIN_COLS = 120;
-const DEFAULT_PASTE_SUBMIT_DELAY_MS = 120;
-const MIN_ATTACH_HISTORY_LINES = 5_000;
 
 interface PreviewCacheEntry {
   value: string;
@@ -57,6 +54,7 @@ interface RuntimeCacheEntry {
 
 const viewportPreviewCache = new Map<string, PreviewCacheEntry>();
 const runtimeInfoCache = new Map<string, RuntimeCacheEntry>();
+const trackedCwds = new Map<string, string>();
 let sessionListCache: { value: string[]; capturedAt: number; inFlight?: Promise<string[]> } | null = null;
 let zellijVersionCache: { value: string; capturedAt: number; inFlight?: Promise<string> } | null = null;
 
@@ -68,7 +66,7 @@ function runZellij(args: string[], options: RunOptions = {}): Promise<{ stdout: 
       {
         cwd: options.cwd,
         timeout: options.timeoutMs ?? 8000,
-        maxBuffer: options.maxBufferBytes ?? 1024 * 1024 * 64
+        maxBuffer: 1024 * 1024 * 8
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -268,42 +266,11 @@ export function appendZellijTranscript(sessionId: string, data: string, dataDir 
   return appendTranscript(zellijTranscriptPath(dataDir, sessionId), data, config.nativeHistoryBytes);
 }
 
-export async function captureZellijAttachHistory(
-  session: Pick<TerminalSession, "id" | "tmuxName">,
-  dataDir = config.dataDir,
-  lines = config.terminalAttachHistoryLines
-): Promise<string> {
-  const linesToKeep = Math.max(MIN_ATTACH_HISTORY_LINES, Math.min(config.zellijScrollback, Math.floor(lines)));
-  const transcript = stripZellijHistoryHidingSequences(
-    tailRawLines(await loadZellijTranscript(dataDir, session.id, linesToKeep), linesToKeep)
-  );
-  if (countRawLines(transcript) >= linesToKeep) {
-    return transcript;
-  }
-
-  if (await hasZellijSession(session.tmuxName)) {
-    const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
-    const args = ["--session", session.tmuxName, "action", "dump-screen", "--ansi", "--full"];
-    if (paneId) {
-      args.push("--pane-id", paneId);
-    }
-    const result = await runZellij(args, {
-      timeoutMs: 8000,
-      maxBufferBytes: Math.max(1024 * 1024 * 16, config.nativeHistoryBytes + 1024 * 1024)
-    }).catch(() => ({ stdout: "", stderr: "" }));
-    const output = stripZellijHistoryHidingSequences(tailRawLines(result.stdout, linesToKeep));
-    if (output.trim()) {
-      return longerHistory(output, transcript);
-    }
-  }
-  return transcript;
-}
-
 export async function sendZellijInput(
   session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
   data: string,
   enter = false,
-  options: { mode?: SessionInputMode; submitDelayMs?: number } = {}
+  submitDelayMs = 160
 ): Promise<void> {
   await ensureZellijSession(session);
   if (!(await hasZellijSession(session.tmuxName))) {
@@ -311,21 +278,12 @@ export async function sendZellijInput(
   }
   const paneId = await activeTerminalPaneId(session.tmuxName).catch(() => null);
   const target = paneId ? ["--pane-id", paneId] : [];
-  if (options.mode === "type") {
-    await writeZellijChars(session.tmuxName, target, data);
-  } else {
-    await pasteZellijText(session.tmuxName, target, data);
-  }
+  await pasteZellijText(session.tmuxName, target, data);
   if (!enter) {
     void saveZellijSessionState(session.tmuxName).catch(() => undefined);
     return;
   }
-  await delay(
-    normalizeSubmitDelayMs(
-      options.submitDelayMs,
-      options.mode === "type" ? 0 : DEFAULT_PASTE_SUBMIT_DELAY_MS
-    )
-  );
+  await delay(Math.max(120, Math.min(12_000, Math.floor(submitDelayMs))));
   await sendZellijEnter(session.tmuxName, target);
   void saveZellijSessionState(session.tmuxName).catch(() => undefined);
 }
@@ -334,6 +292,21 @@ export async function zellijRuntimeInfo(session: TerminalSession): Promise<Sessi
   const value = await zellijRuntimeInfoFresh(session);
   runtimeInfoCache.set(session.tmuxName, { value, capturedAt: Date.now() });
   return value;
+}
+
+export function setZellijTrackedCwd(sessionName: string, cwd: string): void {
+  trackedCwds.set(sessionName, cwd);
+  const cached = runtimeInfoCache.get(sessionName);
+  if (cached?.value) {
+    runtimeInfoCache.set(sessionName, {
+      value: { ...cached.value, currentPath: cwd },
+      capturedAt: Date.now()
+    });
+  }
+}
+
+export function getZellijTrackedCwd(sessionName: string): string | undefined {
+  return trackedCwds.get(sessionName);
 }
 
 export async function zellijRuntimeSnapshot(session: TerminalSession): Promise<SessionRuntime> {
@@ -385,13 +358,23 @@ async function zellijRuntimeInfoFresh(session: TerminalSession): Promise<Session
   const panes = await listZellijPanes(session.tmuxName).catch(() => []);
   const terminalPanes = panes.filter((pane) => !pane.is_plugin);
   const focused = terminalPanes.find((pane) => pane.focused || pane.is_focused) ?? terminalPanes[0] ?? panes[0];
+  const reportedCommand = formatCommand(focused?.terminal_command ?? focused?.pane_command ?? focused?.command);
+  const previousCommand = runtimeInfoCache.get(session.tmuxName)?.value.currentCommand || "";
+  const codexPaneTitle = looksLikeCodexPaneTitle(focused?.title);
+  const currentCommand =
+    reportedCommand ||
+    (codexPaneTitle
+      ? isCodexCommand(previousCommand)
+        ? previousCommand
+        : `codex ${focused?.title || ""}`.trim()
+      : focused?.title || "");
   return {
     exists: true,
     backend: "zellij",
     persistent: true,
     attached: 0,
-    currentPath: focused?.pane_cwd ?? focused?.current_working_directory ?? session.cwd,
-    currentCommand: formatCommand(focused?.terminal_command ?? focused?.pane_command ?? focused?.command) || focused?.title || "",
+    currentPath: trackedCwds.get(session.tmuxName) ?? session.cwd ?? focused?.pane_cwd ?? focused?.current_working_directory,
+    currentCommand,
     windows: Math.max(1, terminalPanes.length || 1),
     lastAttached: null,
     zellijVersion: await zellijVersion().catch(() => undefined)
@@ -412,7 +395,10 @@ async function lightweightZellijRuntimeInfo(session: TerminalSession): Promise<S
   };
 }
 
-export function zellijAttachArgs(session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">): string[] {
+export function zellijAttachArgs(
+  session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
+  scrollbackLines = config.zellijScrollback
+): string[] {
   return [
     "--layout-string",
     ZELLIJ_SINGLE_PANE_LAYOUT,
@@ -420,7 +406,7 @@ export function zellijAttachArgs(session: Pick<TerminalSession, "tmuxName" | "cw
     "--create",
     "--force-run-commands",
     session.tmuxName,
-    ...zellijOptions(session)
+    ...zellijOptions(session, scrollbackLines)
   ];
 }
 
@@ -449,9 +435,8 @@ async function listZellijSessions(): Promise<string[]> {
       const value = result.stdout
         .split(/\r?\n/)
         .map(stripAnsi)
-        .map((line) => line.trim())
-        .filter((line) => line && !/\(EXITED\b/i.test(line))
-        .map((line) => line.split(/\s+/)[0])
+        .filter((line) => !/\bEXITED\b/i.test(line))
+        .map((line) => line.trim().split(/\s+/)[0])
         .filter(Boolean);
       sessionListCache = { value, capturedAt: Date.now() };
       return value;
@@ -579,14 +564,6 @@ async function sendZellijEnter(sessionName: string, target: string[]): Promise<v
   }).catch(() => runZellij(["--session", sessionName, "action", "write", ...target, "13"], { timeoutMs: 5000 }));
 }
 
-function normalizeSubmitDelayMs(value: number | undefined, fallback: number): number {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-  return Math.max(0, Math.min(1000, Math.floor(parsed)));
-}
-
 function chunkString(value: string, chunkSize: number): string[] {
   const chunks: string[] = [];
   for (let index = 0; index < value.length; index += chunkSize) {
@@ -605,15 +582,11 @@ async function activeTerminalPane(sessionName: string): Promise<ZellijPane | nul
   );
 }
 
-async function loadZellijTranscript(dataDir: string, sessionId: string, lines?: number): Promise<string> {
-  const transcriptPath = zellijTranscriptPath(dataDir, sessionId);
-  if (lines !== undefined) {
-    return readTailFileLines(transcriptPath, lines, config.nativeHistoryBytes).catch(() => "");
-  }
-  return readTailFile(transcriptPath, config.nativeHistoryBytes).catch(() => "");
+async function loadZellijTranscript(dataDir: string, sessionId: string): Promise<string> {
+  return readTailFile(zellijTranscriptPath(dataDir, sessionId), config.nativeHistoryBytes).catch(() => "");
 }
 
-export function zellijTranscriptPath(dataDir: string, sessionId: string): string {
+function zellijTranscriptPath(dataDir: string, sessionId: string): string {
   return path.join(dataDir, "transcripts", `${sessionId.replace(/[^A-Za-z0-9_-]/g, "_")}.ansi`);
 }
 
@@ -643,51 +616,11 @@ async function readTailFile(filePath: string, maxBytes: number): Promise<string>
   }
 }
 
-async function readTailFileLines(filePath: string, linesToKeep: number, maxBytes: number): Promise<string> {
-  const stat = await fs.promises.stat(filePath);
-  if (stat.size <= 0) {
-    return "";
-  }
-
-  const chunks: Buffer[] = [];
-  const chunkSize = 256 * 1024;
-  const targetLines = Math.max(1, Math.floor(linesToKeep));
-  const bytesToRead = Math.min(stat.size, maxBytes);
-  let remaining = stat.size;
-  let bytesRead = 0;
-  let lineBreaks = 0;
-  const handle = await fs.promises.open(filePath, "r");
-  try {
-    while (remaining > 0 && bytesRead < bytesToRead && lineBreaks <= targetLines) {
-      const length = Math.min(chunkSize, remaining, bytesToRead - bytesRead);
-      remaining -= length;
-      const buffer = Buffer.alloc(length);
-      const result = await handle.read(buffer, 0, length, remaining);
-      const chunk = buffer.subarray(0, result.bytesRead);
-      chunks.unshift(chunk);
-      bytesRead += result.bytesRead;
-      lineBreaks += countLineBreakBytes(chunk);
-      if (result.bytesRead <= 0) {
-        break;
-      }
-    }
-    return tailRawLines(Buffer.concat(chunks).toString("utf8"), targetLines);
-  } finally {
-    await handle.close();
-  }
-}
-
-function countLineBreakBytes(value: Buffer): number {
-  let count = 0;
-  for (const byte of value) {
-    if (byte === 10) {
-      count += 1;
-    }
-  }
-  return count;
-}
-
-function zellijOptions(session: Pick<TerminalSession, "cwd" | "shell">): string[] {
+function zellijOptions(
+  session: Pick<TerminalSession, "cwd" | "shell">,
+  scrollbackLines = config.zellijScrollback
+): string[] {
+  const normalizedScrollback = Math.max(1000, Math.min(config.zellijScrollback, Math.floor(scrollbackLines)));
   const args = [
     "options",
     "--on-force-close",
@@ -695,7 +628,7 @@ function zellijOptions(session: Pick<TerminalSession, "cwd" | "shell">): string[
     "--default-cwd",
     resolveCwd(session.cwd),
     "--scroll-buffer-size",
-    String(config.zellijScrollback),
+    String(normalizedScrollback),
     "--session-serialization",
     "true",
     "--serialization-interval",
@@ -703,7 +636,7 @@ function zellijOptions(session: Pick<TerminalSession, "cwd" | "shell">): string[
     "--serialize-pane-viewport",
     "true",
     "--scrollback-lines-to-serialize",
-    String(config.zellijScrollback),
+    String(normalizedScrollback),
     "--show-startup-tips",
     "false",
     "--simplified-ui",
@@ -732,79 +665,6 @@ function tailLines(value: string, linesToKeep: number): string {
 function tailRawLines(value: string, linesToKeep: number): string {
   const lines = value.split(/\r?\n/);
   return lines.slice(-linesToKeep).join("\n");
-}
-
-function longerHistory(primary: string, fallback: string): string {
-  if (!fallback.trim()) {
-    return primary;
-  }
-  if (!primary.trim()) {
-    return fallback;
-  }
-  return countRawLines(fallback) > countRawLines(primary) ? fallback : primary;
-}
-
-function countRawLines(value: string): number {
-  return value ? value.split(/\r?\n/).length : 0;
-}
-
-export function createZellijAttachOutputFilter(): (data: string) => string {
-  let pending = "";
-  return (data: string) => {
-    const result = stripZellijHistoryHidingSequencesChunk(`${pending}${data}`);
-    pending = result.pending;
-    return result.output;
-  };
-}
-
-export function stripZellijHistoryHidingSequences(data: string): string {
-  const result = stripZellijHistoryHidingSequencesChunk(data);
-  return result.output + result.pending;
-}
-
-function stripZellijHistoryHidingSequencesChunk(data: string): { output: string; pending: string } {
-  let output = "";
-  let index = 0;
-
-  while (index < data.length) {
-    if (data[index] !== "\x1b" || data[index + 1] !== "[") {
-      output += data[index];
-      index += 1;
-      continue;
-    }
-
-    const end = findCsiSequenceEnd(data, index + 2);
-    if (end === -1) {
-      return { output, pending: data.slice(index) };
-    }
-
-    const sequence = data.slice(index, end + 1);
-    if (!isHistoryHidingCsi(sequence)) {
-      output += sequence;
-    }
-    index = end + 1;
-  }
-
-  return { output, pending: "" };
-}
-
-function findCsiSequenceEnd(data: string, start: number): number {
-  for (let index = start; index < data.length; index += 1) {
-    const code = data.charCodeAt(index);
-    if (code >= 0x40 && code <= 0x7e) {
-      return index;
-    }
-  }
-  return -1;
-}
-
-function isHistoryHidingCsi(sequence: string): boolean {
-  const privateMode = /^\x1b\[\?([0-9;]*)([hl])$/.exec(sequence);
-  if (privateMode) {
-    const modes = privateMode[1].split(";");
-    return modes.some((mode) => mode === "47" || mode === "1047" || mode === "1048" || mode === "1049");
-  }
-  return /^\x1b\[\??3J$/.test(sequence);
 }
 
 async function renderPlainTranscript(value: string, lines: number): Promise<string> {
@@ -853,6 +713,17 @@ function formatCommand(command: ZellijPane["command"]): string {
     return command.join(" ");
   }
   return [command.name, ...(command.args ?? [])].filter(Boolean).join(" ");
+}
+
+function isCodexCommand(value: string): boolean {
+  return /(?:^|[\\/\s])codex(?:\.js|\.exe)?(?:\s|$)/i.test(value) || /@openai[\\/]codex/i.test(value);
+}
+
+function looksLikeCodexPaneTitle(value?: string): boolean {
+  if (!value) {
+    return false;
+  }
+  return /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+/u.test(value) || /\.{3}$/.test(value);
 }
 
 function quoteCommand(value: string): string {

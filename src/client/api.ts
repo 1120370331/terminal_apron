@@ -1,39 +1,19 @@
 import type {
   AuthConfig,
   AuthUser,
+  BackgroundUploadResult,
+  CodexSessionStatus,
+  CodexConversationList,
+  CodexConversationSummary,
+  CodexResumeResult,
   CreateSessionInput,
-  FileTransferListResponse,
-  FileTransferUploadResponse,
   HealthStatus,
   SessionPreview,
-  SessionInputRequest,
-  SessionUploadResponse,
   SystemMetrics,
   TerminalSession,
-  UpdateSessionInput
+  UpdateSessionInput,
+  UserPreferences
 } from "../shared/types";
-
-export type SessionInputAckStatus = "accepted" | "error";
-
-export type SessionInputRequestBody = SessionInputRequest & {
-  inputId?: string;
-  lines?: number;
-  maxChars?: number;
-  includePreview?: boolean;
-};
-
-export interface SessionInputResponse {
-  ok: boolean;
-  inputId: string;
-  inputSeq: number;
-  status: SessionInputAckStatus;
-  message?: string;
-  runtime?: TerminalSession["runtime"];
-  preview?: string;
-  grid?: SessionPreview["grid"];
-  signature?: string;
-  capturedAt?: string;
-}
 
 export class ApiError extends Error {
   constructor(
@@ -46,7 +26,7 @@ export class ApiError extends Error {
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
-  if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
+  if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
@@ -75,24 +55,20 @@ export const api = {
   me: () => request<AuthUser>("/api/me"),
   health: () => request<HealthStatus>("/api/health"),
   systemMetrics: () => request<SystemMetrics>("/api/system/metrics"),
-  fileTransferList: () => request<FileTransferListResponse>("/api/file-transfer/files"),
-  uploadTransferFiles: (files: File[]) => {
-    const form = new FormData();
-    files.forEach((file, index) => {
-      form.append("files", file, uploadFileName(file, index));
-    });
-    return request<FileTransferUploadResponse>("/api/file-transfer/files", {
-      method: "POST",
-      body: form
-    });
-  },
-  deleteTransferFile: (relativePath: string) =>
-    request<{ ok: boolean }>("/api/file-transfer/files", {
-      method: "DELETE",
-      body: JSON.stringify({ path: relativePath })
+  preferences: () => request<UserPreferences>("/api/preferences"),
+  updatePreferences: (input: Partial<UserPreferences>) =>
+    request<UserPreferences>("/api/preferences", {
+      method: "PATCH",
+      body: JSON.stringify(input)
     }),
-  fileTransferDownloadUrl: (relativePath: string) =>
-    `/api/file-transfer/download?path=${encodeURIComponent(relativePath)}`,
+  uploadBackground: (file: File) =>
+    request<BackgroundUploadResult>("/api/backgrounds", {
+      method: "POST",
+      headers: {
+        "Content-Type": file.type
+      },
+      body: file
+    }),
   login: (username: string, password: string) =>
     request<AuthUser>("/api/auth/login", {
       method: "POST",
@@ -116,6 +92,7 @@ export const api = {
       body: JSON.stringify(input)
     }),
   sessions: (archived = false) => request<TerminalSession[]>(`/api/sessions?archived=${archived}`),
+  codexStatuses: () => request<Record<string, CodexSessionStatus>>("/api/codex/statuses"),
   createSession: (input: CreateSessionInput) =>
     request<TerminalSession>("/api/sessions", {
       method: "POST",
@@ -134,21 +111,20 @@ export const api = {
     request<TerminalSession>(`/api/sessions/${id}/ensure`, {
       method: "POST"
     }),
-  sendInput: (id: string, input: SessionInputRequestBody) =>
-    request<SessionInputResponse>(`/api/sessions/${id}/input`, {
+  sendInput: (
+    id: string,
+    input: { data: string; enter?: boolean; submitKey?: "enter"; submitDelayMs?: number }
+  ) =>
+    request<{
+      ok: boolean;
+      runtime?: TerminalSession["runtime"];
+      preview?: string;
+      grid?: SessionPreview["grid"];
+      signature?: string;
+    }>(`/api/sessions/${id}/input`, {
       method: "POST",
       body: JSON.stringify(input)
     }),
-  uploadSessionFiles: (id: string, files: File[]) => {
-    const form = new FormData();
-    files.forEach((file, index) => {
-      form.append("files", file, uploadFileName(file, index));
-    });
-    return request<SessionUploadResponse>(`/api/sessions/${id}/uploads`, {
-      method: "POST",
-      body: form
-    });
-  },
   archiveSession: (id: string) =>
     request<TerminalSession>(`/api/sessions/${id}/archive`, {
       method: "POST"
@@ -161,47 +137,18 @@ export const api = {
     request<TerminalSession>(`/api/sessions/${id}/kill`, {
       method: "POST"
     }),
-  preview: (id: string, lines = 500, maxChars = 500_000, full = true, force = false, signature = "") => {
-    const params = new URLSearchParams({
-      lines: String(lines),
-      maxChars: String(maxChars),
-      full: String(full),
-      force: String(force)
-    });
-    if (signature) {
-      params.set("signature", signature);
-    }
-    return request<SessionPreview>(`/api/sessions/${id}/preview?${params.toString()}`);
-  }
+  preview: (id: string, lines = 500, maxChars = 500_000, full = true) =>
+    request<SessionPreview>(`/api/sessions/${id}/preview?lines=${lines}&maxChars=${maxChars}&full=${full}`),
+  codexConversations: (id: string) =>
+    request<CodexConversationList>(`/api/sessions/${id}/codex/conversations`),
+  resumeCodexConversation: (id: string, conversationId: string) =>
+    request<CodexResumeResult>(`/api/sessions/${id}/codex/resume`, {
+      method: "POST",
+      body: JSON.stringify({ conversationId })
+    }),
+  selectDirectory: (initialPath?: string) =>
+    request<{ path: string | null }>("/api/filesystem/select-directory", {
+      method: "POST",
+      body: JSON.stringify({ initialPath })
+    })
 };
-
-function uploadFileName(file: File, index: number): string {
-  const name = file.name.trim();
-  if (name) {
-    return name;
-  }
-  return `clipboard-${index + 1}${extensionForMimeType(file.type)}`;
-}
-
-function extensionForMimeType(mimeType: string): string {
-  const normalized = mimeType.toLowerCase();
-  if (normalized === "image/png") {
-    return ".png";
-  }
-  if (normalized === "image/jpeg") {
-    return ".jpg";
-  }
-  if (normalized === "image/gif") {
-    return ".gif";
-  }
-  if (normalized === "image/webp") {
-    return ".webp";
-  }
-  if (normalized === "application/pdf") {
-    return ".pdf";
-  }
-  if (normalized.startsWith("text/")) {
-    return ".txt";
-  }
-  return ".bin";
-}

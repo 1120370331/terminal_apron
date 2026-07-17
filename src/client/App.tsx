@@ -1,11 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode
+} from "react";
 import { WidthProvider, Responsive, type Layout } from "react-grid-layout";
 import {
   Archive,
   Activity,
   Boxes,
   Cpu,
-  FolderOpen,
   Laptop,
   LayoutGrid,
   LogOut,
@@ -23,52 +32,48 @@ import {
 } from "lucide-react";
 import type {
   AuthUser,
+  CodexSessionStatus,
   HealthStatus,
   SessionPreview,
   SystemMetrics,
   TerminalPreviewGrid,
-  TerminalSession
+  TerminalSession,
+  UserPreferences
 } from "../shared/types";
-import { api, ApiError, type SessionInputResponse } from "./api";
+import { api, ApiError } from "./api";
 import { Login } from "./components/Login";
-import { FileTransferPanel } from "./components/FileTransferPanel";
-import { SessionCard, type QuickInputPhase, type QuickInputStatus } from "./components/SessionCard";
+import { SessionCard } from "./components/SessionCard";
 import { SessionEditor } from "./components/SessionEditor";
-import { TerminalDock } from "./components/TerminalDock";
+import { CodexHistoryModal } from "./components/CodexHistoryModal";
+import { BackgroundImagePicker } from "./components/BackgroundImagePicker";
+
+const TerminalDock = lazy(async () => {
+  const module = await import("./components/TerminalDock");
+  return { default: module.TerminalDock };
+});
 
 const ResponsiveGrid = WidthProvider(Responsive);
 const FILTER_STATE_KEY = "terminal-web-monitor.filters.v1";
 const SETTINGS_STATE_KEY = "terminal-web-monitor.settings.v1";
-const DEFAULT_BROWSER_TITLE = "Terminal Web Monitor";
-const DEFAULT_ROW_HEIGHT = 48;
-const DEFAULT_CARD_ROWS = 12;
-const MIN_CARD_ROWS = 6;
-const SESSION_REFRESH_MS = 1000;
-const SYSTEM_METRICS_REFRESH_MS = 1000;
+const DEFAULT_ROW_HEIGHT = 100;
+const DEFAULT_CARD_ROWS = 7;
+const MIN_CARD_ROWS = 7;
+const SESSION_REFRESH_MS = 2500;
+const CODEX_STATUS_REFRESH_MS = 1000;
+const SYSTEM_METRICS_REFRESH_MS = 2000;
 const SYSTEM_METRICS_HISTORY_LIMIT = 120;
 const DEFAULT_PREVIEW_LINES = 600;
 const MAX_LIST_PREVIEW_LINES = 1200;
-const FULL_PREVIEW_REFRESH_MS = 10_000;
-const REMOTE_SYSTEM_METRICS_REFRESH_MS = 5000;
-const REMOTE_PREVIEW_MIN_REFRESH_MS = 2500;
-const REMOTE_FULL_PREVIEW_REFRESH_MS = 30_000;
-const LOCAL_PREVIEW_MAX_CHARS = 500_000;
-const REMOTE_PREVIEW_MAX_CHARS = 120_000;
-const LOCAL_PREVIEW_MAX_CONCURRENT = 2;
-const REMOTE_PREVIEW_MAX_CONCURRENT = 1;
 const PREVIEW_REVEAL_TIMEOUT_MS = 1500;
-const QUICK_INPUT_ECHO_DELAY_MS = 180;
-const QUICK_INPUT_REFRESH_RETRY_MS = 900;
-const QUICK_INPUT_UPDATED_CLEAR_MS = 1800;
-const QUICK_INPUT_ERROR_CLEAR_MS = 4000;
 const DESKTOP_INITIAL_PREVIEW_CARDS = 3;
 const MOBILE_INITIAL_PREVIEW_CARDS = 2;
 const MOBILE_QUERY = "(max-width: 720px)";
-const LEGACY_GRID_COLUMNS = 12;
-const GRID_COLUMNS = 24;
-const CARD_COLUMNS = 8;
-const MIN_CARD_COLUMNS = 4;
-const MIN_LAYOUT_ROWS = 5;
+const CODEX_SUBMIT_MIN_DELAY_MS = 220;
+const CODEX_SUBMIT_MAX_DELAY_MS = 900;
+const GRID_COLUMNS = 12;
+const CARD_COLUMNS = 4;
+const MIN_CARD_COLUMNS = 2;
+const MIN_LAYOUT_ROWS = 3;
 const GRID_MARGIN: [number, number] = [14, 14];
 const GRID_RESIZE_HANDLES: Array<"s" | "w" | "e" | "n" | "sw" | "nw" | "se" | "ne"> = [
   "s",
@@ -83,7 +88,6 @@ const GRID_RESIZE_HANDLES: Array<"s" | "w" | "e" | "n" | "sw" | "nw" | "se" | "n
 type ThemeMode = "system" | "light" | "dark";
 
 interface PanelSettings {
-  browserTitle: string;
   rowHeight: number;
   defaultCardRows: number;
   minCardRows: number;
@@ -105,18 +109,20 @@ interface FilterState {
 }
 
 const DEFAULT_SETTINGS: PanelSettings = {
-  browserTitle: DEFAULT_BROWSER_TITLE,
   rowHeight: DEFAULT_ROW_HEIGHT,
   defaultCardRows: DEFAULT_CARD_ROWS,
   minCardRows: MIN_CARD_ROWS,
   previewMinHeight: 500,
   previewLines: DEFAULT_PREVIEW_LINES,
-  previewRefreshMs: 1000,
-  maxPreviewCards: 24,
+  previewRefreshMs: 1500,
+  maxPreviewCards: 12,
   listTerminalFontSize: 16,
   listTerminalScale: 100,
   inlineSubmitKey: "enter",
   themeMode: "system"
+};
+const DEFAULT_PREFERENCES: UserPreferences = {
+  terminalBackgroundImage: null
 };
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
@@ -129,36 +135,6 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
 
 function parseThemeMode(value: unknown): ThemeMode {
   return value === "light" || value === "dark" || value === "system" ? value : DEFAULT_SETTINGS.themeMode;
-}
-
-function normalizeBrowserTitle(value: unknown): string {
-  if (typeof value !== "string") {
-    return DEFAULT_SETTINGS.browserTitle;
-  }
-  return value.replace(/\s+/g, " ").trim().slice(0, 80);
-}
-
-function effectiveBrowserTitle(value: string): string {
-  return value.trim() || DEFAULT_BROWSER_TITLE;
-}
-
-function isRemoteBrowserHost(): boolean {
-  if (typeof window === "undefined") {
-    return false;
-  }
-  const hostname = window.location.hostname.toLowerCase();
-  return !["localhost", "127.0.0.1", "::1", ""].includes(hostname);
-}
-
-function isTerminalInputFocused(): boolean {
-  if (typeof document === "undefined") {
-    return false;
-  }
-  const active = document.activeElement;
-  if (!(active instanceof HTMLElement)) {
-    return false;
-  }
-  return Boolean(active.closest(".terminal-dock, .quick-input"));
 }
 
 function resolveThemeMode(mode: ThemeMode): "light" | "dark" {
@@ -197,27 +173,26 @@ function useMediaQuery(query: string): boolean {
   return matches;
 }
 
-function userStorageKey(base: string, userName: string): string {
+function userStorageKey(base: string, userName: string, clientProfile?: "mobile" | "desktop"): string {
   const safeUser = userName.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "_") || "user";
-  return `${base}.${safeUser}`;
+  return `${base}.${safeUser}${clientProfile ? `.${clientProfile}` : ""}`;
 }
 
-function loadPanelSettings(storageKey = SETTINGS_STATE_KEY): PanelSettings {
+function loadPanelSettings(storageKey = SETTINGS_STATE_KEY, fallbackStorageKey?: string): PanelSettings {
   if (typeof window === "undefined") {
     return DEFAULT_SETTINGS;
   }
 
   try {
-    const stored = window.localStorage.getItem(storageKey);
+    const stored = window.localStorage.getItem(storageKey) ?? (fallbackStorageKey ? window.localStorage.getItem(fallbackStorageKey) : null);
     if (!stored) {
       return DEFAULT_SETTINGS;
     }
     const parsed = JSON.parse(stored) as Partial<PanelSettings>;
     return {
-      browserTitle: normalizeBrowserTitle(parsed.browserTitle),
-      rowHeight: clampNumber(parsed.rowHeight, DEFAULT_SETTINGS.rowHeight, 24, 180),
-      defaultCardRows: clampNumber(parsed.defaultCardRows, DEFAULT_SETTINGS.defaultCardRows, 3, 32),
-      minCardRows: clampNumber(parsed.minCardRows, DEFAULT_SETTINGS.minCardRows, 3, 32),
+      rowHeight: clampNumber(parsed.rowHeight, DEFAULT_SETTINGS.rowHeight, 80, 220),
+      defaultCardRows: clampNumber(parsed.defaultCardRows, DEFAULT_SETTINGS.defaultCardRows, 3, 14),
+      minCardRows: clampNumber(parsed.minCardRows, DEFAULT_SETTINGS.minCardRows, 3, 14),
       previewMinHeight: clampNumber(parsed.previewMinHeight, DEFAULT_SETTINGS.previewMinHeight, 160, 1400),
       previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, MAX_LIST_PREVIEW_LINES),
       previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000),
@@ -232,7 +207,7 @@ function loadPanelSettings(storageKey = SETTINGS_STATE_KEY): PanelSettings {
   }
 }
 
-function loadFilterState(storageKey = FILTER_STATE_KEY): FilterState {
+function loadFilterState(storageKey = FILTER_STATE_KEY, fallbackStorageKey?: string): FilterState {
   if (typeof window === "undefined") {
     return {
       query: "",
@@ -243,7 +218,7 @@ function loadFilterState(storageKey = FILTER_STATE_KEY): FilterState {
   }
 
   try {
-    const stored = window.localStorage.getItem(storageKey);
+    const stored = window.localStorage.getItem(storageKey) ?? (fallbackStorageKey ? window.localStorage.getItem(fallbackStorageKey) : null);
     if (!stored) {
       throw new Error("missing stored filters");
     }
@@ -306,6 +281,8 @@ function sessionSignature(session: TerminalSession): string {
     session.backend,
     session.tmuxName,
     session.color,
+    session.backgroundMode,
+    session.backgroundImage ?? "",
     String(session.archived),
     session.updatedAt,
     session.archivedAt ?? "",
@@ -322,6 +299,16 @@ function sessionSignature(session: TerminalSession): string {
   ].join("\u001f");
 }
 
+function resolveTerminalBackground(session: TerminalSession, preferences: UserPreferences): string | null {
+  if (session.backgroundMode === "none") {
+    return null;
+  }
+  if (session.backgroundMode === "image") {
+    return session.backgroundImage ?? null;
+  }
+  return preferences.terminalBackgroundImage;
+}
+
 function emptyPreview(sessionId: string): SessionPreview {
   return {
     sessionId,
@@ -331,58 +318,44 @@ function emptyPreview(sessionId: string): SessionPreview {
   };
 }
 
-function quickSubmitDelayMs(value: string): number {
-  return Math.max(140, Math.min(600, 140 + Math.ceil(value.length / 80)));
-}
-
-function createQuickInputId(sessionId: string): string {
-  return `qi:${sessionId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function removeRecordKey<T>(record: Record<string, T>, key: string): Record<string, T> {
-  if (!(key in record)) {
-    return record;
+function quickSubmitDelayMs(
+  value: string,
+  session: TerminalSession,
+  preview?: SessionPreview
+): number {
+  const output = preview?.text?.slice(-6000) ?? "";
+  const codexRunning =
+    /\bcodex(?:\.exe)?\b/i.test(session.runtime?.currentCommand || "") ||
+    /OpenAI Codex|codex-cli|codex resume|YOLO mode|esc to interrupt|Implement \{feature\}|gpt-[\w.-]+\s+(?:low|medium|high)/i.test(
+      output
+    );
+  if (codexRunning) {
+    return Math.max(
+      CODEX_SUBMIT_MIN_DELAY_MS,
+      Math.min(CODEX_SUBMIT_MAX_DELAY_MS, CODEX_SUBMIT_MIN_DELAY_MS + Math.ceil(value.length / 8))
+    );
   }
-  const next = { ...record };
-  delete next[key];
-  return next;
-}
-
-function previewFromInputResponse(
-  sessionId: string,
-  result: SessionInputResponse,
-  fallback?: SessionPreview
-): SessionPreview | null {
-  if (result.preview === undefined && !result.grid) {
-    return null;
-  }
-  return {
-    ...emptyPreview(sessionId),
-    text: result.preview ?? fallback?.text ?? "",
-    grid: result.grid,
-    signature: result.signature,
-    capturedAt: result.capturedAt ?? new Date().toISOString()
-  };
-}
-
-function quickInputPhaseRank(phase: QuickInputPhase): number {
-  if (phase === "sending") {
-    return 0;
-  }
-  if (phase === "sent") {
-    return 1;
-  }
-  if (phase === "echoing") {
-    return 2;
-  }
-  if (phase === "updated") {
-    return 3;
-  }
-  return 4;
+  return Math.max(160, Math.min(650, 160 + Math.ceil(value.length / 70)));
 }
 
 function samePreview(previous: SessionPreview | undefined, next: SessionPreview): boolean {
   return previewContentSignature(previous) === previewContentSignature(next);
+}
+
+function codexStatusSignature(status?: CodexSessionStatus): string {
+  if (!status) {
+    return "";
+  }
+  return [
+    status.state,
+    status.label,
+    status.conversationId ?? "",
+    status.conversationTitle ?? "",
+    status.turnId ?? "",
+    status.errorCode ?? "",
+    status.errorMessage ?? "",
+    status.updatedAt ?? ""
+  ].join("\u001f");
 }
 
 function previewContentSignature(preview?: SessionPreview): string {
@@ -415,58 +388,21 @@ function gridContentSignature(grid?: TerminalPreviewGrid): string {
   return [grid.cols, grid.rows.length, ...rows].join("\u001c");
 }
 
-function mergeFastPreview(previous: SessionPreview | undefined, next: SessionPreview, rowsToKeep: number): SessionPreview {
-  if (!previous?.grid || !next.grid) {
-    return next;
-  }
-
-  const fastRows = next.grid.rows;
-  const historyRowsToKeep = Math.max(0, rowsToKeep - fastRows.length);
-  const historyRows = historyRowsToKeep > 0 ? previous.grid.rows.slice(-historyRowsToKeep) : [];
-  return {
-    ...next,
-    text: previous.text,
-    grid: {
-      cols: next.grid.cols || previous.grid.cols,
-      rows: [...historyRows, ...fastRows].slice(-rowsToKeep)
-    }
-  };
-}
-
 function buildSessionLayout(session: TerminalSession, index: number, settings: PanelSettings): Layout {
-  const storedLayout = normalizeStoredLayout(session.layout);
-  const width = Math.max(MIN_CARD_COLUMNS, Math.min(GRID_COLUMNS, storedLayout?.w ?? CARD_COLUMNS));
+  const width = Math.max(MIN_CARD_COLUMNS, Math.min(GRID_COLUMNS, session.layout?.w ?? CARD_COLUMNS));
   return {
     i: session.id,
-    x: storedLayout?.x ?? (index % 3) * CARD_COLUMNS,
-    y: storedLayout?.y ?? Math.floor(index / 3) * settings.defaultCardRows,
+    x: session.layout?.x ?? (index % 3) * CARD_COLUMNS,
+    y: session.layout?.y ?? Math.floor(index / 3) * settings.defaultCardRows,
     w: width,
-    h: Math.max(storedLayout?.h ?? settings.defaultCardRows, MIN_LAYOUT_ROWS),
+    h: Math.max(session.layout?.h ?? settings.defaultCardRows, MIN_LAYOUT_ROWS),
     minW: MIN_CARD_COLUMNS,
     minH: MIN_LAYOUT_ROWS
   };
 }
 
-function normalizeStoredLayout(layout: TerminalSession["layout"]): Layout | null {
-  if (!layout) {
-    return null;
-  }
-
-  const sourceColumns = Math.max(1, Number(layout.gridColumns) || LEGACY_GRID_COLUMNS);
-  const columnScale = GRID_COLUMNS / sourceColumns;
-  return clampLayoutItem({
-    i: "",
-    x: Math.round(layout.x * columnScale),
-    y: layout.y,
-    w: Math.round(layout.w * columnScale),
-    h: layout.h,
-    minW: layout.minW ? Math.round(layout.minW * columnScale) : MIN_CARD_COLUMNS,
-    minH: layout.minH ?? MIN_LAYOUT_ROWS
-  });
-}
-
-function buildTopSessionLayout(sessionId: string, settings: PanelSettings): Layout {
-  return {
+function buildNextSessionLayout(sessionId: string, currentLayout: Layout[], settings: PanelSettings): Layout {
+  const base = {
     i: sessionId,
     x: 0,
     y: 0,
@@ -475,6 +411,19 @@ function buildTopSessionLayout(sessionId: string, settings: PanelSettings): Layo
     minW: MIN_CARD_COLUMNS,
     minH: MIN_LAYOUT_ROWS
   };
+  const columns = Array.from(
+    new Set([0, CARD_COLUMNS, GRID_COLUMNS - CARD_COLUMNS].map((value) => Math.max(0, value)))
+  ).sort((a, b) => a - b);
+  const bottom = Math.max(0, ...currentLayout.map((item) => item.y + item.h));
+  for (let y = 0; y <= bottom + base.h; y += 1) {
+    for (const x of columns) {
+      const candidate = { ...base, x, y };
+      if (!currentLayout.some((item) => layoutItemsOverlap(candidate, item))) {
+        return candidate;
+      }
+    }
+  }
+  return { ...base, y: bottom };
 }
 
 function buildOrganizedLayout(sessions: TerminalSession[], settings: PanelSettings): Layout[] {
@@ -560,6 +509,10 @@ function sameLayout(previous: Layout[], next: Layout[]): boolean {
   });
 }
 
+function settleLayout(layout: Layout[]): Layout[] {
+  return layout.map(clampLayoutItem);
+}
+
 function clampLayoutItem(item: Layout): Layout {
   const minW = item.minW ?? MIN_CARD_COLUMNS;
   const minH = item.minH ?? MIN_LAYOUT_ROWS;
@@ -575,6 +528,10 @@ function clampLayoutItem(item: Layout): Layout {
   };
 }
 
+function layoutItemsOverlap(a: Layout, b: Layout): boolean {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
 function layoutToSessionLayout(item: Layout, offsetY = 0) {
   return {
     x: item.x,
@@ -582,8 +539,7 @@ function layoutToSessionLayout(item: Layout, offsetY = 0) {
     w: item.w,
     h: item.h,
     minW: item.minW,
-    minH: item.minH,
-    gridColumns: GRID_COLUMNS
+    minH: item.minH
   };
 }
 
@@ -593,7 +549,6 @@ export function App() {
   const [auth, setAuth] = useState<AuthUser | null | undefined>(undefined);
   const [sessions, setSessions] = useState<TerminalSession[]>([]);
   const [previews, setPreviews] = useState<Record<string, SessionPreview>>({});
-  const [quickInputStatuses, setQuickInputStatuses] = useState<Record<string, QuickInputStatus>>({});
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [metricsHistory, setMetricsHistory] = useState<SystemMetrics[]>([]);
   const [query, setQuery] = useState(initialFilters.query);
@@ -601,11 +556,11 @@ export function App() {
   const [tagFilter, setTagFilter] = useState(initialFilters.tagFilter);
   const [showArchived, setShowArchived] = useState(initialFilters.showArchived);
   const [settings, setSettings] = useState<PanelSettings>(initialSettings);
+  const [preferences, setPreferences] = useState<UserPreferences>(DEFAULT_PREFERENCES);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [transferOpen, setTransferOpen] = useState(false);
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
   const [activeTerminal, setActiveTerminal] = useState<TerminalSession | null>(null);
-  const [cachedTerminals, setCachedTerminals] = useState<TerminalSession[]>([]);
+  const [codexHistorySession, setCodexHistorySession] = useState<TerminalSession | null>(null);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [previewRevealTimedOut, setPreviewRevealTimedOut] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -614,87 +569,14 @@ export function App() {
   const localLayoutRef = useRef<Layout[]>([]);
   const layoutOriginYRef = useRef(0);
   const layoutProtectUntilRef = useRef(0);
+  const activeLayoutItemIdRef = useRef<string | null>(null);
   const layoutSaveSeqRef = useRef(0);
   const previewsRef = useRef<Record<string, SessionPreview>>({});
   const previewInFlightRef = useRef<Set<string>>(new Set());
-  const previewActiveRequestsRef = useRef(0);
-  const previewQueueRef = useRef<Array<() => void>>([]);
-  const lastFullPreviewAtRef = useRef<Record<string, number>>({});
-  const quickInputTimersRef = useRef<Record<string, number[]>>({});
+  const codexStatusInFlightRef = useRef(false);
   const userStorageReadyRef = useRef<string | null>(null);
   const isMobile = useMediaQuery(MOBILE_QUERY);
-  const remoteBrowserHost = useMemo(isRemoteBrowserHost, []);
-  const systemMetricsRefreshMs = remoteBrowserHost ? REMOTE_SYSTEM_METRICS_REFRESH_MS : SYSTEM_METRICS_REFRESH_MS;
-  const previewRefreshMs = remoteBrowserHost
-    ? Math.max(settings.previewRefreshMs, REMOTE_PREVIEW_MIN_REFRESH_MS)
-    : settings.previewRefreshMs;
-  const fullPreviewRefreshMs = remoteBrowserHost ? REMOTE_FULL_PREVIEW_REFRESH_MS : FULL_PREVIEW_REFRESH_MS;
-  const previewMaxChars = remoteBrowserHost ? REMOTE_PREVIEW_MAX_CHARS : LOCAL_PREVIEW_MAX_CHARS;
-  const previewMaxConcurrent = remoteBrowserHost ? REMOTE_PREVIEW_MAX_CONCURRENT : LOCAL_PREVIEW_MAX_CONCURRENT;
-
-  const clearQuickInputTimers = useCallback((sessionId: string) => {
-    const timers = quickInputTimersRef.current[sessionId] ?? [];
-    timers.forEach((timer) => window.clearTimeout(timer));
-    delete quickInputTimersRef.current[sessionId];
-  }, []);
-
-  const scheduleQuickInputTimer = useCallback((sessionId: string, callback: () => void, delayMs: number) => {
-    const timer = window.setTimeout(callback, delayMs);
-    quickInputTimersRef.current[sessionId] = [...(quickInputTimersRef.current[sessionId] ?? []), timer];
-    return timer;
-  }, []);
-
-  const setQuickInputPhase = useCallback(
-    (
-      sessionId: string,
-      inputId: string,
-      phase: QuickInputPhase,
-      details: { inputSeq?: number; message?: string } = {}
-    ) => {
-      setQuickInputStatuses((current) => {
-        const previous = current[sessionId];
-        if (phase !== "sending" && previous && previous.inputId !== inputId) {
-          return current;
-        }
-        if (previous?.inputId === inputId && quickInputPhaseRank(phase) < quickInputPhaseRank(previous.phase)) {
-          return current;
-        }
-        return {
-          ...current,
-          [sessionId]: {
-            inputId,
-            phase,
-            inputSeq: details.inputSeq ?? (previous?.inputId === inputId ? previous.inputSeq : undefined),
-            message: details.message,
-            updatedAt: Date.now()
-          }
-        };
-      });
-    },
-    []
-  );
-
-  const clearQuickInputStatus = useCallback((sessionId: string, inputId: string) => {
-    setQuickInputStatuses((current) => {
-      if (current[sessionId]?.inputId !== inputId) {
-        return current;
-      }
-      return removeRecordKey(current, sessionId);
-    });
-  }, []);
-
-  const cacheTerminal = useCallback((session: TerminalSession) => {
-    setCachedTerminals((current) => [session, ...current.filter((item) => item.id !== session.id)].slice(0, 3));
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      Object.values(quickInputTimersRef.current).forEach((timers) => {
-        timers.forEach((timer) => window.clearTimeout(timer));
-      });
-      quickInputTimersRef.current = {};
-    };
-  }, []);
+  const clientProfile = isMobile ? "mobile" : "desktop";
 
   const loadSessions = useCallback(async () => {
     try {
@@ -703,7 +585,14 @@ export function App() {
         layoutDirtyRef.current || Date.now() < layoutProtectUntilRef.current
           ? mergeLocalLayoutsIntoSessions(loaded, localLayoutRef.current, layoutOriginYRef.current)
           : loaded;
-      setSessions((current) => (sameSessionList(current, next) ? current : next));
+      setSessions((current) => {
+        const liveStatuses = new Map(current.map((session) => [session.id, session.codexStatus]));
+        const merged = next.map((session) => {
+          const liveStatus = liveStatuses.get(session.id);
+          return liveStatus ? { ...session, codexStatus: liveStatus } : session;
+        });
+        return sameSessionList(current, merged) ? current : merged;
+      });
       setSessionsLoaded(true);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
@@ -718,6 +607,14 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!auth) {
+      setPreferences(DEFAULT_PREFERENCES);
+      return;
+    }
+    void api.preferences().then(setPreferences).catch(() => setPreferences(DEFAULT_PREFERENCES));
+  }, [auth]);
+
+  useEffect(() => {
     previewsRef.current = previews;
   }, [previews]);
 
@@ -728,25 +625,32 @@ export function App() {
       return;
     }
     const userName = auth.name;
+    const storageOwner = `${userName}:${clientProfile}`;
     userStorageReadyRef.current = null;
-    const nextFilters = loadFilterState(userStorageKey(FILTER_STATE_KEY, userName));
-    const nextSettings = loadPanelSettings(userStorageKey(SETTINGS_STATE_KEY, userName));
+    const nextFilters = loadFilterState(
+      userStorageKey(FILTER_STATE_KEY, userName, clientProfile),
+      userStorageKey(FILTER_STATE_KEY, userName)
+    );
+    const nextSettings = loadPanelSettings(
+      userStorageKey(SETTINGS_STATE_KEY, userName, clientProfile),
+      userStorageKey(SETTINGS_STATE_KEY, userName)
+    );
     setQuery(nextFilters.query);
     setGroupFilter(nextFilters.groupFilter);
     setTagFilter(nextFilters.tagFilter);
     setShowArchived(nextFilters.showArchived);
     setSettings(nextSettings);
     window.setTimeout(() => {
-      userStorageReadyRef.current = userName;
+      userStorageReadyRef.current = storageOwner;
     }, 0);
-  }, [auth]);
+  }, [auth, clientProfile]);
 
   useEffect(() => {
-    if (!auth || userStorageReadyRef.current !== auth.name) {
+    if (!auth || userStorageReadyRef.current !== `${auth.name}:${clientProfile}`) {
       return;
     }
     window.localStorage.setItem(
-      userStorageKey(FILTER_STATE_KEY, auth.name),
+      userStorageKey(FILTER_STATE_KEY, auth.name, clientProfile),
       JSON.stringify({
         query,
         groupFilter,
@@ -754,18 +658,14 @@ export function App() {
         showArchived
       })
     );
-  }, [auth, groupFilter, query, showArchived, tagFilter]);
+  }, [auth, clientProfile, groupFilter, query, showArchived, tagFilter]);
 
   useEffect(() => {
-    if (!auth || userStorageReadyRef.current !== auth.name) {
+    if (!auth || userStorageReadyRef.current !== `${auth.name}:${clientProfile}`) {
       return;
     }
-    window.localStorage.setItem(userStorageKey(SETTINGS_STATE_KEY, auth.name), JSON.stringify(settings));
-  }, [auth, settings]);
-
-  useEffect(() => {
-    document.title = effectiveBrowserTitle(settings.browserTitle);
-  }, [settings.browserTitle]);
+    window.localStorage.setItem(userStorageKey(SETTINGS_STATE_KEY, auth.name, clientProfile), JSON.stringify(settings));
+  }, [auth, clientProfile, settings]);
 
   useEffect(() => {
     const applyTheme = () => {
@@ -791,13 +691,53 @@ export function App() {
     }
     void loadSessions();
     const timer = window.setInterval(() => {
-      if (isTerminalInputFocused()) {
-        return;
-      }
       void loadSessions();
     }, SESSION_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [activeTerminal, auth, loadSessions]);
+
+  useEffect(() => {
+    if (!auth || activeTerminal) {
+      return;
+    }
+
+    let cancelled = false;
+    const pollCodexStatuses = async () => {
+      if (codexStatusInFlightRef.current) {
+        return;
+      }
+      codexStatusInFlightRef.current = true;
+      try {
+        const statuses = await api.codexStatuses();
+        if (cancelled) {
+          return;
+        }
+        setSessions((current) => {
+          let changed = false;
+          const next = current.map((session) => {
+            const status = statuses[session.id];
+            if (!status || codexStatusSignature(session.codexStatus) === codexStatusSignature(status)) {
+              return session;
+            }
+            changed = true;
+            return { ...session, codexStatus: status };
+          });
+          return changed ? next : current;
+        });
+      } catch {
+        // Keep the last confirmed state during a transient status capture failure.
+      } finally {
+        codexStatusInFlightRef.current = false;
+      }
+    };
+
+    void pollCodexStatuses();
+    const timer = window.setInterval(() => void pollCodexStatuses(), CODEX_STATUS_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeTerminal, auth]);
 
   useEffect(() => {
     if (!auth) {
@@ -806,9 +746,6 @@ export function App() {
 
     let cancelled = false;
     const loadMetrics = async () => {
-      if (isTerminalInputFocused()) {
-        return;
-      }
       try {
         const metrics = await api.systemMetrics();
         if (!cancelled) {
@@ -822,12 +759,12 @@ export function App() {
     };
 
     void loadMetrics();
-    const timer = window.setInterval(loadMetrics, systemMetricsRefreshMs);
+    const timer = window.setInterval(loadMetrics, SYSTEM_METRICS_REFRESH_MS);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [auth, systemMetricsRefreshMs]);
+  }, [auth]);
 
   const groups = useMemo(
     () => ["all", ...Array.from(new Set(sessions.map((session) => session.group))).sort()],
@@ -899,69 +836,8 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [auth, sessionsLoaded, previewRevealReady, previewRevealTargetKey, previewRevealTargets.length]);
 
-  const applySessionPreview = useCallback(
-    (sessionId: string, preview: SessionPreview, _full: boolean) => {
-      if (preview.unchanged) {
-        return;
-      }
-      setPreviews((current) => {
-        return samePreview(current[sessionId], preview) ? current : { ...current, [sessionId]: preview };
-      });
-    },
-    []
-  );
-
-  const runPreviewRequest = useCallback(
-    <T,>(request: () => Promise<T>): Promise<T> =>
-      new Promise<T>((resolve, reject) => {
-        const start = () => {
-          previewActiveRequestsRef.current += 1;
-          request()
-            .then(resolve, reject)
-            .finally(() => {
-              previewActiveRequestsRef.current = Math.max(0, previewActiveRequestsRef.current - 1);
-              previewQueueRef.current.shift()?.();
-            });
-        };
-
-        if (previewActiveRequestsRef.current < previewMaxConcurrent) {
-          start();
-        } else {
-          previewQueueRef.current.push(start);
-        }
-      }),
-    [previewMaxConcurrent]
-  );
-
-  const refreshSessionPreview = useCallback(
-    async (sessionId: string, full = false, force = false): Promise<SessionPreview | null> => {
-      if (previewInFlightRef.current.has(sessionId)) {
-        return null;
-      }
-
-      previewInFlightRef.current.add(sessionId);
-      try {
-        const knownSignature = force ? "" : previewContentSignature(previewsRef.current[sessionId]);
-        const preview = await runPreviewRequest(() =>
-          api.preview(sessionId, settings.previewLines, previewMaxChars, full, force, knownSignature)
-        );
-        if (preview.unchanged) {
-          return previewsRef.current[sessionId] ?? null;
-        }
-        if (full) {
-          lastFullPreviewAtRef.current[sessionId] = Date.now();
-        }
-        applySessionPreview(sessionId, preview, full);
-        return preview;
-      } finally {
-        previewInFlightRef.current.delete(sessionId);
-      }
-    },
-    [applySessionPreview, previewMaxChars, runPreviewRequest, settings.previewLines]
-  );
-
   useEffect(() => {
-    if (!auth || activeTerminal || previewTargets.length === 0) {
+    if (!auth || previewTargets.length === 0) {
       return;
     }
 
@@ -984,35 +860,25 @@ export function App() {
     });
 
     const pollPreview = async (sessionId: string) => {
-      if (previewInFlightRef.current.has(sessionId) || isTerminalInputFocused()) {
+      if (previewInFlightRef.current.has(sessionId)) {
+        return;
+      }
+      if (activeTerminal?.id === sessionId || document.hidden || !isSessionNearViewport(sessionId)) {
         return;
       }
 
       previewInFlightRef.current.add(sessionId);
       try {
-        const now = Date.now();
-        const previous = previewsRef.current[sessionId];
-        const lastFullAt = lastFullPreviewAtRef.current[sessionId] ?? 0;
-        const shouldLoadFull = true;
-        const knownSignature = now - lastFullAt >= fullPreviewRefreshMs ? "" : previewContentSignature(previous);
-        const preview = await runPreviewRequest(() =>
-          api.preview(sessionId, settings.previewLines, previewMaxChars, shouldLoadFull, false, knownSignature)
-        );
+        const preview = await api.preview(sessionId, settings.previewLines, 240_000, true);
         if (cancelled || !visibleIds.has(sessionId)) {
           return;
         }
 
-        if (preview.unchanged) {
-          return;
-        }
-
-        if (shouldLoadFull) {
-          lastFullPreviewAtRef.current[sessionId] = Date.now();
-        }
-
-        applySessionPreview(sessionId, preview, shouldLoadFull);
+        setPreviews((current) => {
+          return samePreview(current[sessionId], preview) ? current : { ...current, [sessionId]: preview };
+        });
       } catch {
-        // Retain the last successful frame during transient capture failures.
+        // Keep the last successful frame during transient Zellij capture failures.
       } finally {
         previewInFlightRef.current.delete(sessionId);
       }
@@ -1021,29 +887,17 @@ export function App() {
     for (const target of previewTargets) {
       if (!target.exists) {
         previewInFlightRef.current.delete(target.id);
-        delete lastFullPreviewAtRef.current[target.id];
         continue;
       }
       void pollPreview(target.id);
-      timers.push(window.setInterval(() => void pollPreview(target.id), previewRefreshMs));
+      timers.push(window.setInterval(() => void pollPreview(target.id), settings.previewRefreshMs));
     }
 
     return () => {
       cancelled = true;
       timers.forEach((timer) => window.clearInterval(timer));
     };
-  }, [
-    activeTerminal,
-    applySessionPreview,
-    auth,
-    fullPreviewRefreshMs,
-    previewMaxChars,
-    remoteBrowserHost,
-    runPreviewRequest,
-    previewRefreshMs,
-    previewTargetKey,
-    settings.previewLines
-  ]);
+  }, [activeTerminal?.id, auth, previewTargetKey, settings.previewLines, settings.previewRefreshMs]);
 
   const desktopLayoutState = useMemo(
     () => normalizeVisibleLayout(filtered.map((session, index) => buildSessionLayout(session, index, settings))),
@@ -1111,10 +965,11 @@ export function App() {
   );
 
   const handleLayoutStart = useCallback(
-    () => {
+    (_layout: Layout[], oldItem?: Layout, changedItem?: Layout) => {
       if (isMobile) {
         return;
       }
+      activeLayoutItemIdRef.current = changedItem?.i ?? oldItem?.i ?? null;
       layoutDirtyRef.current = true;
       layoutProtectUntilRef.current = Date.now() + 5000;
     },
@@ -1135,16 +990,17 @@ export function App() {
   );
 
   const handleLayoutStop = useCallback(
-    (layout: Layout[]) => {
+    (layout: Layout[], _oldItem?: Layout, changedItem?: Layout) => {
       if (isMobile) {
         return;
       }
-      const next = layout.map(clampLayoutItem);
+      const settled = settleLayout(layout);
+      activeLayoutItemIdRef.current = null;
       layoutDirtyRef.current = true;
       layoutProtectUntilRef.current = Date.now() + 5000;
-      localLayoutRef.current = next;
-      setLocalLayout(next);
-      void saveLayout(next);
+      localLayoutRef.current = settled;
+      setLocalLayout(settled);
+      void saveLayout(settled);
     },
     [isMobile, saveLayout]
   );
@@ -1162,88 +1018,46 @@ export function App() {
     void saveLayout(organized);
   }, [filtered, isMobile, saveLayout, settings]);
 
-  const closeTerminal = useCallback(
-    (terminal: TerminalSession) => {
-      setActiveTerminal(null);
-      void refreshSessionPreview(terminal.id, false, true);
-      void loadSessions();
-    },
-    [loadSessions, refreshSessionPreview]
-  );
-
   const renderSessionCard = (session: TerminalSession) => (
     <SessionCard
       session={session}
       preview={previews[session.id]}
-      quickInputStatus={quickInputStatuses[session.id]}
+      backgroundImage={resolveTerminalBackground(session, preferences)}
       previewFontSize={settings.listTerminalFontSize}
       previewScale={settings.listTerminalScale / 100}
-      onOpen={() => {
-        cacheTerminal(session);
-        setActiveTerminal(session);
-      }}
+      onOpen={() => setActiveTerminal(session)}
       onEdit={() => setEditorSession(session)}
       onDuplicate={async () => {
         await api.duplicateSession(session.id);
         await loadSessions();
       }}
+      onCodexHistory={() => setCodexHistorySession(session)}
       onQuickInput={async (value) => {
-        const inputId = createQuickInputId(session.id);
-        clearQuickInputTimers(session.id);
-        setQuickInputPhase(session.id, inputId, "sending");
         const input = {
-          inputId,
           data: value,
           enter: true,
           submitKey: "enter" as const,
-          mode: "paste" as const,
-          submitDelayMs: quickSubmitDelayMs(value),
-          lines: settings.previewLines,
-          maxChars: previewMaxChars,
-          includePreview: false
+          submitDelayMs: quickSubmitDelayMs(value, session, previewsRef.current[session.id])
         };
-        let result: SessionInputResponse;
-        try {
-          result = await api.sendInput(session.id, input);
-        } catch (error) {
-          setQuickInputPhase(session.id, inputId, "error", {
-            message: error instanceof Error ? error.message : "send failed"
-          });
-          scheduleQuickInputTimer(session.id, () => clearQuickInputStatus(session.id, inputId), QUICK_INPUT_ERROR_CLEAR_MS);
-          throw error;
+        const result = await api.sendInput(session.id, input);
+        if (result.preview !== undefined) {
+          setPreviews((current) => ({
+            ...current,
+            [session.id]: {
+              ...emptyPreview(session.id),
+              text: result.preview || current[session.id]?.text || "",
+              grid: result.grid,
+              signature: result.signature
+            }
+          }));
         }
-
-        setQuickInputPhase(session.id, inputId, "sent", { inputSeq: result.inputSeq });
-        const preview = previewFromInputResponse(session.id, result, previewsRef.current[session.id]);
-        if (preview) {
-          applySessionPreview(session.id, preview, false);
-        }
-        void loadSessions();
-        scheduleQuickInputTimer(session.id, () => {
-          setQuickInputPhase(session.id, inputId, "echoing", { inputSeq: result.inputSeq });
-        }, QUICK_INPUT_ECHO_DELAY_MS);
-        scheduleQuickInputTimer(session.id, () => {
-          void refreshSessionPreview(session.id, false, true)
-            .then(() => {
-              setQuickInputPhase(session.id, inputId, "updated", { inputSeq: result.inputSeq });
-              scheduleQuickInputTimer(
-                session.id,
-                () => clearQuickInputStatus(session.id, inputId),
-                QUICK_INPUT_UPDATED_CLEAR_MS
-              );
-            })
-            .catch((error) => {
-              setQuickInputPhase(session.id, inputId, "error", {
-                inputSeq: result.inputSeq,
-                message: error instanceof Error ? error.message : "preview refresh failed"
-              });
-              scheduleQuickInputTimer(session.id, () => clearQuickInputStatus(session.id, inputId), QUICK_INPUT_ERROR_CLEAR_MS);
-            });
-        }, QUICK_INPUT_REFRESH_RETRY_MS);
-      }}
-      onPasteFiles={async (files) => {
-        const result = await api.uploadSessionFiles(session.id, files);
-        return result.terminalText;
+        await loadSessions();
+        window.setTimeout(() => {
+          void api
+            .preview(session.id, settings.previewLines)
+            .then((preview) => setPreviews((current) => ({ ...current, [session.id]: preview })))
+            .catch(() => undefined);
+        }, 900);
       }}
       onArchive={async () => {
         await api.archiveSession(session.id);
@@ -1309,11 +1123,8 @@ export function App() {
           >
             <ThemeModeIcon mode={settings.themeMode} />
           </button>
-          <button className="icon-button desktop-only-action" type="button" onClick={() => setSettingsOpen(true)} title="配置">
+          <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} title="配置">
             <Settings size={18} />
-          </button>
-          <button className="icon-button" type="button" onClick={() => setTransferOpen(true)} title="文件传输">
-            <FolderOpen size={18} />
           </button>
           <button className="icon-button" type="button" onClick={refresh} title="刷新">
             <RefreshCw size={18} className={loading ? "spin" : ""} />
@@ -1369,7 +1180,7 @@ export function App() {
           <SlidersHorizontal size={16} />
           <input
             type="range"
-            min="24"
+            min="100"
             max="180"
             step="4"
             value={settings.rowHeight}
@@ -1411,7 +1222,7 @@ export function App() {
       ) : isMobile ? (
         <section className="mobile-session-list" aria-label="terminal sessions">
           {filtered.map((session) => (
-            <div className="mobile-session-item" key={session.id}>
+            <div className="mobile-session-item" key={session.id} data-session-id={session.id}>
               {renderSessionCard(session)}
             </div>
           ))}
@@ -1428,8 +1239,8 @@ export function App() {
           allowOverlap
           preventCollision={false}
           resizeHandles={GRID_RESIZE_HANDLES}
-          draggableHandle=".session-card-header"
-          draggableCancel=".preview,.quick-input,.card-actions,.preview-tools,input,select,a"
+          draggableHandle=".drag-handle"
+          draggableCancel=".preview,.quick-input,.card-actions,.preview-tools"
           onDragStart={handleLayoutStart}
           onDrag={handleLayoutMove}
           onResizeStart={handleLayoutStart}
@@ -1452,49 +1263,99 @@ export function App() {
           session={editorSession === "new" ? null : editorSession}
           initialGroup={groupFilter === "all" ? undefined : groupFilter}
           initialTags={tagFilter === "all" ? [] : [tagFilter]}
+          defaultBackgroundImage={preferences.terminalBackgroundImage}
           onClose={() => setEditorSession(null)}
           onSave={async (input) => {
-            let terminalToOpen: TerminalSession | null = null;
             if (editorSession === "new") {
               const created = await api.createSession(input);
-              const topLayout = buildTopSessionLayout(created.id, settings);
-              terminalToOpen = await api.updateSession(created.id, {
-                layout: layoutToSessionLayout(topLayout)
+              const activeLayout = sessions
+                .filter((session) => !session.archived)
+                .map((session, index) => buildSessionLayout(session, index, settings));
+              const nextItem = buildNextSessionLayout(created.id, activeLayout, settings);
+              const nextLayout = [...gridLayout, nextItem];
+              layoutDirtyRef.current = true;
+              layoutProtectUntilRef.current = Date.now() + 5000;
+              localLayoutRef.current = nextLayout;
+              setLocalLayout(nextLayout);
+              await api.updateSession(created.id, {
+                layout: layoutToSessionLayout(nextItem)
               });
             } else {
               await api.updateSession(editorSession.id, input);
             }
             setEditorSession(null);
             await loadSessions();
-            if (terminalToOpen) {
-              cacheTerminal(terminalToOpen);
-              setActiveTerminal(terminalToOpen);
-            }
           }}
         />
       )}
 
-      {cachedTerminals.map((terminal) => (
-        <TerminalDock
-          key={terminal.id}
-          session={terminal}
-          visible={activeTerminal?.id === terminal.id}
-          onClose={() => closeTerminal(terminal)}
+      {activeTerminal && (
+        <Suspense fallback={<TerminalDockLoader />}>
+          <TerminalDock
+            session={activeTerminal}
+            backgroundImage={resolveTerminalBackground(activeTerminal, preferences)}
+            onClose={() => {
+              setActiveTerminal(null);
+              void loadSessions();
+            }}
+          />
+        </Suspense>
+      )}
+
+      {codexHistorySession && (
+        <CodexHistoryModal
+          session={codexHistorySession}
+          onClose={() => setCodexHistorySession(null)}
+          onResumed={() => {
+            const session = codexHistorySession;
+            setCodexHistorySession(null);
+            const refreshPreview = () => {
+              void api
+                .preview(session.id, settings.previewLines, 240_000, true)
+                .then((preview) => setPreviews((current) => ({ ...current, [session.id]: preview })))
+                .catch(() => undefined);
+            };
+            refreshPreview();
+            window.setTimeout(refreshPreview, 600);
+            window.setTimeout(refreshPreview, 1600);
+            window.setTimeout(() => void loadSessions(), 500);
+          }}
         />
-      ))}
+      )}
 
       {settingsOpen && (
         <SettingsModal
           settings={settings}
+          preferences={preferences}
           onChange={setSettings}
+          onPreferencesChange={async (next) => {
+            setPreferences(next);
+            try {
+              setPreferences(await api.updatePreferences(next));
+            } catch {
+              setPreferences(preferences);
+            }
+          }}
           onClose={() => setSettingsOpen(false)}
-          onReset={() => setSettings(DEFAULT_SETTINGS)}
+          onReset={() => {
+            setSettings(DEFAULT_SETTINGS);
+            setPreferences(DEFAULT_PREFERENCES);
+            void api.updatePreferences(DEFAULT_PREFERENCES).then(setPreferences);
+          }}
         />
       )}
-
-      {transferOpen && <FileTransferPanel onClose={() => setTransferOpen(false)} />}
     </main>
   );
+}
+
+function isSessionNearViewport(sessionId: string): boolean {
+  const element = document.querySelector<HTMLElement>(`[data-session-id="${CSS.escape(sessionId)}"]`);
+  if (!element) {
+    return true;
+  }
+  const rect = element.getBoundingClientRect();
+  const margin = Math.max(window.innerHeight, 600);
+  return rect.bottom >= -margin && rect.top <= window.innerHeight + margin;
 }
 
 function TerminalListLoader() {
@@ -1514,14 +1375,30 @@ function TerminalListLoader() {
   );
 }
 
+function TerminalDockLoader() {
+  return (
+    <div className="terminal-dock terminal-dock-loader" aria-busy="true">
+      <div className="terminal-loader-mark" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </div>
+    </div>
+  );
+}
+
 function SettingsModal({
   settings,
+  preferences,
   onChange,
+  onPreferencesChange,
   onClose,
   onReset
 }: {
   settings: PanelSettings;
+  preferences: UserPreferences;
   onChange: (settings: PanelSettings) => void;
+  onPreferencesChange: (preferences: UserPreferences) => void;
   onClose: () => void;
   onReset: () => void;
 }) {
@@ -1539,16 +1416,6 @@ function SettingsModal({
           </button>
         </header>
         <div className="settings-form">
-          <label className="settings-form-wide">
-            <span>浏览器标签名称</span>
-            <input
-              type="text"
-              maxLength={80}
-              placeholder={DEFAULT_BROWSER_TITLE}
-              value={settings.browserTitle}
-              onChange={(event) => update("browserTitle", event.target.value.slice(0, 80))}
-            />
-          </label>
           <label>
             <span>Theme mode</span>
             <select value={settings.themeMode} onChange={(event) => update("themeMode", parseThemeMode(event.target.value))}>
@@ -1561,11 +1428,11 @@ function SettingsModal({
             <span>网格行高</span>
             <input
               type="number"
-              min="24"
-              max="180"
+              min="80"
+              max="220"
               step="4"
               value={settings.rowHeight}
-              onChange={(event) => update("rowHeight", clampNumber(event.target.value, DEFAULT_SETTINGS.rowHeight, 24, 180))}
+              onChange={(event) => update("rowHeight", clampNumber(event.target.value, DEFAULT_SETTINGS.rowHeight, 80, 220))}
             />
           </label>
           <label>
@@ -1573,10 +1440,10 @@ function SettingsModal({
             <input
               type="number"
               min="3"
-              max="32"
+              max="14"
               value={settings.defaultCardRows}
               onChange={(event) =>
-                update("defaultCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.defaultCardRows, 3, 32))
+                update("defaultCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.defaultCardRows, 3, 14))
               }
             />
           </label>
@@ -1585,10 +1452,10 @@ function SettingsModal({
             <input
               type="number"
               min="3"
-              max="32"
+              max="14"
               value={settings.minCardRows}
               onChange={(event) =>
-                update("minCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.minCardRows, 3, 32))
+                update("minCardRows", clampNumber(event.target.value, DEFAULT_SETTINGS.minCardRows, 3, 14))
               }
             />
           </label>
@@ -1677,6 +1544,13 @@ function SettingsModal({
               <option value="enter">Enter</option>
             </select>
           </label>
+          <div className="settings-background-field">
+            <span>Terminal 默认背景图</span>
+            <BackgroundImagePicker
+              value={preferences.terminalBackgroundImage}
+              onChange={(terminalBackgroundImage) => onPreferencesChange({ terminalBackgroundImage })}
+            />
+          </div>
         </div>
         <footer className="modal-actions">
           <button className="secondary-button" type="button" onClick={onReset}>

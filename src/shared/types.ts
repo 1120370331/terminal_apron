@@ -1,6 +1,7 @@
 export type AuthMethod = "none" | "password" | "ssh";
 export type TerminalBackend = "auto" | "native" | "tmux" | "zellij";
 export type ResolvedTerminalBackend = "native" | "tmux" | "zellij";
+export type TerminalBackgroundMode = "inherit" | "none" | "image";
 
 export interface AuthConfig {
   methods: AuthMethod[];
@@ -19,7 +20,6 @@ export interface GridItemLayout {
   h: number;
   minW?: number;
   minH?: number;
-  gridColumns?: number;
 }
 
 export interface SessionRuntime {
@@ -35,6 +35,19 @@ export interface SessionRuntime {
   zellijVersion?: string;
 }
 
+export type CodexSessionState = "stopped" | "ready" | "working" | "error";
+
+export interface CodexSessionStatus {
+  state: CodexSessionState;
+  label: string;
+  conversationId?: string;
+  conversationTitle?: string;
+  turnId?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  updatedAt?: string;
+}
+
 export interface TerminalSession {
   id: string;
   name: string;
@@ -45,13 +58,18 @@ export interface TerminalSession {
   backend: TerminalBackend;
   tmuxName: string;
   color: string;
+  backgroundMode: TerminalBackgroundMode;
+  backgroundImage?: string;
   archived: boolean;
   createdAt: string;
   updatedAt: string;
   archivedAt?: string;
   stoppedAt?: string;
+  codexConversationId?: string;
+  codexAutoResume?: boolean;
   layout?: GridItemLayout;
   runtime?: SessionRuntime;
+  codexStatus?: CodexSessionStatus;
 }
 
 export interface CreateSessionInput {
@@ -62,6 +80,8 @@ export interface CreateSessionInput {
   shell?: string;
   backend?: TerminalBackend;
   color?: string;
+  backgroundMode?: TerminalBackgroundMode;
+  backgroundImage?: string;
 }
 
 export interface UpdateSessionInput {
@@ -72,18 +92,21 @@ export interface UpdateSessionInput {
   shell?: string;
   backend?: TerminalBackend;
   color?: string;
+  backgroundMode?: TerminalBackgroundMode;
+  backgroundImage?: string;
+  codexConversationId?: string;
+  codexAutoResume?: boolean;
   archived?: boolean;
   layout?: GridItemLayout;
 }
 
-export type SessionInputMode = "paste" | "type";
+export interface UserPreferences {
+  terminalBackgroundImage: string | null;
+}
 
-export interface SessionInputRequest {
-  data: string;
-  enter?: boolean;
-  submitKey?: "enter";
-  mode?: SessionInputMode;
-  submitDelayMs?: number;
+export interface BackgroundUploadResult {
+  url: string;
+  name: string;
 }
 
 export interface SessionPreview {
@@ -92,53 +115,6 @@ export interface SessionPreview {
   grid?: TerminalPreviewGrid;
   signature?: string;
   capturedAt: string;
-  unchanged?: boolean;
-  debug?: SessionPreviewDebug;
-}
-
-export interface SessionPreviewDebug {
-  cache: "hit" | "miss" | "stale" | "refreshing";
-  ageMs?: number;
-  captureMs?: number;
-  renderMs?: number;
-  totalMs?: number;
-  payloadBytes?: number;
-}
-
-export interface SessionUploadFile {
-  originalName: string;
-  fileName: string;
-  mimeType: string;
-  size: number;
-  path: string;
-  terminalText: string;
-}
-
-export interface SessionUploadResponse {
-  files: SessionUploadFile[];
-  terminalText: string;
-}
-
-export interface FileTransferEntry {
-  name: string;
-  relativePath: string;
-  path: string;
-  terminalText: string;
-  size: number;
-  modifiedAt: string;
-  mimeType: string;
-}
-
-export interface FileTransferListResponse {
-  rootPath: string;
-  terminalText: string;
-  files: FileTransferEntry[];
-}
-
-export interface FileTransferUploadResponse {
-  rootPath: string;
-  terminalText: string;
-  files: FileTransferEntry[];
 }
 
 export interface TerminalPreviewGrid {
@@ -212,4 +188,27 @@ export interface SystemMetrics {
     processHeapUsedBytes: number;
     processHeapTotalBytes: number;
   };
+}
+
+export interface CodexConversationSummary {
+  id: string;
+  title: string;
+  summary: string;
+  cwd: string;
+  source: string;
+  model?: string;
+  tokensUsed: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CodexConversationList {
+  cwd: string;
+  conversations: CodexConversationSummary[];
+}
+
+export interface CodexResumeResult {
+  ok: boolean;
+  command: string;
+  conversation: CodexConversationSummary;
 }
