@@ -1,0 +1,4 @@
+interface:
+  display_name: "Terminal Apron Tasks"
+  short_description: "Read, report, and update TaskMonitor development work"
+  default_prompt: "Use $manage-terminal-apron-tasks to read the assigned task, report progress, and keep its status accurate."

@@ -4,6 +4,8 @@ data/
 .local-test-data/
 .local-test-server.pid
 tools/
+.search-index/
+.ui-render/
 file-transfer/*
 !file-transfer/.gitkeep
 .env
