@@ -208,7 +208,11 @@ export class SessionStore {
         ...("backgroundImage" in patch ? { backgroundImage: normalizeBackgroundImage(patch.backgroundImage) } : {}),
         ...("layout" in patch ? { layout: normalizeLayout(patch.layout, existing.layout) } : {}),
         ...("archived" in patch
-          ? { archived: Boolean(patch.archived), archivedAt: patch.archived ? now() : undefined }
+          ? {
+              archived: Boolean(patch.archived),
+              archivedAt: patch.archived ? now() : undefined,
+              stoppedAt: patch.archived ? existing.stoppedAt : undefined
+            }
           : {}),
         updatedAt: now()
       };

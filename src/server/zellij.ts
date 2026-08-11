@@ -577,7 +577,7 @@ async function listZellijSessions(): Promise<string[]> {
   return inFlight;
 }
 
-async function hasExitedZellijSession(sessionName: string): Promise<boolean> {
+export async function listExitedZellijSessions(): Promise<string[]> {
   const result = await runZellij(["list-sessions"], { timeoutMs: 5000 }).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     if (/no active zellij sessions|no active sessions|no sessions/i.test(message)) {
@@ -588,7 +588,14 @@ async function hasExitedZellijSession(sessionName: string): Promise<boolean> {
   return result.stdout
     .split(/\r?\n/)
     .map(stripAnsi)
-    .some((line) => line.trim().split(/\s+/)[0] === sessionName && /\(EXITED\b/i.test(line));
+    .map((line) => line.trim())
+    .filter((line) => /\(EXITED\b/i.test(line))
+    .map((line) => line.split(/\s+/)[0])
+    .filter(Boolean);
+}
+
+export async function hasExitedZellijSession(sessionName: string): Promise<boolean> {
+  return (await listExitedZellijSessions()).includes(sessionName);
 }
 
 function invalidateZellijSessionListCache(): void {

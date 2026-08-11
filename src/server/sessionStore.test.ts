@@ -54,3 +54,22 @@ test("drops malformed task metadata while loading legacy session data", async ()
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("restoring a stopped session clears its stopped marker", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-apron-session-store-"));
+  try {
+    const store = new SessionStore(directory);
+    await store.init();
+    const session = await store.create({ name: "stopped terminal", cwd: directory });
+    const stopped = await store.markStopped(session.id);
+
+    assert.equal(stopped?.archived, true);
+    assert.ok(stopped?.stoppedAt);
+
+    const restored = await store.update(session.id, { archived: false });
+    assert.equal(restored?.archived, false);
+    assert.equal(restored?.stoppedAt, undefined);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

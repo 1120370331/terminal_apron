@@ -31,7 +31,9 @@ import {
 import {
   captureZellijPreview,
   ensureZellijSession,
+  hasExitedZellijSession,
   killZellijSession,
+  listExitedZellijSessions,
   restartZellijSession,
   saveZellijSessionState,
   sendZellijInput,
@@ -735,8 +737,24 @@ function queueStoreSessionRestore(store: SessionStore) {
 async function restoreActiveSessions(store: SessionStore) {
   const sessions = (await store.all()).filter((session) => !session.archived);
   const preferences = await store.preferences();
+  const exitedZellijSessions = new Set(await listExitedZellijSessions().catch(() => []));
   for (const session of sessions) {
     try {
+      if (
+        (await resolveBackend(session)) === "zellij" &&
+        exitedZellijSessions.has(session.tmuxName)
+      ) {
+        const latest = await store.get(session.id);
+        if (
+          latest &&
+          !latest.archived &&
+          (await hasExitedZellijSession(latest.tmuxName))
+        ) {
+          await store.markStopped(latest.id);
+          console.log(`Archived stopped Zellij session ${latest.id} instead of resurrecting it`);
+        }
+        continue;
+      }
       await ensureSession(session, store.dataDir, preferences);
     } catch (error) {
       console.error(`Failed to restore session ${session.id}`, error);
