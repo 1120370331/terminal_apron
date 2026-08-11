@@ -28,6 +28,7 @@ import {
   Paperclip,
   Play,
   RotateCcw,
+  RotateCw,
   Send,
   Square,
   Tag,
@@ -35,6 +36,7 @@ import {
 } from "lucide-react";
 import type { SessionPreview, TerminalPreviewGrid, TerminalPreviewSegment, TerminalSession } from "../../shared/types";
 import { filesFromClipboardData, readClipboardFiles, readClipboardText, writeClipboardText } from "../clipboard";
+import { detectCodexStatus } from "../codexStatus";
 
 export type QuickInputPhase = "sending" | "sent" | "echoing" | "updated" | "error";
 
@@ -49,6 +51,7 @@ export interface QuickInputStatus {
 interface Props {
   session: TerminalSession;
   preview?: SessionPreview;
+  backgroundImage: string | null;
   quickInputStatus?: QuickInputStatus;
   previewFontSize: number;
   previewScale: number;
@@ -59,7 +62,9 @@ interface Props {
   onPasteFiles: (files: File[]) => Promise<string>;
   onArchive: () => void;
   onRestore: () => void;
+  onRestart: () => void;
   onKill: () => void;
+  restarting: boolean;
 }
 
 const ANSI_PATTERN = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)|\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -74,6 +79,7 @@ const MOBILE_QUERY = "(max-width: 720px)";
 function SessionCardComponent({
   session,
   preview,
+  backgroundImage,
   quickInputStatus,
   previewFontSize,
   previewScale,
@@ -84,7 +90,9 @@ function SessionCardComponent({
   onPasteFiles,
   onArchive,
   onRestore,
-  onKill
+  onRestart,
+  onKill,
+  restarting
 }: Props) {
   const runtime = session.runtime;
   const livePath = runtime?.currentPath || session.cwd;
@@ -124,8 +132,10 @@ function SessionCardComponent({
   const terminalFontSize = normalizedPreviewFontSize(previewFontSize);
   const terminalScale = normalizedPreviewScale(previewScale);
   const previewStyle = {
-    "--list-terminal-font-size": `${terminalFontSize * terminalScale}px`
+    "--list-terminal-font-size": `${terminalFontSize * terminalScale}px`,
+    "--terminal-background-image": backgroundImage ? `url("${backgroundImage}")` : "none"
   } as CSSProperties;
+  const codexStatus = detectCodexStatus(session, deferredPreview);
   const quickInputPhase = quickInputStatus?.phase;
   const inputControlsDisabled = sending || uploading || quickInputPhase === "sending";
   const quickStatusLabel = quickInputPhase ? quickInputStatusLabel(quickInputPhase) : sending ? "sending" : uploading ? "uploading" : "";
@@ -179,6 +189,7 @@ function SessionCardComponent({
       Math.round(availableWidth || 0),
       terminalFontSize,
       terminalScale,
+      backgroundImage ?? "",
       window.devicePixelRatio || 1
     ].join(":");
     if (canvasRenderRef.current?.canvas === canvasRef.current && canvasRenderRef.current.key === renderKey) {
@@ -192,7 +203,7 @@ function SessionCardComponent({
     if (previewElement && stickToBottomRef.current) {
       previewElement.scrollTop = previewElement.scrollHeight;
     }
-  }, [deferredPreview?.signature, grid, showCanvas, terminalFontSize, terminalScale]);
+  }, [backgroundImage, deferredPreview?.signature, grid, showCanvas, terminalFontSize, terminalScale]);
 
   useLayoutEffect(() => {
     if (!showCanvas) {
@@ -469,6 +480,23 @@ function SessionCardComponent({
     <article className={cardClassName}>
       <div className="session-accent" style={{ background: session.color }} />
       <header className="session-card-header">
+        <div
+          className={`codex-session-status ${codexStatus.state}`}
+          tabIndex={0}
+          aria-label={`${codexStatus.label}，会话 ${session.name}`}
+        >
+          <span className="codex-session-status-swatch" />
+          <span className="codex-session-status-copy">
+            <strong>{codexStatus.label}</strong>
+            <span>{session.name}</span>
+          </span>
+          <div className="codex-status-details">
+            <strong>{session.name}</strong>
+            <span>{codexStatus.label}</span>
+            <code>{runtime?.currentCommand || "Codex 未启动"}</code>
+            <span title={livePath}>{livePath}</span>
+          </div>
+        </div>
         <button className="drag-handle" type="button" title="拖拽排列">
           <Grip size={15} />
         </button>
@@ -625,6 +653,15 @@ function SessionCardComponent({
               <button className="icon-button small" type="button" onClick={onOpen} title="打开">
                 <ExternalLink size={16} />
               </button>
+              <button
+                className="icon-button small restart-button"
+                type="button"
+                onClick={onRestart}
+                disabled={restarting}
+                title="重启 terminal；若 Codex 正在运行，将自动 resume --yolo"
+              >
+                <RotateCw size={16} className={restarting ? "spin" : ""} />
+              </button>
               <button className="icon-button small" type="button" onClick={onEdit} title="编辑">
                 <Edit3 size={16} />
               </button>
@@ -656,6 +693,8 @@ function areSessionCardPropsEqual(previous: Props, next: Props): boolean {
   return (
     previous.previewFontSize === next.previewFontSize &&
     previous.previewScale === next.previewScale &&
+    previous.backgroundImage === next.backgroundImage &&
+    previous.restarting === next.restarting &&
     previewSignature(previous.preview) === previewSignature(next.preview) &&
     quickInputStatusSignature(previous.quickInputStatus) === quickInputStatusSignature(next.quickInputStatus) &&
     sessionCardSignature(previous.session) === sessionCardSignature(next.session)
@@ -745,6 +784,8 @@ function sessionCardSignature(session: TerminalSession): string {
     session.cwd,
     session.backend,
     session.color,
+    session.backgroundMode,
+    session.backgroundImage ?? "",
     String(session.archived),
     runtime?.backend ?? "",
     String(runtime?.exists ?? ""),
@@ -806,8 +847,7 @@ function drawPreviewCanvas(
 
   context.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
   context.imageSmoothingEnabled = false;
-  context.fillStyle = "#111614";
-  context.fillRect(0, 0, naturalWidth, naturalHeight);
+  context.clearRect(0, 0, naturalWidth, naturalHeight);
 
   for (let rowIndex = 0; rowIndex < grid.rows.length; rowIndex += 1) {
     const row = grid.rows[rowIndex];

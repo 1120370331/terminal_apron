@@ -5,17 +5,21 @@ import os from "node:os";
 import type {
   CreateSessionInput,
   GridItemLayout,
+  TerminalBackgroundMode,
   TerminalBackend,
   TerminalSession,
-  UpdateSessionInput
+  UpdateSessionInput,
+  UserPreferences
 } from "../shared/types.js";
 
 interface StoreShape {
   version: 1;
   sessions: TerminalSession[];
+  preferences?: UserPreferences;
 }
 
 const DEFAULT_COLORS = ["#2f80ed", "#00a676", "#f2994a", "#9b51e0", "#eb5757", "#00897b"];
+const DEFAULT_TERMINAL_PROXY_URL = "http://127.0.0.1:7890";
 
 function now(): string {
   return new Date().toISOString();
@@ -32,6 +36,24 @@ function normalizeTags(tags: string[] | undefined): string[] {
   );
 }
 
+function normalizeTaskId(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+function normalizeTaskKey(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim().toUpperCase();
+  return /^TA-[1-9][0-9]{0,8}$/.test(normalized) ? normalized : undefined;
+}
+
 function sanitizeName(value: string, fallback: string): string {
   const trimmed = value.trim();
   return trimmed.length ? trimmed.slice(0, 80) : fallback;
@@ -43,6 +65,38 @@ function tmuxNameFromId(id: string): string {
 
 function normalizeBackend(value: TerminalBackend | undefined): TerminalBackend {
   return "zellij";
+}
+
+function normalizeBackgroundMode(value: TerminalBackgroundMode | undefined): TerminalBackgroundMode {
+  return value === "none" || value === "image" ? value : "inherit";
+}
+
+function normalizeBackgroundImage(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed?.startsWith("/api/backgrounds/") ? trimmed : undefined;
+}
+
+function normalizeTerminalProxyUrl(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    return DEFAULT_TERMINAL_PROXY_URL;
+  }
+  try {
+    const parsed = new URL(value.trim());
+    if (!["http:", "https:", "socks:", "socks5:"].includes(parsed.protocol) || !parsed.hostname) {
+      return DEFAULT_TERMINAL_PROXY_URL;
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return DEFAULT_TERMINAL_PROXY_URL;
+  }
+}
+
+function defaultPreferences(): UserPreferences {
+  return {
+    terminalBackgroundImage: null,
+    terminalProxyEnabled: false,
+    terminalProxyUrl: DEFAULT_TERMINAL_PROXY_URL
+  };
 }
 
 export class SessionStore {
@@ -70,6 +124,30 @@ export class SessionStore {
     return (await this.read()).sessions.find((session) => session.id === id) ?? null;
   }
 
+  async preferences(): Promise<UserPreferences> {
+    return (await this.read()).preferences ?? defaultPreferences();
+  }
+
+  async updatePreferences(patch: Partial<UserPreferences>): Promise<UserPreferences> {
+    return this.mutate((db) => {
+      const current = db.preferences ?? defaultPreferences();
+      const preferences: UserPreferences = {
+        terminalBackgroundImage:
+          "terminalBackgroundImage" in patch
+            ? normalizeBackgroundImage(patch.terminalBackgroundImage ?? undefined) ?? null
+            : current.terminalBackgroundImage,
+        terminalProxyEnabled:
+          "terminalProxyEnabled" in patch ? Boolean(patch.terminalProxyEnabled) : current.terminalProxyEnabled,
+        terminalProxyUrl:
+          "terminalProxyUrl" in patch
+            ? normalizeTerminalProxyUrl(patch.terminalProxyUrl)
+            : current.terminalProxyUrl
+      };
+      db.preferences = preferences;
+      return preferences;
+    });
+  }
+
   async create(input: CreateSessionInput): Promise<TerminalSession> {
     return this.mutate(async (db) => {
       const id = randomUUID();
@@ -80,11 +158,15 @@ export class SessionStore {
         name: sanitizeName(input.name, `terminal-${index + 1}`),
         group: sanitizeName(input.group ?? "default", "default"),
         tags: normalizeTags(input.tags),
+        taskId: normalizeTaskId(input.taskId),
+        taskKey: normalizeTaskKey(input.taskKey),
         cwd: input.cwd?.trim() || os.homedir(),
         shell: input.shell?.trim() || undefined,
         backend: normalizeBackend(input.backend),
         tmuxName: tmuxNameFromId(id),
         color: input.color?.trim() || DEFAULT_COLORS[index % DEFAULT_COLORS.length],
+        backgroundMode: normalizeBackgroundMode(input.backgroundMode),
+        backgroundImage: normalizeBackgroundImage(input.backgroundImage),
         archived: false,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -116,10 +198,14 @@ export class SessionStore {
         ...("name" in patch ? { name: sanitizeName(patch.name ?? existing.name, existing.name) } : {}),
         ...("group" in patch ? { group: sanitizeName(patch.group ?? existing.group, "default") } : {}),
         ...("tags" in patch ? { tags: normalizeTags(patch.tags) } : {}),
+        ...("taskId" in patch ? { taskId: normalizeTaskId(patch.taskId) } : {}),
+        ...("taskKey" in patch ? { taskKey: normalizeTaskKey(patch.taskKey) } : {}),
         ...("cwd" in patch ? { cwd: patch.cwd?.trim() || existing.cwd } : {}),
         ...("shell" in patch ? { shell: patch.shell?.trim() || undefined } : {}),
         ...("backend" in patch ? { backend: normalizeBackend(patch.backend) } : {}),
         ...("color" in patch ? { color: patch.color?.trim() || existing.color } : {}),
+        ...("backgroundMode" in patch ? { backgroundMode: normalizeBackgroundMode(patch.backgroundMode) } : {}),
+        ...("backgroundImage" in patch ? { backgroundImage: normalizeBackgroundImage(patch.backgroundImage) } : {}),
         ...("layout" in patch ? { layout: normalizeLayout(patch.layout, existing.layout) } : {}),
         ...("archived" in patch
           ? { archived: Boolean(patch.archived), archivedAt: patch.archived ? now() : undefined }
@@ -147,6 +233,26 @@ export class SessionStore {
         updatedAt: now()
       };
       return db.sessions[index];
+    });
+  }
+
+  async updateCodexThread(id: string, threadId: string | null): Promise<TerminalSession | null> {
+    return this.mutate((db) => {
+      const index = db.sessions.findIndex((session) => session.id === id);
+      if (index === -1) {
+        return null;
+      }
+      const existing = db.sessions[index];
+      if ((existing.codexThreadId ?? null) === threadId) {
+        return existing;
+      }
+      const updated: TerminalSession = {
+        ...existing,
+        codexThreadId: threadId ?? undefined,
+        codexThreadUpdatedAt: now()
+      };
+      db.sessions[index] = updated;
+      return updated;
     });
   }
 
@@ -204,13 +310,33 @@ export class SessionStore {
 function normalizeStoreShape(parsed: StoreShape): StoreShape {
   return {
     version: 1,
+    preferences: {
+      terminalBackgroundImage: normalizeBackgroundImage(parsed.preferences?.terminalBackgroundImage ?? undefined) ?? null,
+      terminalProxyEnabled: Boolean(parsed.preferences?.terminalProxyEnabled),
+      terminalProxyUrl: normalizeTerminalProxyUrl(parsed.preferences?.terminalProxyUrl)
+    },
     sessions: Array.isArray(parsed.sessions)
       ? parsed.sessions.map((session) => ({
           ...session,
-          backend: normalizeBackend(session.backend)
+          backend: normalizeBackend(session.backend),
+          backgroundMode: normalizeBackgroundMode(session.backgroundMode),
+          backgroundImage: normalizeBackgroundImage(session.backgroundImage),
+          taskId: normalizeTaskId(session.taskId),
+          taskKey: normalizeTaskKey(session.taskKey),
+          codexThreadId: normalizeCodexThreadId(session.codexThreadId)
         }))
       : []
   };
+}
+
+function normalizeCodexThreadId(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)
+    ? normalized
+    : undefined;
 }
 
 function parseRecoverableStore(raw: string): StoreShape | null {

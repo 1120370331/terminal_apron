@@ -5,7 +5,21 @@ import Headless from "@xterm/headless";
 import type { Terminal as HeadlessTerminal } from "@xterm/headless";
 import type { SessionInputMode, SessionRuntime, TerminalSession } from "../shared/types.js";
 import { config } from "./config.js";
+import {
+  classifyCodexBootstrapFailure,
+  codexResumeCommand,
+  codexTerminalTitleMatchesThread,
+  codexThreadIdFromProcessCommand,
+  isCodexProcessCommand,
+  isCodexYoloProcessCommand,
+  resolveCodexThreadFromTerminalTitle
+} from "./codexSessions.js";
 import { loadPty } from "./pty.js";
+import {
+  DISABLED_TERMINAL_PROXY,
+  terminalProcessEnvironment,
+  type TerminalProxyConfig
+} from "./terminalProxy.js";
 
 interface RunOptions {
   cwd?: string;
@@ -21,6 +35,7 @@ interface ZellijPane {
   is_focused?: boolean;
   is_plugin?: boolean;
   exited?: boolean;
+  is_held?: boolean;
   pane_rows?: number;
   pane_content_rows?: number;
   pane_columns?: number;
@@ -33,6 +48,17 @@ interface ZellijPane {
   title?: string;
 }
 
+type ZellijSessionSpec = Pick<TerminalSession, "tmuxName" | "cwd" | "shell"> &
+  Partial<Pick<TerminalSession, "codexThreadId">>;
+
+export interface ZellijCodexProcessState {
+  running: boolean;
+  yolo: boolean;
+  threadId: string | null;
+  command: string;
+  title: string;
+}
+
 const ZELLIJ_SINGLE_PANE_LAYOUT = ["layout {", "    pane", "}"].join("\n");
 const VIEWPORT_PREVIEW_TTL_MS = 600;
 const VIEWPORT_PREVIEW_STALE_MS = 30_000;
@@ -42,6 +68,13 @@ const ZELLIJ_RUNTIME_CACHE_TTL_MS = 10_000;
 const ZELLIJ_PREVIEW_MIN_COLS = 120;
 const DEFAULT_PASTE_SUBMIT_DELAY_MS = 120;
 const MIN_ATTACH_HISTORY_LINES = 5_000;
+const ZELLIJ_SERIALIZATION_INTERVAL_SECONDS = 30;
+const ZELLIJ_BOOTSTRAP_TIMEOUT_MS = 8_000;
+const ZELLIJ_BOOTSTRAP_OBSERVE_MS = 4_000;
+const CODEX_LOCK_RETRY_DELAYS_MS = [2_000, 4_000, 8_000, 12_000];
+const CODEX_GRACEFUL_EXIT_TIMEOUT_MS = 2_500;
+const CODEX_INTERRUPT_EXIT_TIMEOUT_MS = 2_500;
+const CODEX_INTERRUPT_ATTEMPTS = 2;
 
 interface PreviewCacheEntry {
   value: string;
@@ -59,6 +92,8 @@ const viewportPreviewCache = new Map<string, PreviewCacheEntry>();
 const runtimeInfoCache = new Map<string, RuntimeCacheEntry>();
 let sessionListCache: { value: string[]; capturedAt: number; inFlight?: Promise<string[]> } | null = null;
 let zellijVersionCache: { value: string; capturedAt: number; inFlight?: Promise<string> } | null = null;
+// Codex instances share one local SQLite store, so resurrected sessions must not initialize in parallel.
+let zellijBootstrapQueue: Promise<void> = Promise.resolve();
 
 function runZellij(args: string[], options: RunOptions = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -122,7 +157,8 @@ export async function hasZellijSession(name: string): Promise<boolean> {
 }
 
 export async function ensureZellijSession(
-  session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">
+  session: ZellijSessionSpec,
+  proxy: TerminalProxyConfig = DISABLED_TERMINAL_PROXY
 ): Promise<void> {
   if (await hasZellijSession(session.tmuxName)) {
     await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
@@ -130,7 +166,13 @@ export async function ensureZellijSession(
     return;
   }
 
-  await bootstrapZellijSession(session);
+  await queueZellijBootstrap(async () => {
+    if (await hasZellijSession(session.tmuxName)) {
+      return;
+    }
+    await bootstrapZellijSession(session, await hasExitedZellijSession(session.tmuxName), proxy);
+    invalidateZellijSessionListCache();
+  });
   invalidateZellijSessionListCache();
   runtimeInfoCache.delete(session.tmuxName);
   await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
@@ -148,6 +190,76 @@ export async function killZellijSession(session: Pick<TerminalSession, "tmuxName
   await runZellij(["delete-session", session.tmuxName], { timeoutMs: 5000 }).catch(() => undefined);
   invalidateZellijSessionListCache();
   runtimeInfoCache.delete(session.tmuxName);
+}
+
+export async function restartZellijSession(
+  session: ZellijSessionSpec,
+  proxy: TerminalProxyConfig = DISABLED_TERMINAL_PROXY
+): Promise<void> {
+  await queueZellijBootstrap(async () => {
+    if (await hasZellijSession(session.tmuxName)) {
+      await saveZellijSessionState(session.tmuxName).catch(() => undefined);
+      await runZellij(["kill-session", session.tmuxName], { timeoutMs: 5000 });
+      invalidateZellijSessionListCache();
+    }
+    const resurrecting = await hasExitedZellijSession(session.tmuxName);
+    await bootstrapZellijSession(session, resurrecting, proxy);
+    invalidateZellijSessionListCache();
+  });
+  runtimeInfoCache.delete(session.tmuxName);
+  await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
+  await saveZellijSessionState(session.tmuxName).catch(() => undefined);
+}
+
+export async function zellijCodexProcessState(
+  session: Pick<TerminalSession, "tmuxName">
+): Promise<ZellijCodexProcessState> {
+  if (!(await hasZellijSession(session.tmuxName))) {
+    return { running: false, yolo: false, threadId: null, command: "", title: "" };
+  }
+  const pane = await activeTerminalPane(session.tmuxName).catch(() => null);
+  const command = formatCommand(pane?.terminal_command ?? pane?.pane_command ?? pane?.command);
+  const title = pane?.title ?? "";
+  const running = Boolean(pane && !pane.exited && isCodexProcessCommand(command));
+  return {
+    running,
+    yolo: running && isCodexYoloProcessCommand(command),
+    threadId: running
+      ? codexThreadIdFromProcessCommand(command) ??
+        (await resolveCodexThreadFromTerminalTitle(title).catch(() => null))
+      : null,
+    command,
+    title
+  };
+}
+
+export async function stopZellijCodexProcess(
+  session: Pick<TerminalSession, "tmuxName">
+): Promise<{ stopped: boolean; forced: boolean }> {
+  const initial = await zellijCodexProcessState(session);
+  if (!initial.running) {
+    return { stopped: true, forced: false };
+  }
+
+  const paneId = await activeTerminalPaneId(session.tmuxName);
+  const target = paneId ? ["--pane-id", paneId] : [];
+  await writeZellijChars(session.tmuxName, target, "/exit");
+  await delay(120);
+  await sendZellijEnter(session.tmuxName, target);
+  if (await waitForZellijCodexExit(session, CODEX_GRACEFUL_EXIT_TIMEOUT_MS)) {
+    return { stopped: true, forced: false };
+  }
+
+  for (let attempt = 0; attempt < CODEX_INTERRUPT_ATTEMPTS; attempt += 1) {
+    const currentPaneId = await activeTerminalPaneId(session.tmuxName);
+    const currentTarget = currentPaneId ? ["--pane-id", currentPaneId] : [];
+    await sendZellijInterrupt(session.tmuxName, currentTarget);
+    if (await waitForZellijCodexExit(session, CODEX_INTERRUPT_EXIT_TIMEOUT_MS)) {
+      return { stopped: true, forced: true };
+    }
+  }
+
+  return { stopped: false, forced: true };
 }
 
 export async function saveZellijSessionState(sessionName: string): Promise<void> {
@@ -303,9 +415,9 @@ export async function sendZellijInput(
   session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">,
   data: string,
   enter = false,
-  options: { mode?: SessionInputMode; submitDelayMs?: number } = {}
+  options: { mode?: SessionInputMode; submitDelayMs?: number; proxy?: TerminalProxyConfig } = {}
 ): Promise<void> {
-  await ensureZellijSession(session);
+  await ensureZellijSession(session, options.proxy);
   if (!(await hasZellijSession(session.tmuxName))) {
     throw new Error("zellij session is not running yet; open the terminal once before sending inline input");
   }
@@ -465,6 +577,20 @@ async function listZellijSessions(): Promise<string[]> {
   return inFlight;
 }
 
+async function hasExitedZellijSession(sessionName: string): Promise<boolean> {
+  const result = await runZellij(["list-sessions"], { timeoutMs: 5000 }).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/no active zellij sessions|no active sessions|no sessions/i.test(message)) {
+      return { stdout: "", stderr: "" };
+    }
+    throw error;
+  });
+  return result.stdout
+    .split(/\r?\n/)
+    .map(stripAnsi)
+    .some((line) => line.trim().split(/\s+/)[0] === sessionName && /\(EXITED\b/i.test(line));
+}
+
 function invalidateZellijSessionListCache(): void {
   sessionListCache = null;
 }
@@ -499,7 +625,34 @@ export async function normalizeZellijSessionUi(sessionName: string): Promise<voi
   }
 }
 
-async function bootstrapZellijSession(session: Pick<TerminalSession, "tmuxName" | "cwd" | "shell">): Promise<void> {
+async function bootstrapZellijSession(
+  session: ZellijSessionSpec,
+  resurrecting: boolean,
+  proxy: TerminalProxyConfig
+): Promise<void> {
+  try {
+    await launchZellijSession(session, resurrecting, proxy);
+  } catch (error) {
+    if (!isUnreadableZellijResurrection(error)) {
+      throw error;
+    }
+
+    const backupPath = await backupUnreadableZellijResurrection(session.tmuxName, error);
+    if (!backupPath) {
+      throw error;
+    }
+    console.warn(`Discarding unreadable Zellij resurrection state for ${session.tmuxName}; backup: ${backupPath}`);
+    await runZellij(["delete-session", session.tmuxName], { timeoutMs: 5000 });
+    invalidateZellijSessionListCache();
+    await launchZellijSession(session, false, proxy);
+  }
+}
+
+async function launchZellijSession(
+  session: ZellijSessionSpec,
+  observeCodexLock: boolean,
+  proxy: TerminalProxyConfig
+): Promise<void> {
   const pty = await loadPty();
   const cwd = resolveCwd(session.cwd);
   const term = pty.spawn(config.zellijBin, zellijAttachArgs(session), {
@@ -507,15 +660,49 @@ async function bootstrapZellijSession(session: Pick<TerminalSession, "tmuxName" 
     cols: 120,
     rows: 36,
     cwd,
-    env: {
-      ...process.env,
+    env: terminalProcessEnvironment(proxy, {
       TERM: "xterm-256color",
       COLORTERM: "truecolor"
-    }
+    })
+  });
+  let output = "";
+  let exitEvent: { exitCode: number; signal?: number } | null = null;
+  term.onData((data) => {
+    output = (output + data).slice(-100_000);
+  });
+  term.onExit((event) => {
+    exitEvent = event;
   });
 
   try {
-    await waitForZellijSession(session.tmuxName, 8000);
+    await waitForZellijSession(
+      session.tmuxName,
+      ZELLIJ_BOOTSTRAP_TIMEOUT_MS,
+      () => exitEvent,
+      () => output
+    );
+    if (observeCodexLock) {
+      await recoverCodexLocalDataLock(session.tmuxName, {
+        read: () => output,
+        clear: () => {
+          output = "";
+        }
+      });
+    }
+    if (session.codexThreadId) {
+      output = "";
+      const restored = await restoreTrackedCodexThread(session);
+      if (restored) {
+        await recoverCodexLocalDataLock(session.tmuxName, {
+          read: () => output,
+          clear: () => {
+            output = "";
+          }
+        }, async () => {
+          await restoreTrackedCodexThread(session, "openai", true);
+        });
+      }
+    }
     await saveZellijSessionState(session.tmuxName).catch(() => undefined);
     await runZellij(["--session", session.tmuxName, "action", "detach"], { timeoutMs: 5000 }).catch(() => undefined);
   } finally {
@@ -523,15 +710,244 @@ async function bootstrapZellijSession(session: Pick<TerminalSession, "tmuxName" 
   }
 }
 
-async function waitForZellijSession(sessionName: string, timeoutMs: number): Promise<void> {
+async function restoreTrackedCodexThread(
+  session: ZellijSessionSpec,
+  modelProvider?: string,
+  force = false
+): Promise<boolean> {
+  const threadId = session.codexThreadId;
+  if (!threadId) {
+    return false;
+  }
+  const command = codexResumeCommand(threadId, { modelProvider });
+  if (!command) {
+    return false;
+  }
+
+  const pane = await activeTerminalPane(session.tmuxName).catch(() => null);
+  const paneCommand = formatCommand(pane?.terminal_command ?? pane?.pane_command ?? pane?.command);
+  if (
+    !force &&
+    paneCommand.toLowerCase().includes(threadId.toLowerCase()) &&
+    isCodexYoloProcessCommand(paneCommand)
+  ) {
+    return false;
+  }
+
+  await runZellij(
+    [
+      "--session",
+      session.tmuxName,
+      "action",
+      "new-pane",
+      "--in-place",
+      "--close-replaced-pane",
+      "--cwd",
+      resolveCwd(session.cwd),
+      "--",
+      ...command
+    ],
+    { timeoutMs: 8000 }
+  );
+  await waitForTrackedCodexPane(session.tmuxName, threadId, 20_000);
+  return true;
+}
+
+async function waitForTrackedCodexPane(sessionName: string, threadId: string, timeoutMs: number): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const pane = await activeTerminalPane(sessionName).catch(() => null);
+    const command = formatCommand(pane?.terminal_command ?? pane?.pane_command ?? pane?.command);
+    if (
+      command.toLowerCase().includes(threadId.toLowerCase()) ||
+      codexTerminalTitleMatchesThread(pane?.title ?? "", threadId)
+    ) {
+      return;
+    }
+    await delay(200);
+  }
+  throw new Error(`Codex thread ${threadId} did not start in Zellij session ${sessionName}`);
+}
+
+function queueZellijBootstrap<T>(operation: () => Promise<T>): Promise<T> {
+  const queued = zellijBootstrapQueue.then(operation, operation);
+  zellijBootstrapQueue = queued.then(
+    () => undefined,
+    () => undefined
+  );
+  return queued;
+}
+
+export function recoverZellijCodexLocalDataLock(
+  sessionName: string,
+  output: { read: () => string; clear: () => void }
+): Promise<void> {
+  return queueZellijBootstrap(() => recoverCodexLocalDataLock(sessionName, output));
+}
+
+async function recoverCodexLocalDataLock(
+  sessionName: string,
+  output: { read: () => string; clear: () => void },
+  retryWithOpenAi?: () => Promise<void>
+): Promise<void> {
+  let usedProviderFallback = false;
+  for (let attempt = 0; attempt <= CODEX_LOCK_RETRY_DELAYS_MS.length; attempt += 1) {
+    const failure = await waitForCodexBootstrapFailure(output.read, ZELLIJ_BOOTSTRAP_OBSERVE_MS);
+    if (!failure) {
+      return;
+    }
+    if (failure === "model-provider-missing" && retryWithOpenAi && !usedProviderFallback) {
+      usedProviderFallback = true;
+      output.clear();
+      await delay(500);
+      await retryWithOpenAi();
+      continue;
+    }
+    if (failure !== "database-locked") {
+      console.error(`Codex failed while restoring Zellij session ${sessionName}: ${failure}`);
+      return;
+    }
+    if (attempt >= CODEX_LOCK_RETRY_DELAYS_MS.length) {
+      console.error(`Codex local data remained locked while resurrecting Zellij session ${sessionName}`);
+      return;
+    }
+
+    if (await codexProcessSurvivedLockReport(sessionName)) {
+      return;
+    }
+
+    const retryDelay = CODEX_LOCK_RETRY_DELAYS_MS[attempt];
+    console.warn(
+      `Codex local data was locked while resurrecting Zellij session ${sessionName}; retrying in ${retryDelay}ms`
+    );
+    const retryCommandOutput = output.read();
+    output.clear();
+    await delay(retryDelay);
+    await rerunFocusedZellijCommand(sessionName, retryCommandOutput);
+  }
+}
+
+async function waitForCodexBootstrapFailure(
+  output: () => string,
+  timeoutMs: number
+): Promise<Exclude<ReturnType<typeof classifyCodexBootstrapFailure>, null> | null> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const failure = classifyCodexBootstrapFailure(stripAnsi(output()));
+    if (failure) {
+      return failure;
+    }
+    await delay(200);
+  }
+  return classifyCodexBootstrapFailure(stripAnsi(output()));
+}
+
+async function codexProcessSurvivedLockReport(sessionName: string): Promise<boolean> {
+  for (let check = 0; check < 5; check += 1) {
+    await delay(250);
+    if (!(await activePaneRunsCodex(sessionName))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function activePaneRunsCodex(sessionName: string): Promise<boolean> {
+  const pane = await activeTerminalPane(sessionName).catch(() => null);
+  if (!pane || pane.exited) {
+    return false;
+  }
+  const command = formatCommand(pane?.terminal_command ?? pane?.pane_command ?? pane?.command);
+  return isCodexProcessCommand(command);
+}
+
+async function rerunFocusedZellijCommand(sessionName: string, bootstrapOutput: string): Promise<void> {
+  const pane = await activeTerminalPane(sessionName).catch(() => null);
+  const id = pane?.pane_id ?? pane?.id;
+  const paneId = typeof id === "number" ? `terminal_${id}` : null;
+  const target = paneId ? ["--pane-id", paneId] : [];
+  if (pane?.is_held || pane?.exited) {
+    await runZellij(["--session", sessionName, "action", "send-keys", ...target, "Enter"], {
+      timeoutMs: 5000
+    });
+    return;
+  }
+
+  const command = extractCodexResumeCommand(bootstrapOutput);
+  const paneCommand = formatCommand(pane?.terminal_command ?? pane?.pane_command ?? pane?.command);
+  if (command && isShellCommand(paneCommand)) {
+    await runZellij(["--session", sessionName, "action", "write-chars", ...target, "--", command], {
+      timeoutMs: 5000
+    });
+    await runZellij(["--session", sessionName, "action", "send-keys", ...target, "Enter"], {
+      timeoutMs: 5000
+    });
+    return;
+  }
+
+  await runZellij(["--session", sessionName, "action", "send-keys", ...target, "Up", "Enter"], {
+    timeoutMs: 5000
+  });
+}
+
+function extractCodexResumeCommand(value: string): string | null {
+  const message = stripAnsi(value).replace(/\s+/g, " ");
+  const matches = Array.from(
+    message.matchAll(/\bcodex(?:\.exe)?\s+(?:resume|fork)\s+[0-9a-f-]{32,36}(?:\s+--[a-z0-9-]+)*/gi)
+  );
+  return matches.at(-1)?.[0] ?? null;
+}
+
+function isShellCommand(command: string): boolean {
+  return /(?:^|[\\/])(?:cmd|powershell|pwsh|bash|zsh|fish)(?:\.exe)?(?:\s|$)/i.test(command);
+}
+
+async function waitForZellijSession(
+  sessionName: string,
+  timeoutMs: number,
+  exitEvent: () => { exitCode: number; signal?: number } | null,
+  output: () => string
+): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     if (await hasZellijSession(sessionName)) {
       return;
     }
+    const exited = exitEvent();
+    if (exited) {
+      const detail = stripAnsi(output()).trim();
+      throw new Error(
+        detail || `zellij client for ${sessionName} exited before the session was created (exit code ${exited.exitCode})`
+      );
+    }
     await delay(200);
   }
-  throw new Error(`zellij session ${sessionName} was not created`);
+  const detail = stripAnsi(output()).trim();
+  throw new Error(detail || `zellij session ${sessionName} was not created`);
+}
+
+function isUnreadableZellijResurrection(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /failed to parse resurrection layout|kdl(?:de)?serialization error|failed to parse zellij configuration/i.test(message);
+}
+
+async function backupUnreadableZellijResurrection(sessionName: string, error: unknown): Promise<string | null> {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/failed to parse resurrection layout file (.+?session-layout\.kdl):/i);
+  if (!match) {
+    return null;
+  }
+
+  const sourceDir = path.dirname(match[1].trim());
+  if (path.basename(sourceDir).toLowerCase() !== sessionName.toLowerCase() || !fs.existsSync(sourceDir)) {
+    return null;
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupDir = path.join(config.dataDir, "backups", "zellij-corrupt", `${sessionName}-${timestamp}`);
+  await fs.promises.mkdir(path.dirname(backupDir), { recursive: true });
+  await fs.promises.cp(sourceDir, backupDir, { recursive: true, errorOnExist: true, force: false });
+  return backupDir;
 }
 
 function delay(ms: number): Promise<void> {
@@ -579,12 +995,32 @@ async function sendZellijEnter(sessionName: string, target: string[]): Promise<v
   }).catch(() => runZellij(["--session", sessionName, "action", "write", ...target, "13"], { timeoutMs: 5000 }));
 }
 
+async function sendZellijInterrupt(sessionName: string, target: string[]): Promise<void> {
+  await runZellij(["--session", sessionName, "action", "send-keys", ...target, "Ctrl", "c"], {
+    timeoutMs: 5000
+  }).catch(() => runZellij(["--session", sessionName, "action", "write", ...target, "3"], { timeoutMs: 5000 }));
+}
+
+async function waitForZellijCodexExit(
+  session: Pick<TerminalSession, "tmuxName">,
+  timeoutMs: number
+): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (!(await zellijCodexProcessState(session)).running) {
+      return true;
+    }
+    await delay(200);
+  }
+  return !(await zellijCodexProcessState(session)).running;
+}
+
 function normalizeSubmitDelayMs(value: number | undefined, fallback: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
     return fallback;
   }
-  return Math.max(0, Math.min(1000, Math.floor(parsed)));
+  return Math.max(0, Math.min(12_000, Math.floor(parsed)));
 }
 
 function chunkString(value: string, chunkSize: number): string[] {
@@ -699,7 +1135,7 @@ function zellijOptions(session: Pick<TerminalSession, "cwd" | "shell">): string[
     "--session-serialization",
     "true",
     "--serialization-interval",
-    "1",
+    String(ZELLIJ_SERIALIZATION_INTERVAL_SECONDS),
     "--serialize-pane-viewport",
     "true",
     "--scrollback-lines-to-serialize",

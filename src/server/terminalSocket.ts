@@ -6,6 +6,7 @@ import { userFromCookie } from "./auth.js";
 import { resolveBackend } from "./backend.js";
 import type { NativeSessionManager } from "./nativeSessions.js";
 import { getTerminalBroker, type TerminalBrokerSubscribeOptions } from "./terminalBroker.js";
+import { terminalProxyConfig } from "./terminalProxy.js";
 import type {
   TerminalClientProfile,
   TerminalErrorFrame,
@@ -69,7 +70,14 @@ async function attachTerminal(
       return;
     }
 
-    const broker = getTerminalBroker(session, store.dataDir);
+    const broker = getTerminalBroker(
+      session,
+      store.dataDir,
+      terminalProxyConfig(await store.preferences()),
+      async (threadId) => {
+        await store.updateCodexThread(session.id, threadId);
+      }
+    );
     broker.subscribe(socket, parseSubscribeOptions(socket));
   } catch (error) {
     emitTerminalError(

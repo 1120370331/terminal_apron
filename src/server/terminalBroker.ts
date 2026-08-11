@@ -22,12 +22,24 @@ import {
   type TerminalVisibilityFrame
 } from "../shared/terminalProtocol.js";
 import { config } from "./config.js";
+import {
+  CodexTerminalTitleTracker,
+  parseCodexThreadIntent,
+  trackCodexThreadForTerminalPrompt,
+  type CodexThreadChangeHandler
+} from "./codexSessions.js";
 import { loadPty, type PtyProcess } from "./pty.js";
 import { emitTerminalData } from "./terminalData.js";
+import {
+  DISABLED_TERMINAL_PROXY,
+  terminalProcessEnvironment,
+  type TerminalProxyConfig
+} from "./terminalProxy.js";
 import {
   appendZellijTranscript,
   createZellijAttachOutputFilter,
   ensureZellijSession,
+  recoverZellijCodexLocalDataLock,
   saveZellijSessionState,
   zellijAttachArgs,
   zellijAttachCommand
@@ -115,15 +127,20 @@ class TerminalFrameRingBuffer {
 
 const brokers = new Map<string, TerminalBroker>();
 
-export function getTerminalBroker(session: TerminalSession, dataDir: string): TerminalBroker {
+export function getTerminalBroker(
+  session: TerminalSession,
+  dataDir: string,
+  proxy: TerminalProxyConfig = DISABLED_TERMINAL_PROXY,
+  onCodexThreadChange?: CodexThreadChangeHandler
+): TerminalBroker {
   const key = brokerKey(dataDir, session.id);
   const existing = brokers.get(key);
   if (existing) {
-    existing.updateSession(session);
+    existing.updateSession(session, proxy, onCodexThreadChange);
     return existing;
   }
 
-  const broker = new TerminalBroker(session, dataDir, () => {
+  const broker = new TerminalBroker(session, dataDir, proxy, onCodexThreadChange, () => {
     if (brokers.get(key) === broker) {
       brokers.delete(key);
     }
@@ -132,14 +149,32 @@ export function getTerminalBroker(session: TerminalSession, dataDir: string): Te
   return broker;
 }
 
+export async function closeTerminalBrokers(dataDir: string): Promise<void> {
+  const prefix = `${path.resolve(dataDir)}:`;
+  const matching = Array.from(brokers.entries())
+    .filter(([key]) => key.startsWith(prefix))
+    .map(([, broker]) => broker);
+  await Promise.allSettled(matching.map((broker) => broker.closeForRefresh()));
+}
+
+export async function closeTerminalBroker(dataDir: string, sessionId: string): Promise<void> {
+  const broker = brokers.get(brokerKey(dataDir, sessionId));
+  if (broker) {
+    await broker.closeForRefresh("terminal-restart");
+  }
+}
+
 export class TerminalBroker {
   readonly streamId = crypto.randomUUID();
   private session: TerminalSession;
   private readonly dataDir: string;
+  private proxy: TerminalProxyConfig;
   private readonly onDestroy: () => void;
   private readonly subscribers = new Map<string, TerminalSubscriber>();
   private readonly ringBuffer = new TerminalFrameRingBuffer();
   private readonly outputFilter = createZellijAttachOutputFilter();
+  private readonly codexTitleTracker: CodexTerminalTitleTracker;
+  private onCodexThreadChange?: CodexThreadChangeHandler;
   private state: TerminalStateFrame["state"] = "detached";
   private term: PtyProcess | null = null;
   private startPromise: Promise<void> | null = null;
@@ -147,6 +182,9 @@ export class TerminalBroker {
   private saveTimer: NodeJS.Timeout | null = null;
   private transcriptQueue = Promise.resolve();
   private inputQueue = Promise.resolve();
+  private terminalInputBuffer = "";
+  private bracketedPaste = false;
+  private promptTrackingGeneration = 0;
   private currentCols = ZELLIJ_WEB_COLS;
   private currentRows = ZELLIJ_WEB_ROWS;
   private resizeOwnerId: string | null = null;
@@ -154,14 +192,29 @@ export class TerminalBroker {
   private lastSaveAt = 0;
   private closed = false;
 
-  constructor(session: TerminalSession, dataDir: string, onDestroy: () => void) {
+  constructor(
+    session: TerminalSession,
+    dataDir: string,
+    proxy: TerminalProxyConfig,
+    onCodexThreadChange: CodexThreadChangeHandler | undefined,
+    onDestroy: () => void
+  ) {
     this.session = session;
     this.dataDir = dataDir;
+    this.proxy = proxy;
+    this.onCodexThreadChange = onCodexThreadChange;
     this.onDestroy = onDestroy;
+    this.codexTitleTracker = new CodexTerminalTitleTracker((threadId) => this.handleCodexThreadChange(threadId));
   }
 
-  updateSession(session: TerminalSession): void {
+  updateSession(
+    session: TerminalSession,
+    proxy: TerminalProxyConfig,
+    onCodexThreadChange?: CodexThreadChangeHandler
+  ): void {
     this.session = session;
+    this.proxy = proxy;
+    this.onCodexThreadChange = onCodexThreadChange;
   }
 
   subscribe(socket: Socket, options: TerminalBrokerSubscribeOptions): void {
@@ -281,22 +334,28 @@ export class TerminalBroker {
 
   private async start(): Promise<void> {
     this.setState("starting");
-    await ensureZellijSession(this.session);
+    await ensureZellijSession(this.session, this.proxy);
     const pty = await loadPty();
     const term = pty.spawn(config.zellijBin, zellijAttachArgs(this.session), {
       name: "xterm-256color",
       cols: this.currentCols,
       rows: this.currentRows,
       cwd: this.session.cwd,
-      env: {
-        ...process.env,
+      env: terminalProcessEnvironment(this.proxy, {
         TERM: "xterm-256color",
         COLORTERM: "truecolor"
-      }
+      })
     });
 
     this.term = term;
-    term.onData((data) => this.handlePtyData(data));
+    let startupOutput = "";
+    let captureStartupOutput = true;
+    term.onData((data) => {
+      if (captureStartupOutput) {
+        startupOutput = (startupOutput + data).slice(-100_000);
+      }
+      this.handlePtyData(data);
+    });
     term.onExit((event) => {
       this.closed = true;
       this.term = null;
@@ -313,12 +372,27 @@ export class TerminalBroker {
     this.setState("live");
     this.broadcastReady();
     this.broadcastResizeAck(0);
+    void recoverZellijCodexLocalDataLock(this.session.tmuxName, {
+      read: () => startupOutput,
+      clear: () => {
+        startupOutput = "";
+      }
+    }).catch((error) => {
+      console.error(
+        `Failed to recover Codex local data lock in Zellij session ${this.session.tmuxName}`,
+        error
+      );
+    }).finally(() => {
+      captureStartupOutput = false;
+      startupOutput = "";
+    });
   }
 
   private handlePtyData(data: string): void {
     if (this.closed) {
       return;
     }
+    this.codexTitleTracker.push(data);
     const filtered = this.outputFilter(data);
     if (!filtered) {
       return;
@@ -490,6 +564,7 @@ export class TerminalBroker {
         throw new Error("zellij attach is not ready");
       }
       const inputSeq = this.lastSeq;
+      this.trackTerminalInput(input.data);
       this.term.write(input.data);
       this.scheduleSave();
       this.emitInputAck(subscriber, {
@@ -720,6 +795,83 @@ export class TerminalBroker {
     }
   }
 
+  private async handleCodexThreadChange(threadId: string | null): Promise<void> {
+    if ((this.session.codexThreadId ?? null) === threadId) {
+      return;
+    }
+    this.session = {
+      ...this.session,
+      codexThreadId: threadId ?? undefined,
+      codexThreadUpdatedAt: new Date().toISOString()
+    };
+    this.promptTrackingGeneration += 1;
+    await this.onCodexThreadChange?.(threadId);
+    this.scheduleSave();
+  }
+
+  private trackTerminalInput(data: string): void {
+    for (let index = 0; index < data.length; index += 1) {
+      if (data.startsWith("\x1b[200~", index)) {
+        this.bracketedPaste = true;
+        index += 5;
+        continue;
+      }
+      if (data.startsWith("\x1b[201~", index)) {
+        this.bracketedPaste = false;
+        index += 5;
+        continue;
+      }
+
+      const char = data[index];
+      if (char === "\x1b") {
+        const sequence = /^\x1b\[[0-9;?]*[A-Za-z~]/.exec(data.slice(index))?.[0];
+        if (sequence) {
+          index += sequence.length - 1;
+        }
+        continue;
+      }
+      if (char === "\x03" || char === "\x15") {
+        this.terminalInputBuffer = "";
+        continue;
+      }
+      if (char === "\x17") {
+        this.terminalInputBuffer = this.terminalInputBuffer.replace(/\S+\s*$/, "");
+        continue;
+      }
+      if (char === "\x08" || char === "\x7f") {
+        this.terminalInputBuffer = Array.from(this.terminalInputBuffer).slice(0, -1).join("");
+        continue;
+      }
+      if (char === "\r" || char === "\n") {
+        if (this.bracketedPaste) {
+          if (char === "\n" && data[index - 1] === "\r") {
+            continue;
+          }
+          this.terminalInputBuffer += "\n";
+          continue;
+        }
+        const prompt = this.terminalInputBuffer;
+        this.terminalInputBuffer = "";
+        if (prompt) {
+          const submittedAt = Date.now();
+          if (parseCodexThreadIntent(prompt, this.session.codexThreadId)) {
+            this.promptTrackingGeneration += 1;
+          }
+          const generation = this.promptTrackingGeneration;
+          trackCodexThreadForTerminalPrompt(this.session, prompt, submittedAt, (threadId) => {
+            if (generation === this.promptTrackingGeneration) {
+              return this.handleCodexThreadChange(threadId);
+            }
+          });
+        }
+        continue;
+      }
+      if (char >= " " && char !== "\x7f") {
+        this.terminalInputBuffer += char;
+      }
+    }
+  }
+
   private saveNow(): Promise<void> {
     this.lastSaveAt = Date.now();
     return saveZellijSessionState(this.session.tmuxName).catch(() => undefined);
@@ -781,7 +933,18 @@ export class TerminalBroker {
       }
     }
     this.setState("detached");
+    this.codexTitleTracker.dispose();
     this.onDestroy();
+  }
+
+  async closeForRefresh(reason = "proxy-refresh"): Promise<void> {
+    for (const subscriber of Array.from(this.subscribers.values())) {
+      subscriber.closed = true;
+      subscriber.socket.emit("terminal:exit", { reason });
+      subscriber.socket.disconnect(true);
+    }
+    this.subscribers.clear();
+    await this.stop();
   }
 }
 

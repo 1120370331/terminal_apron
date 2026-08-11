@@ -51,6 +51,7 @@ const authorizedKeysFile = expandHome(
   process.env.TWM_AUTHORIZED_KEYS_FILE ?? path.join("~", ".ssh", "authorized_keys")
 );
 const zellijBin = resolveBinaryPath(process.env.TWM_ZELLIJ_BIN ?? "zellij");
+const codexBin = resolveBinaryPath(process.env.TWM_CODEX_BIN ?? "codex");
 const adminUser = sanitizeUserName(process.env.TWM_ADMIN_USER ?? "admin", "admin");
 const configuredUsers = buildConfiguredUsers(dataDir, adminUser, authorizedKeysFile);
 
@@ -79,6 +80,7 @@ export const config = {
   dataDir,
   tmuxBin: process.env.TWM_TMUX_BIN ?? "tmux",
   zellijBin,
+  codexBin,
   sessionBackend: parseBackend(process.env.TWM_SESSION_BACKEND),
   adminUser,
   adminPassword: process.env.TWM_ADMIN_PASSWORD ?? "",

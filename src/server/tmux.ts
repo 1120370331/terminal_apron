@@ -99,7 +99,7 @@ export async function sendTmuxInput(
 }
 
 function delay(ms: number): Promise<void> {
-  const duration = Math.max(0, Math.min(1000, Math.floor(ms)));
+  const duration = Math.max(0, Math.min(12_000, Math.floor(ms)));
   if (duration === 0) {
     return Promise.resolve();
   }

@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { io, type Socket } from "socket.io-client";
-import { ArrowDownToLine, Check, Clipboard, ClipboardPaste, History, RefreshCw, X } from "lucide-react";
+import { ArrowDownToLine, Check, Clipboard, ClipboardPaste, History, RefreshCw, RotateCw, X } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
 import { api } from "../api";
 import { filesFromClipboardData, readClipboardFiles, readClipboardText, writeClipboardText } from "../clipboard";
@@ -24,8 +24,11 @@ import {
 
 interface Props {
   session: TerminalSession;
+  backgroundImage: string | null;
   visible: boolean;
   onClose: () => void;
+  onRestart: () => void;
+  restarting: boolean;
 }
 
 const MOBILE_QUERY = "(max-width: 720px)";
@@ -38,6 +41,8 @@ const TERMINAL_HISTORY_RETAINED_LINES = 100_000;
 const TERMINAL_HISTORY_ROW_HEIGHT = 18;
 const TERMINAL_HISTORY_OVERSCAN_ROWS = 18;
 const TERMINAL_HISTORY_INITIAL_RENDER_ROWS = 120;
+const TERMINAL_OPAQUE_BACKGROUND = "#111614";
+const TERMINAL_IMAGE_BACKGROUND = "rgba(17, 22, 20, 0.68)";
 
 type LatestHistoryStatus = "waiting" | "loading" | "ready" | "error";
 type OlderHistoryStatus = "idle" | "loading" | "ready" | "exhausted" | "error";
@@ -79,7 +84,11 @@ interface TerminalHistoryVirtualRange {
 
 type TerminalHistoryScrollTarget = { type: "bottom" } | { type: "offset"; top: number };
 
-export function TerminalDock({ session, visible, onClose }: Props) {
+function terminalBackgroundColor(hasBackgroundImage: boolean): string {
+  return hasBackgroundImage ? TERMINAL_IMAGE_BACKGROUND : TERMINAL_OPAQUE_BACKGROUND;
+}
+
+export function TerminalDock({ session, backgroundImage, visible, onClose, onRestart, restarting }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const historyScrollRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -140,6 +149,10 @@ export function TerminalDock({ session, visible, onClose }: Props) {
   const isMobileClient = typeof window !== "undefined" && window.matchMedia(MOBILE_QUERY).matches;
   const usesStableZellijWidth =
     !isMobileClient && (backend === "zellij" || session.backend === "zellij" || session.backend === "auto");
+  const hasBackgroundImage = Boolean(backgroundImage);
+  const backgroundStyle = {
+    "--terminal-background-image": backgroundImage ? `url("${backgroundImage}")` : "none"
+  } as CSSProperties;
 
   const updateWriteQueueBytes = useCallback((delta: number) => {
     writeQueueBytesRef.current = Math.max(0, writeQueueBytesRef.current + delta);
@@ -689,6 +702,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
 
     const terminal = new Terminal({
       cursorBlink: true,
+      allowTransparency: true,
       allowProposedApi: true,
       rescaleOverlappingGlyphs: true,
       windowsMode: true,
@@ -697,7 +711,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
       fontSize: isMobileClient ? 13 : 14,
       lineHeight: isMobileClient ? 1.18 : 1.2,
       theme: {
-        background: "#111614",
+        background: TERMINAL_OPAQUE_BACKGROUND,
         foreground: "#eef2ed",
         cursor: "#f2c94c",
         selectionBackground: "#2f80ed66"
@@ -1051,6 +1065,18 @@ export function TerminalDock({ session, visible, onClose }: Props) {
     usesStableZellijWidth
   ]);
 
+  useEffect(() => {
+    const terminal = termRef.current;
+    if (!terminal) {
+      return;
+    }
+    terminal.options.theme = {
+      ...(terminal.options.theme ?? {}),
+      background: terminalBackgroundColor(hasBackgroundImage)
+    };
+    terminal.refresh(0, Math.max(0, terminal.rows - 1));
+  }, [hasBackgroundImage]);
+
   const historyRangeStart =
     historyVirtualRange.end > historyVirtualRange.start
       ? Math.min(historyVirtualRange.start, historyLineCount)
@@ -1160,6 +1186,15 @@ export function TerminalDock({ session, visible, onClose }: Props) {
             <RefreshCw size={17} />
           </button>
           <button
+            className="icon-button restart-button"
+            type="button"
+            title="重启 terminal；若 Codex 正在运行，将自动 resume --yolo"
+            disabled={restarting}
+            onClick={onRestart}
+          >
+            <RotateCw size={17} className={restarting ? "spin" : ""} />
+          </button>
+          <button
             className="icon-button"
             type="button"
             title="关闭"
@@ -1175,7 +1210,7 @@ export function TerminalDock({ session, visible, onClose }: Props) {
         </div>
       </header>
       <div className="terminal-body">
-        <div className="terminal-host" ref={hostRef} />
+        <div className="terminal-host" ref={hostRef} style={backgroundStyle} />
         {historyLayerOpen && (
           <section className="terminal-history-layer" aria-label="Older terminal history">
             <header className="terminal-history-layer-header">

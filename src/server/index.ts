@@ -32,14 +32,25 @@ import {
   captureZellijPreview,
   ensureZellijSession,
   killZellijSession,
+  restartZellijSession,
   saveZellijSessionState,
   sendZellijInput,
+  stopZellijCodexProcess,
+  zellijCodexProcessState,
   zellijHealth,
   zellijPreviewSize,
   zellijRuntimeInfo,
   zellijRuntimeSnapshot
 } from "./zellij.js";
 import { registerTerminalSockets } from "./terminalSocket.js";
+import { createTaskRouter } from "./tasks/taskRouter.js";
+import { TaskStore } from "./tasks/taskStore.js";
+import { browseFilesystemDirectory } from "./filesystem.js";
+import {
+  trackCodexThreadForTerminalPrompt
+} from "./codexSessions.js";
+import { closeTerminalBroker, closeTerminalBrokers } from "./terminalBroker.js";
+import { sameTerminalProxy, terminalProxyConfig } from "./terminalProxy.js";
 import { nodePtyHealth } from "./pty.js";
 import { backendHealth, resolveBackend } from "./backend.js";
 import { NativeSessionManager } from "./nativeSessions.js";
@@ -57,8 +68,11 @@ import type {
   SessionUploadResponse,
   SystemMetrics,
   TerminalPreviewGrid,
+  TerminalBatchRestartResult,
+  TerminalRestartResult,
   TerminalSession,
-  UpdateSessionInput
+  UpdateSessionInput,
+  UserPreferences
 } from "../shared/types.js";
 
 const app = express();
@@ -70,6 +84,7 @@ const io = new SocketServer(server, {
   }
 });
 const stores = new Map<string, Promise<SessionStore>>();
+const taskStores = new Map<string, TaskStore>();
 const restoreQueuedStores = new Set<string>();
 const nativeSessions = new NativeSessionManager();
 const DEFAULT_PREVIEW_MAX_CHARS = 120_000;
@@ -86,6 +101,7 @@ let acceptedInputSeq = 0;
 let activePreviewJobs = 0;
 const previewJobQueue: Array<() => void> = [];
 const sessionPreviewCache = new Map<string, PreviewCacheEntry>();
+const sessionRestartJobs = new Map<string, Promise<TerminalRestartResult>>();
 const uploadSessionFiles = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -115,6 +131,16 @@ async function storeForUser(user: AuthUser): Promise<SessionStore> {
     stores.set(userDataDir, storePromise);
   }
   return storePromise;
+}
+
+async function taskStoreForUser(user: AuthUser): Promise<TaskStore> {
+  const userDataDir = path.resolve(dataDirForUser(user.name));
+  let store = taskStores.get(userDataDir);
+  if (!store) {
+    store = new TaskStore(userDataDir);
+    taskStores.set(userDataDir, store);
+  }
+  return store;
 }
 
 app.get("/api/auth/config", (_req, res) => {
@@ -193,9 +219,71 @@ app.get("/api/health", async (_req, res) => {
 });
 
 app.use("/api", requireAuth);
+app.use("/api/tasks", createTaskRouter(taskStoreForUser));
+
+app.get("/api/filesystem/directories", async (req, res) => {
+  const requestedPath = typeof req.query.path === "string" ? req.query.path : undefined;
+  try {
+    res.json(await browseFilesystemDirectory(requestedPath));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
 
 app.get("/api/system/metrics", (_req, res) => {
   res.json(readSystemMetrics());
+});
+
+app.get("/api/preferences", async (_req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  res.json(await store.preferences());
+});
+
+app.patch("/api/preferences", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  const patch = req.body as Partial<UserPreferences>;
+  const previous = await store.preferences();
+  const updated = await store.updatePreferences(patch);
+  const proxyTouched = "terminalProxyEnabled" in patch || "terminalProxyUrl" in patch;
+  if (proxyTouched && !sameTerminalProxy(previous, updated)) {
+    await refreshSessionsForProxy(store, updated);
+  }
+  res.json(updated);
+});
+
+app.post(
+  "/api/backgrounds",
+  express.raw({ type: ["image/png", "image/jpeg", "image/webp", "image/gif", "image/avif"], limit: "12mb" }),
+  async (req, res) => {
+    const buffer = Buffer.isBuffer(req.body) ? req.body : null;
+    const extension = backgroundImageExtension(req.headers["content-type"]);
+    if (!buffer?.length || !extension) {
+      res.status(400).json({ error: "请选择 PNG、JPEG、WebP、GIF 或 AVIF 图片" });
+      return;
+    }
+    const store = await storeForUser(res.locals.user as AuthUser);
+    const name = `${crypto.randomUUID()}.${extension}`;
+    const directory = path.join(store.dataDir, "backgrounds");
+    await fs.promises.mkdir(directory, { recursive: true });
+    await fs.promises.writeFile(path.join(directory, name), buffer, { flag: "wx" });
+    res.status(201).json({ url: `/api/backgrounds/${name}`, name });
+  }
+);
+
+app.get("/api/backgrounds/:name", async (req, res) => {
+  const name = req.params.name;
+  if (!/^[a-f0-9-]+\.(?:png|jpg|webp|gif|avif)$/.test(name)) {
+    res.status(404).json({ error: "background not found" });
+    return;
+  }
+  const store = await storeForUser(res.locals.user as AuthUser);
+  const filePath = path.join(store.dataDir, "backgrounds", name);
+  if (!fs.existsSync(filePath)) {
+    res.status(404).json({ error: "background not found" });
+    return;
+  }
+  res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+  res.sendFile(filePath);
 });
 
 app.get("/api/file-transfer/files", async (_req, res) => {
@@ -266,7 +354,7 @@ app.get("/api/sessions", async (req, res) => {
 app.post("/api/sessions", async (req, res) => {
   const store = await storeForUser(res.locals.user as AuthUser);
   const session = await store.create(req.body as CreateSessionInput);
-  void ensureSession(session, store.dataDir).catch((error) => {
+  void ensureSession(session, store.dataDir, await store.preferences()).catch((error) => {
     console.error(`Failed to start session ${session.id}`, error);
   });
   res.status(201).json({
@@ -291,7 +379,9 @@ app.post("/api/sessions/:id/duplicate", async (req, res) => {
     cwd: source.cwd,
     shell: source.shell,
     backend: source.backend,
-    color: source.color
+    color: source.color,
+    backgroundMode: source.backgroundMode,
+    backgroundImage: source.backgroundImage
   });
 
   const updated =
@@ -331,11 +421,58 @@ app.post("/api/sessions/:id/ensure", async (req, res) => {
     res.status(404).json({ error: "session not found" });
     return;
   }
-  await ensureSession(session, store.dataDir);
+  await ensureSession(session, store.dataDir, await store.preferences());
   res.json({
     ...session,
     runtime: await getRuntime(session, store.dataDir)
   });
+});
+
+app.post("/api/sessions/restart-all", async (_req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  const sessions = (await store.all()).filter((session) => !session.archived);
+  const preferences = await store.preferences();
+  const results: TerminalRestartResult[] = [];
+  for (const session of sessions) {
+    try {
+      results.push(await restartManagedSession(store, session, preferences));
+    } catch (error) {
+      results.push({
+        sessionId: session.id,
+        sessionName: session.name,
+        restarted: false,
+        codexWasRunning: false,
+        codexResumed: false,
+        error: errorMessage(error)
+      });
+    }
+  }
+  const result: TerminalBatchRestartResult = {
+    total: results.length,
+    succeeded: results.filter((item) => item.restarted).length,
+    failed: results.filter((item) => !item.restarted).length,
+    codexResumed: results.filter((item) => item.codexResumed).length,
+    results
+  };
+  res.json(result);
+});
+
+app.post("/api/sessions/:id/restart", async (req, res) => {
+  const store = await storeForUser(res.locals.user as AuthUser);
+  const session = await store.get(req.params.id);
+  if (!session) {
+    res.status(404).json({ error: "session not found" });
+    return;
+  }
+  if (session.archived) {
+    res.status(409).json({ error: "archived terminal cannot be restarted" });
+    return;
+  }
+  try {
+    res.json(await restartManagedSession(store, session, await store.preferences()));
+  } catch (error) {
+    res.status(502).json({ error: errorMessage(error) });
+  }
 });
 
 app.post("/api/sessions/:id/input", async (req, res) => {
@@ -366,13 +503,19 @@ app.post("/api/sessions/:id/input", async (req, res) => {
   const inputMode = normalizeInputMode(mode);
   const inputSeq = (acceptedInputSeq += 1);
   try {
+    if (enter !== false) {
+      trackCodexThreadForTerminalPrompt(session, data, Date.now(), async (threadId) => {
+        await store.updateCodexThread(session.id, threadId);
+      });
+    }
     await sendSessionInput(
       session,
       data,
       enter !== false,
       store.dataDir,
       inputMode,
-      parseSubmitDelayMs(submitDelayMs, inputMode === "paste" ? 120 : 0)
+      parseSubmitDelayMs(submitDelayMs, inputMode === "paste" ? 120 : 0),
+      await store.preferences()
     );
     invalidateSessionPreviewCache(session, store.dataDir);
   } catch (error) {
@@ -446,7 +589,7 @@ app.post("/api/sessions/:id/restore", async (req, res) => {
     res.status(404).json({ error: "session not found" });
     return;
   }
-  await ensureSession(updated, store.dataDir);
+  await ensureSession(updated, store.dataDir, await store.preferences());
   res.json({
     ...updated,
     runtime: await getRuntime(updated, store.dataDir)
@@ -499,6 +642,28 @@ const clientDir =
   [path.resolve(dirname, "../../client"), path.resolve(dirname, "../client")].find((candidate) =>
     fs.existsSync(path.join(candidate, "index.html"))
   ) ?? path.resolve(dirname, "../client");
+const taskMonitorClientDir = [
+  path.resolve(dirname, "../../task-monitor-client"),
+  path.resolve(dirname, "../task-monitor-client")
+].find((candidate) => fs.existsSync(path.join(candidate, "task-monitor.html")));
+
+app.use(
+  "/task-monitor",
+  taskMonitorClientDir
+    ? express.static(taskMonitorClientDir, { index: false })
+    : (_req, _res, next) => next()
+);
+app.use("/task-monitor", (req, res, next) => {
+  if (req.method !== "GET") {
+    next();
+    return;
+  }
+  if (!taskMonitorClientDir) {
+    res.status(503).json({ error: "TaskMonitor client is not built" });
+    return;
+  }
+  res.sendFile(path.join(taskMonitorClientDir, "task-monitor.html"));
+});
 app.use(express.static(clientDir));
 app.use((req, res, next) => {
   if (req.method !== "GET" || req.path.startsWith("/api") || req.path.startsWith("/socket.io")) {
@@ -508,7 +673,10 @@ app.use((req, res, next) => {
   res.sendFile(path.join(clientDir, "index.html"));
 });
 
-await storeForUser({ name: config.adminUser, method: "password" });
+const startupUsers = new Set([config.adminUser, ...config.users.map((user) => user.name)]);
+await Promise.all(
+  Array.from(startupUsers, (name) => storeForUser({ name, method: "password" }))
+);
 server.listen(config.port, config.host, () => {
   console.log(`terminal-web-monitor listening on http://${config.host}:${config.port}`);
   console.log(`data dir: ${config.dataDir}`);
@@ -525,7 +693,12 @@ async function shutdown(signal: string) {
   await saveKnownZellijSessions().catch((error) => {
     console.error("Failed to save zellij sessions during shutdown", error);
   });
-  server.close(() => process.exit(0));
+  server.close(() => {
+    for (const store of taskStores.values()) {
+      store.close();
+    }
+    process.exit(0);
+  });
   setTimeout(() => process.exit(0), 5000).unref();
 }
 
@@ -561,22 +734,126 @@ function queueStoreSessionRestore(store: SessionStore) {
 
 async function restoreActiveSessions(store: SessionStore) {
   const sessions = (await store.all()).filter((session) => !session.archived);
-  const results = await Promise.allSettled(sessions.map((session) => ensureSession(session, store.dataDir)));
-  results.forEach((result, index) => {
-    if (result.status === "rejected") {
-      console.error(`Failed to restore session ${sessions[index]?.id}`, result.reason);
+  const preferences = await store.preferences();
+  for (const session of sessions) {
+    try {
+      await ensureSession(session, store.dataDir, preferences);
+    } catch (error) {
+      console.error(`Failed to restore session ${session.id}`, error);
     }
-  });
+  }
 }
 
-async function ensureSession(session: TerminalSession, dataDir = config.dataDir) {
+async function refreshSessionsForProxy(store: SessionStore, preferences: UserPreferences): Promise<void> {
+  const sessions = (await store.all()).filter((session) => !session.archived);
+  const failures: string[] = [];
+  await closeTerminalBrokers(store.dataDir);
+  for (const session of sessions) {
+    try {
+      await restartManagedSession(store, session, preferences);
+    } catch (error) {
+      failures.push(`${session.name}: ${errorMessage(error)}`);
+    }
+  }
+  if (failures.length) {
+    throw new Error(`Failed to refresh ${failures.length} terminal session(s): ${failures.join("; ")}`);
+  }
+}
+
+function restartManagedSession(
+  store: SessionStore,
+  session: TerminalSession,
+  preferences: UserPreferences
+): Promise<TerminalRestartResult> {
+  const key = `${path.resolve(store.dataDir)}:${session.id}`;
+  const existing = sessionRestartJobs.get(key);
+  if (existing) {
+    return existing;
+  }
+  const job = performManagedSessionRestart(store, session, preferences).finally(() => {
+    if (sessionRestartJobs.get(key) === job) {
+      sessionRestartJobs.delete(key);
+    }
+  });
+  sessionRestartJobs.set(key, job);
+  return job;
+}
+
+async function performManagedSessionRestart(
+  store: SessionStore,
+  session: TerminalSession,
+  preferences: UserPreferences
+): Promise<TerminalRestartResult> {
+  const backend = await resolveBackend(session);
+  if (backend !== "zellij") {
+    throw new Error(`terminal restart requires zellij, received ${backend}`);
+  }
+
+  // Capture both facts before stopping anything: whether Codex owns the focused pane,
+  // and which exact thread that process is running.
+  const codexState = await zellijCodexProcessState(session);
+  const codexThreadId = codexState.running ? codexState.threadId ?? session.codexThreadId : undefined;
+  if (codexState.running && !codexThreadId) {
+    throw new Error("检测到 Codex 正在运行，但未能识别 thread id；为避免丢失会话，本次未重启");
+  }
+
+  if (codexState.running && codexThreadId !== session.codexThreadId) {
+    await store.updateCodexThread(session.id, codexThreadId ?? null);
+  }
+
+  if (codexState.running) {
+    const stopped = await stopZellijCodexProcess(session);
+    if (!stopped.stopped) {
+      throw new Error("发送 /exit 和 Ctrl+C 后 Codex 进程仍未退出；为避免重复会话，本次未重启");
+    }
+  }
+
+  await closeTerminalBroker(store.dataDir, session.id);
+  await restartZellijSession(
+    {
+      tmuxName: session.tmuxName,
+      cwd: session.cwd,
+      shell: session.shell,
+      codexThreadId
+    },
+    terminalProxyConfig(preferences)
+  );
+
+  let codexResumed = false;
+  if (codexState.running && codexThreadId) {
+    const resumedState = await zellijCodexProcessState(session);
+    codexResumed =
+      resumedState.running &&
+      resumedState.yolo &&
+      (resumedState.threadId === codexThreadId || resumedState.command.toLowerCase().includes(codexThreadId.toLowerCase()));
+    if (!codexResumed) {
+      throw new Error(`terminal 已重启，但 Codex thread ${codexThreadId} 未能恢复`);
+    }
+  }
+
+  invalidateSessionPreviewCache(session, store.dataDir);
+  return {
+    sessionId: session.id,
+    sessionName: session.name,
+    restarted: true,
+    codexWasRunning: codexState.running,
+    codexThreadId,
+    codexResumed
+  };
+}
+
+async function ensureSession(
+  session: TerminalSession,
+  dataDir = config.dataDir,
+  preferences?: UserPreferences
+) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
     await ensureTmuxSession(session);
     return;
   }
   if (backend === "zellij") {
-    await ensureZellijSession(session);
+    await ensureZellijSession(session, preferences ? terminalProxyConfig(preferences) : undefined);
     return;
   }
   await nativeSessions.ensure(session, dataDir);
@@ -858,7 +1135,8 @@ async function sendSessionInput(
   enter: boolean,
   dataDir = config.dataDir,
   mode: SessionInputMode = "paste",
-  submitDelayMs = 0
+  submitDelayMs = 0,
+  preferences?: UserPreferences
 ) {
   const backend = await resolveBackend(session);
   if (backend === "tmux") {
@@ -866,7 +1144,11 @@ async function sendSessionInput(
     return;
   }
   if (backend === "zellij") {
-    await sendZellijInput(session, data, enter, { mode, submitDelayMs });
+    await sendZellijInput(session, data, enter, {
+      mode,
+      submitDelayMs,
+      proxy: preferences ? terminalProxyConfig(preferences) : undefined
+    });
     return;
   }
   await nativeSessions.write(session, data, enter, dataDir, submitDelayMs);
@@ -895,7 +1177,27 @@ function parseSubmitDelayMs(value: unknown, fallback: number): number {
   if (!Number.isFinite(parsed)) {
     return fallback;
   }
-  return Math.max(0, Math.min(1000, Math.floor(parsed)));
+  return Math.max(0, Math.min(12_000, Math.floor(parsed)));
+}
+
+function backgroundImageExtension(contentType: string | string[] | undefined): string | null {
+  const normalized = Array.isArray(contentType) ? contentType[0] : contentType?.split(";")[0].trim().toLowerCase();
+  if (normalized === "image/png") {
+    return "png";
+  }
+  if (normalized === "image/jpeg") {
+    return "jpg";
+  }
+  if (normalized === "image/webp") {
+    return "webp";
+  }
+  if (normalized === "image/gif") {
+    return "gif";
+  }
+  if (normalized === "image/avif") {
+    return "avif";
+  }
+  return null;
 }
 
 async function handleFileTransferUpload(

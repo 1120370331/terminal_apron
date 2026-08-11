@@ -8,12 +8,15 @@ import {
   FolderOpen,
   Laptop,
   LayoutGrid,
+  ListTodo,
   LogOut,
   MemoryStick,
   MonitorUp,
   Moon,
+  Network,
   Plus,
   RefreshCw,
+  RotateCw,
   Search,
   Settings,
   ShieldCheck,
@@ -27,7 +30,8 @@ import type {
   SessionPreview,
   SystemMetrics,
   TerminalPreviewGrid,
-  TerminalSession
+  TerminalSession,
+  UserPreferences
 } from "../shared/types";
 import { api, ApiError, type SessionInputResponse } from "./api";
 import { Login } from "./components/Login";
@@ -35,6 +39,7 @@ import { FileTransferPanel } from "./components/FileTransferPanel";
 import { SessionCard, type QuickInputPhase, type QuickInputStatus } from "./components/SessionCard";
 import { SessionEditor } from "./components/SessionEditor";
 import { TerminalDock } from "./components/TerminalDock";
+import { BackgroundImagePicker } from "./components/BackgroundImagePicker";
 
 const ResponsiveGrid = WidthProvider(Responsive);
 const FILTER_STATE_KEY = "terminal-web-monitor.filters.v1";
@@ -66,6 +71,12 @@ const MOBILE_INITIAL_PREVIEW_CARDS = 2;
 const MOBILE_QUERY = "(max-width: 720px)";
 const LEGACY_GRID_COLUMNS = 12;
 const GRID_COLUMNS = 24;
+
+interface RestartNotice {
+  tone: "success" | "warning" | "error";
+  message: string;
+  details?: string;
+}
 const CARD_COLUMNS = 8;
 const MIN_CARD_COLUMNS = 4;
 const MIN_LAYOUT_ROWS = 5;
@@ -118,6 +129,11 @@ const DEFAULT_SETTINGS: PanelSettings = {
   inlineSubmitKey: "enter",
   themeMode: "system"
 };
+const DEFAULT_PREFERENCES: UserPreferences = {
+  terminalBackgroundImage: null,
+  terminalProxyEnabled: false,
+  terminalProxyUrl: "http://127.0.0.1:7890"
+};
 
 function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
@@ -140,6 +156,26 @@ function normalizeBrowserTitle(value: unknown): string {
 
 function effectiveBrowserTitle(value: string): string {
   return value.trim() || DEFAULT_BROWSER_TITLE;
+}
+
+function normalizeTerminalProxyUrl(value: string): string {
+  try {
+    const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(value.trim()) ? value.trim() : `http://${value.trim()}`;
+    const parsed = new URL(candidate);
+    if (!["http:", "https:", "socks:", "socks5:"].includes(parsed.protocol) || !parsed.hostname) {
+      throw new Error();
+    }
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    throw new Error("请输入有效的 HTTP、HTTPS 或 SOCKS 代理地址");
+  }
+}
+
+function sameTerminalProxy(left: UserPreferences, right: UserPreferences): boolean {
+  if (left.terminalProxyEnabled !== right.terminalProxyEnabled) {
+    return false;
+  }
+  return !left.terminalProxyEnabled || left.terminalProxyUrl === right.terminalProxyUrl;
 }
 
 function isRemoteBrowserHost(): boolean {
@@ -306,6 +342,8 @@ function sessionSignature(session: TerminalSession): string {
     session.backend,
     session.tmuxName,
     session.color,
+    session.backgroundMode,
+    session.backgroundImage ?? "",
     String(session.archived),
     session.updatedAt,
     session.archivedAt ?? "",
@@ -331,8 +369,27 @@ function emptyPreview(sessionId: string): SessionPreview {
   };
 }
 
-function quickSubmitDelayMs(value: string): number {
+function quickSubmitDelayMs(value: string, session: TerminalSession, preview?: SessionPreview): number {
+  const output = preview?.text?.slice(-6000) ?? "";
+  const codexRunning =
+    /\bcodex(?:\.exe)?\b/i.test(session.runtime?.currentCommand || "") ||
+    /OpenAI Codex|codex-cli|codex resume|YOLO mode|esc to interrupt|Implement \{feature\}|gpt-[\w.-]+\s+(?:low|medium|high)/i.test(
+      output
+    );
+  if (codexRunning) {
+    return Math.max(5200, Math.min(10000, 5200 + Math.ceil(value.length / 2)));
+  }
   return Math.max(140, Math.min(600, 140 + Math.ceil(value.length / 80)));
+}
+
+function resolveTerminalBackground(session: TerminalSession, preferences: UserPreferences): string | null {
+  if (session.backgroundMode === "none") {
+    return null;
+  }
+  if (session.backgroundMode === "image") {
+    return session.backgroundImage ?? null;
+  }
+  return preferences.terminalBackgroundImage;
 }
 
 function createQuickInputId(sessionId: string): string {
@@ -601,6 +658,7 @@ export function App() {
   const [tagFilter, setTagFilter] = useState(initialFilters.tagFilter);
   const [showArchived, setShowArchived] = useState(initialFilters.showArchived);
   const [settings, setSettings] = useState<PanelSettings>(initialSettings);
+  const [preferences, setPreferences] = useState<UserPreferences>(DEFAULT_PREFERENCES);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [transferOpen, setTransferOpen] = useState(false);
   const [editorSession, setEditorSession] = useState<TerminalSession | "new" | null>(null);
@@ -609,6 +667,9 @@ export function App() {
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [previewRevealTimedOut, setPreviewRevealTimedOut] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [restartingAll, setRestartingAll] = useState(false);
+  const [restartingSessionIds, setRestartingSessionIds] = useState<Record<string, boolean>>({});
+  const [restartNotice, setRestartNotice] = useState<RestartNotice | null>(null);
   const [localLayout, setLocalLayout] = useState<Layout[]>([]);
   const layoutDirtyRef = useRef(false);
   const localLayoutRef = useRef<Layout[]>([]);
@@ -621,6 +682,7 @@ export function App() {
   const previewQueueRef = useRef<Array<() => void>>([]);
   const lastFullPreviewAtRef = useRef<Record<string, number>>({});
   const quickInputTimersRef = useRef<Record<string, number[]>>({});
+  const restartNoticeTimerRef = useRef<number | null>(null);
   const userStorageReadyRef = useRef<string | null>(null);
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const remoteBrowserHost = useMemo(isRemoteBrowserHost, []);
@@ -693,7 +755,21 @@ export function App() {
         timers.forEach((timer) => window.clearTimeout(timer));
       });
       quickInputTimersRef.current = {};
+      if (restartNoticeTimerRef.current !== null) {
+        window.clearTimeout(restartNoticeTimerRef.current);
+      }
     };
+  }, []);
+
+  const showRestartNotice = useCallback((notice: RestartNotice) => {
+    if (restartNoticeTimerRef.current !== null) {
+      window.clearTimeout(restartNoticeTimerRef.current);
+    }
+    setRestartNotice(notice);
+    restartNoticeTimerRef.current = window.setTimeout(() => {
+      setRestartNotice(null);
+      restartNoticeTimerRef.current = null;
+    }, notice.tone === "error" ? 9_000 : 6_000);
   }, []);
 
   const loadSessions = useCallback(async () => {
@@ -712,10 +788,50 @@ export function App() {
     }
   }, [showArchived]);
 
+  const applyPreferences = useCallback(
+    async (patch: Partial<UserPreferences>): Promise<UserPreferences> => {
+      const previous = preferences;
+      const optimistic = { ...previous, ...patch };
+      const proxyTouched = "terminalProxyEnabled" in patch || "terminalProxyUrl" in patch;
+      const proxyChanged = proxyTouched && !sameTerminalProxy(previous, optimistic);
+      setPreferences(optimistic);
+      try {
+        const updated = await api.updatePreferences(patch);
+        setPreferences(updated);
+        if (proxyChanged) {
+          setActiveTerminal(null);
+          setCachedTerminals([]);
+          setPreviews({});
+          await loadSessions();
+        }
+        return updated;
+      } catch (error) {
+        const persisted = await api.preferences().catch(() => previous);
+        setPreferences(persisted);
+        if (proxyChanged) {
+          setActiveTerminal(null);
+          setCachedTerminals([]);
+          setPreviews({});
+          await loadSessions();
+        }
+        throw error;
+      }
+    },
+    [loadSessions, preferences]
+  );
+
   useEffect(() => {
     void api.me().then(setAuth).catch(() => setAuth(null));
     void api.health().then(setHealth).catch(() => setHealth(null));
   }, []);
+
+  useEffect(() => {
+    if (!auth) {
+      setPreferences(DEFAULT_PREFERENCES);
+      return;
+    }
+    void api.preferences().then(setPreferences).catch(() => setPreferences(DEFAULT_PREFERENCES));
+  }, [auth]);
 
   useEffect(() => {
     previewsRef.current = previews;
@@ -889,7 +1005,12 @@ export function App() {
 
   useEffect(() => {
     setPreviewRevealTimedOut(false);
-    if (!auth || !sessionsLoaded || previewRevealTargets.length === 0 || previewRevealReady) {
+    if (
+      !auth ||
+      !sessionsLoaded ||
+      previewRevealTargets.length === 0 ||
+      previewRevealReady
+    ) {
       return;
     }
 
@@ -1171,10 +1292,78 @@ export function App() {
     [loadSessions, refreshSessionPreview]
   );
 
+  const restartTerminal = useCallback(
+    async (session: TerminalSession) => {
+      const prompt = session.runtime?.exists
+        ? `重启 ${session.name}？当前进程会被终止；如果检测到 Codex，将用 resume --yolo 恢复当前会话。`
+        : `启动并重建 ${session.name} terminal？`;
+      if (!window.confirm(prompt)) {
+        return;
+      }
+
+      setRestartingSessionIds((current) => ({ ...current, [session.id]: true }));
+      setActiveTerminal((current) => (current?.id === session.id ? null : current));
+      setCachedTerminals((current) => current.filter((item) => item.id !== session.id));
+      setPreviews((current) => removeRecordKey(current, session.id));
+      try {
+        const result = await api.restartSession(session.id);
+        showRestartNotice({
+          tone: "success",
+          message: result.codexResumed
+            ? `${session.name} 已重启，Codex 已通过 resume --yolo 恢复`
+            : `${session.name} 已重启；重启前未检测到 Codex 进程`
+        });
+      } catch (error) {
+        showRestartNotice({
+          tone: "error",
+          message: `${session.name} 重启失败`,
+          details: error instanceof Error ? error.message : "unknown error"
+        });
+      } finally {
+        setRestartingSessionIds((current) => removeRecordKey(current, session.id));
+        await loadSessions();
+      }
+    },
+    [loadSessions, showRestartNotice]
+  );
+
+  const restartAllTerminals = useCallback(async () => {
+    const count = sessions.filter((session) => !session.archived).length;
+    if (count === 0 || !window.confirm(`重启全部 ${count} 个 terminal？每个正在运行的 Codex 会话都会用 resume --yolo 恢复。`)) {
+      return;
+    }
+
+    setRestartingAll(true);
+    setActiveTerminal(null);
+    setCachedTerminals([]);
+    setPreviews({});
+    try {
+      const result = await api.restartAllSessions();
+      const failures = result.results
+        .filter((item) => !item.restarted)
+        .map((item) => `${item.sessionName}: ${item.error || "restart failed"}`);
+      showRestartNotice({
+        tone: result.failed === 0 ? "success" : result.succeeded > 0 ? "warning" : "error",
+        message: `已重启 ${result.succeeded}/${result.total} 个 terminal，恢复 ${result.codexResumed} 个 Codex 会话`,
+        details: failures.length ? failures.join("；") : undefined
+      });
+    } catch (error) {
+      showRestartNotice({
+        tone: "error",
+        message: "批量重启失败",
+        details: error instanceof Error ? error.message : "unknown error"
+      });
+    } finally {
+      setRestartingAll(false);
+      await loadSessions();
+    }
+  }, [loadSessions, sessions, showRestartNotice]);
+
   const renderSessionCard = (session: TerminalSession) => (
     <SessionCard
       session={session}
       preview={previews[session.id]}
+      backgroundImage={resolveTerminalBackground(session, preferences)}
       quickInputStatus={quickInputStatuses[session.id]}
       previewFontSize={settings.listTerminalFontSize}
       previewScale={settings.listTerminalScale / 100}
@@ -1197,7 +1386,7 @@ export function App() {
           enter: true,
           submitKey: "enter" as const,
           mode: "paste" as const,
-          submitDelayMs: quickSubmitDelayMs(value),
+          submitDelayMs: quickSubmitDelayMs(value, session, previewsRef.current[session.id]),
           lines: settings.previewLines,
           maxChars: previewMaxChars,
           includePreview: false
@@ -1253,6 +1442,8 @@ export function App() {
         await api.restoreSession(session.id);
         await loadSessions();
       }}
+      onRestart={() => void restartTerminal(session)}
+      restarting={restartingAll || Boolean(restartingSessionIds[session.id])}
       onKill={async () => {
         if (window.confirm(`Stop ${session.name} terminal session?`)) {
           await api.killSession(session.id);
@@ -1295,11 +1486,15 @@ export function App() {
         <div className="brand">
           <MonitorUp size={24} />
           <div>
-            <h1>Terminal Web Monitor</h1>
+            <h1>Terminal Apron</h1>
             <span>{sessions.length} sessions · {auth.name}</span>
           </div>
         </div>
         <div className="topbar-actions">
+          <a className="secondary-button terminal-mode-link" href="/task-monitor/" title="打开任务工作台">
+            <ListTodo size={16} />
+            任务
+          </a>
           <HealthPill health={health} />
           <button
             className="icon-button"
@@ -1309,7 +1504,7 @@ export function App() {
           >
             <ThemeModeIcon mode={settings.themeMode} />
           </button>
-          <button className="icon-button desktop-only-action" type="button" onClick={() => setSettingsOpen(true)} title="配置">
+          <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} title="配置">
             <Settings size={18} />
           </button>
           <button className="icon-button" type="button" onClick={() => setTransferOpen(true)} title="文件传输">
@@ -1356,6 +1551,16 @@ export function App() {
           归档
         </button>
         <button
+          className="secondary-button restart-all-button"
+          type="button"
+          onClick={() => void restartAllTerminals()}
+          disabled={restartingAll || sessions.every((session) => session.archived)}
+          title="重启全部活动 terminal；正在运行的 Codex 将自动 resume --yolo"
+        >
+          <RotateCw size={16} className={restartingAll ? "spin" : ""} />
+          {restartingAll ? "重启中" : "全部重启"}
+        </button>
+        <button
           className="secondary-button desktop-only-action"
           type="button"
           onClick={organizeLayout}
@@ -1396,6 +1601,18 @@ export function App() {
           新建
         </button>
       </section>
+
+      {restartNotice && (
+        <div
+          className={`restart-notice ${restartNotice.tone}`}
+          role={restartNotice.tone === "error" ? "alert" : "status"}
+          title={restartNotice.details}
+        >
+          <RotateCw size={17} />
+          <span>{restartNotice.message}</span>
+          {restartNotice.details && <small>{restartNotice.details}</small>}
+        </div>
+      )}
 
       {terminalListLoading ? (
         <TerminalListLoader />
@@ -1452,6 +1669,7 @@ export function App() {
           session={editorSession === "new" ? null : editorSession}
           initialGroup={groupFilter === "all" ? undefined : groupFilter}
           initialTags={tagFilter === "all" ? [] : [tagFilter]}
+          defaultBackgroundImage={preferences.terminalBackgroundImage}
           onClose={() => setEditorSession(null)}
           onSave={async (input) => {
             let terminalToOpen: TerminalSession | null = null;
@@ -1478,17 +1696,25 @@ export function App() {
         <TerminalDock
           key={terminal.id}
           session={terminal}
+          backgroundImage={resolveTerminalBackground(terminal, preferences)}
           visible={activeTerminal?.id === terminal.id}
           onClose={() => closeTerminal(terminal)}
+          onRestart={() => void restartTerminal(terminal)}
+          restarting={restartingAll || Boolean(restartingSessionIds[terminal.id])}
         />
       ))}
 
       {settingsOpen && (
         <SettingsModal
           settings={settings}
+          preferences={preferences}
           onChange={setSettings}
+          onPreferencesChange={applyPreferences}
           onClose={() => setSettingsOpen(false)}
-          onReset={() => setSettings(DEFAULT_SETTINGS)}
+          onReset={async () => {
+            setSettings(DEFAULT_SETTINGS);
+            await applyPreferences(DEFAULT_PREFERENCES);
+          }}
         />
       )}
 
@@ -1516,17 +1742,46 @@ function TerminalListLoader() {
 
 function SettingsModal({
   settings,
+  preferences,
   onChange,
+  onPreferencesChange,
   onClose,
   onReset
 }: {
   settings: PanelSettings;
+  preferences: UserPreferences;
   onChange: (settings: PanelSettings) => void;
+  onPreferencesChange: (preferences: Partial<UserPreferences>) => Promise<UserPreferences>;
   onClose: () => void;
-  onReset: () => void;
+  onReset: () => Promise<void>;
 }) {
+  const [proxyEnabled, setProxyEnabled] = useState(preferences.terminalProxyEnabled);
+  const [proxyUrl, setProxyUrl] = useState(preferences.terminalProxyUrl);
+  const [proxyApplyState, setProxyApplyState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [proxyError, setProxyError] = useState("");
   const update = <K extends keyof PanelSettings>(key: K, value: PanelSettings[K]) => {
     onChange({ ...settings, [key]: value });
+  };
+  const proxyDirty =
+    proxyEnabled !== preferences.terminalProxyEnabled || proxyUrl.trim() !== preferences.terminalProxyUrl;
+  const proxyWillRefresh = proxyEnabled || preferences.terminalProxyEnabled;
+
+  const applyProxy = async () => {
+    setProxyApplyState("saving");
+    setProxyError("");
+    try {
+      const normalizedUrl = normalizeTerminalProxyUrl(proxyUrl);
+      const updated = await onPreferencesChange({
+        terminalProxyEnabled: proxyEnabled,
+        terminalProxyUrl: normalizedUrl
+      });
+      setProxyEnabled(updated.terminalProxyEnabled);
+      setProxyUrl(updated.terminalProxyUrl);
+      setProxyApplyState("saved");
+    } catch (error) {
+      setProxyApplyState("error");
+      setProxyError(error instanceof Error ? error.message : "代理配置应用失败");
+    }
   };
 
   return (
@@ -1677,9 +1932,90 @@ function SettingsModal({
               <option value="enter">Enter</option>
             </select>
           </label>
+          <section className={proxyEnabled ? "settings-proxy-field enabled" : "settings-proxy-field"}>
+            <header className="settings-proxy-header">
+              <div className="settings-proxy-heading">
+                <span className="settings-proxy-icon">
+                  <Network size={18} />
+                </span>
+                <div>
+                  <strong>Terminal 系统代理</strong>
+                  <span>为所有 terminal 注入 HTTP_PROXY、HTTPS_PROXY 和 ALL_PROXY</span>
+                </div>
+              </div>
+              <label className="proxy-switch">
+                <input
+                  type="checkbox"
+                  checked={proxyEnabled}
+                  onChange={(event) => {
+                    setProxyEnabled(event.target.checked);
+                    setProxyApplyState("idle");
+                  }}
+                />
+                <span aria-hidden="true" />
+                <b>{proxyEnabled ? "已开启" : "未开启"}</b>
+              </label>
+            </header>
+            <div className="settings-proxy-route" aria-hidden="true">
+              <span>terminal</span>
+              <i />
+              <code>{proxyUrl.trim() || DEFAULT_PREFERENCES.terminalProxyUrl}</code>
+              <i />
+              <span>network</span>
+            </div>
+            <div className="settings-proxy-controls">
+              <label>
+                <span>代理地址</span>
+                <input
+                  type="text"
+                  inputMode="url"
+                  spellCheck={false}
+                  value={proxyUrl}
+                  placeholder={DEFAULT_PREFERENCES.terminalProxyUrl}
+                  onChange={(event) => {
+                    setProxyUrl(event.target.value);
+                    setProxyApplyState("idle");
+                  }}
+                />
+              </label>
+              <button
+                className="primary-button proxy-apply-button"
+                type="button"
+                disabled={!proxyDirty || proxyApplyState === "saving"}
+                onClick={() => void applyProxy()}
+              >
+                <RefreshCw size={15} className={proxyApplyState === "saving" ? "spin" : ""} />
+                {proxyApplyState === "saving"
+                  ? proxyWillRefresh
+                    ? "正在刷新"
+                    : "正在保存"
+                  : proxyWillRefresh
+                    ? "应用并刷新"
+                    : "保存配置"}
+              </button>
+            </div>
+            <footer className={`settings-proxy-feedback ${proxyApplyState}`}>
+              {proxyApplyState === "error"
+                ? proxyError
+                : proxyApplyState === "saved"
+                  ? proxyEnabled
+                    ? "代理配置已生效，所有 terminal 已重新连接"
+                    : "代理配置已保存，terminal 将继续直连"
+                  : "修改后会重启全部活动 terminal；正在运行的命令将通过 Zellij 恢复"}
+            </footer>
+          </section>
+          <div className="settings-background-field">
+            <span>Terminal 默认背景图</span>
+            <BackgroundImagePicker
+              value={preferences.terminalBackgroundImage}
+              onChange={(terminalBackgroundImage) => {
+                void onPreferencesChange({ terminalBackgroundImage });
+              }}
+            />
+          </div>
         </div>
         <footer className="modal-actions">
-          <button className="secondary-button" type="button" onClick={onReset}>
+          <button className="secondary-button" type="button" onClick={() => void onReset()}>
             重置
           </button>
           <button className="primary-button" type="button" onClick={onClose}>

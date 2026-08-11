@@ -6,6 +6,7 @@
 
 - Web 面板管理多个 terminal，会话支持名称、分组、标签、路径、颜色、布局、归档和复制配置。
 - 每个 terminal 对应一个 Zellij session。网页断开或 Web 服务重启时，Zellij session 不会被杀掉。
+- 从本面板启动的 Codex CLI 会自动附加 thread-id 标记；在 Codex 内执行 `/new`、`/fork`（以及同类 branch 操作）后，面板会记录新的 thread。terminal 卡片、terminal 窗口都提供单个重启按钮，工具栏提供全部重启按钮；重启前会核验当前 pane 是否确实运行 Codex，先尝试 `/exit`，仍未退出时自动补发 `Ctrl+C`，确认旧进程结束后才以 `codex resume --yolo <thread-id>` 恢复同一会话。
 - 列表卡片可以直接发送输入，服务端会以粘贴模式写入目标 pane，并在短暂等待后发送 Enter，适合 Codex 这类交互式 composer。
 - 列表输入行和完整终端窗口支持通过 Ctrl+V 粘贴图片或文件；文件会先上传到项目内 `file-transfer/<user>/` 传输目录，再把路径写入输入位置。
 - 顶部工具栏提供文件传输面板，可上传、刷新、下载、删除和复制传输目录/文件路径，用于不同设备之间交换远程文件。
@@ -17,7 +18,7 @@
 
 已经被杀掉的进程无法恢复。旧的 native ConPTY 会话不能热迁移进 Zellij，只能保留之前捕获的输出历史。切到 Zellij 后，新开的 terminal 才具备“Web 服务重启不杀会话”的能力。
 
-系统关机后，正在运行的进程能否恢复取决于 Zellij session serialization 和命令本身的恢复能力。Codex CLI 这类工具如果自身支持 resume/history，应该配合它自己的恢复机制使用。
+系统关机后，普通进程能否恢复仍取决于 Zellij session serialization 和命令本身的恢复能力。Codex CLI 额外使用自身的 thread-id/resume 机制恢复；绝对路径绕过 `codex` 命令包装器、或手工覆盖 `tui.terminal_title` 时，只能退回 Zellij 原生恢复。
 
 ## 要求
 

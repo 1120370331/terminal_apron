@@ -1,6 +1,7 @@
 import type {
   AuthConfig,
   AuthUser,
+  BackgroundUploadResult,
   CreateSessionInput,
   FileTransferListResponse,
   FileTransferUploadResponse,
@@ -9,8 +10,11 @@ import type {
   SessionInputRequest,
   SessionUploadResponse,
   SystemMetrics,
+  TerminalBatchRestartResult,
+  TerminalRestartResult,
   TerminalSession,
-  UpdateSessionInput
+  UpdateSessionInput,
+  UserPreferences
 } from "../shared/types";
 
 export type SessionInputAckStatus = "accepted" | "error";
@@ -75,6 +79,18 @@ export const api = {
   me: () => request<AuthUser>("/api/me"),
   health: () => request<HealthStatus>("/api/health"),
   systemMetrics: () => request<SystemMetrics>("/api/system/metrics"),
+  preferences: () => request<UserPreferences>("/api/preferences"),
+  updatePreferences: (input: Partial<UserPreferences>) =>
+    request<UserPreferences>("/api/preferences", {
+      method: "PATCH",
+      body: JSON.stringify(input)
+    }),
+  uploadBackground: (file: File) =>
+    request<BackgroundUploadResult>("/api/backgrounds", {
+      method: "POST",
+      headers: { "Content-Type": file.type },
+      body: file
+    }),
   fileTransferList: () => request<FileTransferListResponse>("/api/file-transfer/files"),
   uploadTransferFiles: (files: File[]) => {
     const form = new FormData();
@@ -115,7 +131,18 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
-  sessions: (archived = false) => request<TerminalSession[]>(`/api/sessions?archived=${archived}`),
+  sessions: (
+    archived = false,
+    options: { taskId?: string; taskLinked?: boolean } = {}
+  ) => {
+    const params = new URLSearchParams({ archived: String(archived) });
+    if (options.taskId) {
+      params.set("taskId", options.taskId);
+    } else if (options.taskLinked) {
+      params.set("taskLinked", "true");
+    }
+    return request<TerminalSession[]>(`/api/sessions?${params.toString()}`);
+  },
   createSession: (input: CreateSessionInput) =>
     request<TerminalSession>("/api/sessions", {
       method: "POST",
@@ -132,6 +159,14 @@ export const api = {
     }),
   ensureSession: (id: string) =>
     request<TerminalSession>(`/api/sessions/${id}/ensure`, {
+      method: "POST"
+    }),
+  restartSession: (id: string) =>
+    request<TerminalRestartResult>(`/api/sessions/${id}/restart`, {
+      method: "POST"
+    }),
+  restartAllSessions: () =>
+    request<TerminalBatchRestartResult>("/api/sessions/restart-all", {
       method: "POST"
     }),
   sendInput: (id: string, input: SessionInputRequestBody) =>

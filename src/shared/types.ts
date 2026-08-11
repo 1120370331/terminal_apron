@@ -1,6 +1,7 @@
 export type AuthMethod = "none" | "password" | "ssh";
 export type TerminalBackend = "auto" | "native" | "tmux" | "zellij";
 export type ResolvedTerminalBackend = "native" | "tmux" | "zellij";
+export type TerminalBackgroundMode = "inherit" | "none" | "image";
 
 export interface AuthConfig {
   methods: AuthMethod[];
@@ -40,40 +41,103 @@ export interface TerminalSession {
   name: string;
   group: string;
   tags: string[];
+  taskId?: string;
+  taskKey?: string;
   cwd: string;
   shell?: string;
   backend: TerminalBackend;
   tmuxName: string;
   color: string;
+  backgroundMode: TerminalBackgroundMode;
+  backgroundImage?: string;
   archived: boolean;
   createdAt: string;
   updatedAt: string;
   archivedAt?: string;
   stoppedAt?: string;
+  codexThreadId?: string;
+  codexThreadUpdatedAt?: string;
   layout?: GridItemLayout;
   runtime?: SessionRuntime;
+}
+
+export interface TerminalRestartResult {
+  sessionId: string;
+  sessionName: string;
+  restarted: boolean;
+  codexWasRunning: boolean;
+  codexThreadId?: string;
+  codexResumed: boolean;
+  error?: string;
+}
+
+export interface TerminalBatchRestartResult {
+  total: number;
+  succeeded: number;
+  failed: number;
+  codexResumed: number;
+  results: TerminalRestartResult[];
 }
 
 export interface CreateSessionInput {
   name: string;
   group?: string;
   tags?: string[];
+  taskId?: string;
+  taskKey?: string;
   cwd?: string;
   shell?: string;
   backend?: TerminalBackend;
   color?: string;
+  backgroundMode?: TerminalBackgroundMode;
+  backgroundImage?: string;
 }
 
 export interface UpdateSessionInput {
   name?: string;
   group?: string;
   tags?: string[];
+  taskId?: string | null;
+  taskKey?: string | null;
   cwd?: string;
   shell?: string;
   backend?: TerminalBackend;
   color?: string;
+  backgroundMode?: TerminalBackgroundMode;
+  backgroundImage?: string;
   archived?: boolean;
   layout?: GridItemLayout;
+}
+
+export interface UserPreferences {
+  terminalBackgroundImage: string | null;
+  terminalProxyEnabled: boolean;
+  terminalProxyUrl: string;
+}
+
+export interface BackgroundUploadResult {
+  url: string;
+  name: string;
+}
+
+export type FilesystemLocationKind = "home" | "desktop" | "documents" | "downloads" | "drive";
+
+export interface FilesystemLocation {
+  label: string;
+  path: string;
+  kind: FilesystemLocationKind;
+}
+
+export interface FilesystemDirectory {
+  name: string;
+  path: string;
+}
+
+export interface DirectoryBrowserResult {
+  path: string;
+  parentPath: string | null;
+  locations: FilesystemLocation[];
+  directories: FilesystemDirectory[];
 }
 
 export type SessionInputMode = "paste" | "type";
