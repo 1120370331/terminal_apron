@@ -744,7 +744,8 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
         clientProfile: isMobileClient ? "mobile" : "desktop",
         mode: "interactive",
         lastAckSeq: String(lastAckSeqRef.current),
-        historyPolicy: "viewport"
+        historyPolicy: "tail",
+        tailLines: "200"
       }
     });
 

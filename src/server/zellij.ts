@@ -62,7 +62,7 @@ export interface ZellijCodexProcessState {
 const ZELLIJ_SINGLE_PANE_LAYOUT = ["layout {", "    pane", "}"].join("\n");
 const VIEWPORT_PREVIEW_TTL_MS = 600;
 const VIEWPORT_PREVIEW_STALE_MS = 30_000;
-const ZELLIJ_SESSION_LIST_TTL_MS = 750;
+const ZELLIJ_SESSION_LIST_TTL_MS = 3_000;
 const ZELLIJ_VERSION_TTL_MS = 60_000;
 const ZELLIJ_RUNTIME_CACHE_TTL_MS = 10_000;
 const ZELLIJ_PREVIEW_MIN_COLS = 120;
@@ -75,6 +75,9 @@ const CODEX_LOCK_RETRY_DELAYS_MS = [2_000, 4_000, 8_000, 12_000];
 const CODEX_GRACEFUL_EXIT_TIMEOUT_MS = 2_500;
 const CODEX_INTERRUPT_EXIT_TIMEOUT_MS = 2_500;
 const CODEX_INTERRUPT_ATTEMPTS = 2;
+const ZELLIJ_MAINTENANCE_DELAY_MS = 1_500;
+
+const zellijMaintenanceTimers = new Map<string, NodeJS.Timeout>();
 
 interface PreviewCacheEntry {
   value: string;
@@ -161,8 +164,7 @@ export async function ensureZellijSession(
   proxy: TerminalProxyConfig = DISABLED_TERMINAL_PROXY
 ): Promise<void> {
   if (await hasZellijSession(session.tmuxName)) {
-    await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
-    await saveZellijSessionState(session.tmuxName).catch(() => undefined);
+    scheduleZellijSessionMaintenance(session.tmuxName);
     return;
   }
 
@@ -175,11 +177,11 @@ export async function ensureZellijSession(
   });
   invalidateZellijSessionListCache();
   runtimeInfoCache.delete(session.tmuxName);
-  await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
-  await saveZellijSessionState(session.tmuxName).catch(() => undefined);
+  scheduleZellijSessionMaintenance(session.tmuxName);
 }
 
 export async function killZellijSession(session: Pick<TerminalSession, "tmuxName">): Promise<void> {
+  cancelZellijSessionMaintenance(session.tmuxName);
   if (!(await hasZellijSession(session.tmuxName))) {
     return;
   }
@@ -196,6 +198,7 @@ export async function restartZellijSession(
   session: ZellijSessionSpec,
   proxy: TerminalProxyConfig = DISABLED_TERMINAL_PROXY
 ): Promise<void> {
+  cancelZellijSessionMaintenance(session.tmuxName);
   await queueZellijBootstrap(async () => {
     if (await hasZellijSession(session.tmuxName)) {
       await saveZellijSessionState(session.tmuxName).catch(() => undefined);
@@ -207,8 +210,7 @@ export async function restartZellijSession(
     invalidateZellijSessionListCache();
   });
   runtimeInfoCache.delete(session.tmuxName);
-  await pruneZellijUiPanes(session.tmuxName).catch(() => undefined);
-  await saveZellijSessionState(session.tmuxName).catch(() => undefined);
+  scheduleZellijSessionMaintenance(session.tmuxName);
 }
 
 export async function zellijCodexProcessState(
@@ -624,6 +626,30 @@ async function pruneZellijUiPanes(sessionName: string): Promise<void> {
       timeoutMs: 3000
     }).catch(() => undefined);
   }
+}
+
+function scheduleZellijSessionMaintenance(sessionName: string): void {
+  if (zellijMaintenanceTimers.has(sessionName)) {
+    return;
+  }
+
+  const timer = setTimeout(() => {
+    zellijMaintenanceTimers.delete(sessionName);
+    void pruneZellijUiPanes(sessionName)
+      .then(() => saveZellijSessionState(sessionName))
+      .catch(() => undefined);
+  }, ZELLIJ_MAINTENANCE_DELAY_MS);
+  timer.unref();
+  zellijMaintenanceTimers.set(sessionName, timer);
+}
+
+function cancelZellijSessionMaintenance(sessionName: string): void {
+  const timer = zellijMaintenanceTimers.get(sessionName);
+  if (!timer) {
+    return;
+  }
+  clearTimeout(timer);
+  zellijMaintenanceTimers.delete(sessionName);
 }
 
 export async function normalizeZellijSessionUi(sessionName: string): Promise<void> {

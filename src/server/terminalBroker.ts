@@ -443,7 +443,8 @@ export class TerminalBroker {
         session: this.session,
         requestId,
         dataDir: this.dataDir,
-        tailLines
+        tailLines,
+        includeViewport: policy === "viewport"
       });
       if (subscriber.closed || subscriber.canceledHistory.has(requestId)) {
         return;

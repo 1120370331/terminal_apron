@@ -50,6 +50,7 @@ export interface TerminalLatestSnapshotOptions {
   viewportLines?: number;
   tailLines?: number;
   maxTailBytes?: number;
+  includeViewport?: boolean;
   signal?: AbortSignal;
 }
 
@@ -154,7 +155,9 @@ export async function captureTerminalLatestSnapshot(
 
   throwIfAborted(options.signal);
   const [viewportAnsi, tailRange] = await Promise.all([
-    captureZellijPreview(options.session, viewportLines, false, dataDir),
+    options.includeViewport === false
+      ? Promise.resolve("")
+      : captureZellijPreview(options.session, viewportLines, false, dataDir),
     loadTerminalHistoryRange({
       session: options.session,
       requestId: options.requestId,
