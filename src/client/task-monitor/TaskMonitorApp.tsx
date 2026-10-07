@@ -1,3 +1,4 @@
+import { TaskMonitorErrorBoundary } from "./TaskMonitorErrorBoundary";
 import {
   KeyRound,
   ListChecks,
@@ -8,7 +9,7 @@ import {
   ShieldCheck,
   Sun
 } from "lucide-react";
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState, type FormEvent } from "react";
 import type { AuthConfig, AuthUser } from "../../shared/types";
 import { taskAuthApi } from "../taskApi";
 import { TaskMonitorPage } from "./TaskMonitorPage";
@@ -16,8 +17,12 @@ import { TaskMonitorPage } from "./TaskMonitorPage";
 type ThemeMode = "light" | "dark";
 
 const THEME_KEY = "terminal-apron.task-monitor.theme.v1";
+const TaskModePage = lazy(() => import("../task-mode/TaskModePage").then(module => ({ default: module.TaskModePage })));
+const TaskArtifactPage = lazy(() => import("../task-mode/TaskArtifactPage").then(module => ({ default: module.TaskArtifactPage })));
 
-export function TaskMonitorApp() {
+export function TaskMonitorApp() { return <TaskMonitorErrorBoundary><TaskMonitorContents/></TaskMonitorErrorBoundary>; }
+
+function TaskMonitorContents() {
   const [user, setUser] = useState<AuthUser | null | undefined>(undefined);
   const [theme, setTheme] = useState<ThemeMode>(loadTheme);
 
@@ -43,6 +48,19 @@ export function TaskMonitorApp() {
     return <TaskMonitorLogin onAuthenticated={setUser} />;
   }
 
+  if (new URLSearchParams(window.location.search).get("mode") === "artifact") {
+    return <Suspense fallback={<main className="task-monitor-boot">正在读取汇总文档…</main>}><TaskArtifactPage theme={theme} onTheme={() => setTheme(current => current === "dark" ? "light" : "dark")} onUnauthorized={() => setUser(null)} /></Suspense>;
+  }
+
+  if (new URLSearchParams(window.location.search).get("mode") === "task-mode") {
+    return <Suspense fallback={<main className="task-monitor-boot">正在打开 Task Mode…</main>}>
+      <TaskModePage userName={user.name} theme={theme}
+        onTheme={() => setTheme(current => current === "dark" ? "light" : "dark")}
+        onLogout={() => void taskAuthApi.logout().finally(() => setUser(null))}
+        onUnauthorized={() => setUser(null)} />
+    </Suspense>;
+  }
+
   return (
     <main className="task-monitor-shell">
       <header className="task-monitor-topbar">
@@ -56,6 +74,7 @@ export function TaskMonitorApp() {
           </div>
         </div>
         <div className="task-monitor-session">
+          <a className="task-shell-mode-link" href="/task-monitor/?mode=task-mode"><ListChecks size={15} />Task Mode</a>
           <a className="task-shell-mode-link" href="/" title="返回 Terminal Monitor">
             <MonitorUp size={15} />
             终端

@@ -31,9 +31,7 @@ import {
 import {
   captureZellijPreview,
   ensureZellijSession,
-  hasExitedZellijSession,
   killZellijSession,
-  listExitedZellijSessions,
   restartZellijSession,
   saveZellijSessionState,
   sendZellijInput,
@@ -47,6 +45,15 @@ import {
 import { registerTerminalSockets } from "./terminalSocket.js";
 import { createTaskRouter } from "./tasks/taskRouter.js";
 import { TaskStore } from "./tasks/taskStore.js";
+import { createTaskConversationRouter } from "./tasks/taskConversationRouter.js";
+import { TaskConversationService } from "./tasks/taskConversationService.js";
+import { RequirementDraftStore } from "./tasks/requirementDraftStore.js";
+import { RequirementDraftService } from "./tasks/requirementDraftService.js";
+import { createRequirementDraftRouter } from "./tasks/requirementDraftRouter.js";
+import { TaskModeService } from "./tasks/taskModeService.js";
+import { createTaskModeRouter } from "./tasks/taskModeRouter.js";
+import { CodexConversationManager } from "./codexConversationManager.js";
+import { CodexAppServerClient } from "./codexAppServerClient.js";
 import { browseFilesystemDirectory } from "./filesystem.js";
 import {
   trackCodexThreadForTerminalPrompt
@@ -57,6 +64,9 @@ import { nodePtyHealth } from "./pty.js";
 import { backendHealth, resolveBackend } from "./backend.js";
 import { NativeSessionManager } from "./nativeSessions.js";
 import { renderPreviewGrid } from "./previewGrid.js";
+import { ensureTaskSkillAvailable, findTaskSkillProjectRoot } from "./taskSkill.js";
+import { ensureTaskMonitorCliCredential } from "./taskCliCredential.js";
+import { listenBeforeBootstrap } from "./startupSequence.js";
 import type {
   CreateSessionInput,
   AuthUser,
@@ -87,6 +97,9 @@ const io = new SocketServer(server, {
 });
 const stores = new Map<string, Promise<SessionStore>>();
 const taskStores = new Map<string, TaskStore>();
+const taskConversationServices = new Map<string, TaskConversationService>();
+const requirementDraftServices = new Map<string, Promise<RequirementDraftService>>();
+const taskModeServices = new Map<string, Promise<TaskModeService>>();
 const restoreQueuedStores = new Set<string>();
 const nativeSessions = new NativeSessionManager();
 const DEFAULT_PREVIEW_MAX_CHARS = 120_000;
@@ -143,6 +156,52 @@ async function taskStoreForUser(user: AuthUser): Promise<TaskStore> {
     taskStores.set(userDataDir, store);
   }
   return store;
+}
+
+async function taskConversationServiceForUser(user: AuthUser): Promise<TaskConversationService> {
+  const userDataDir = path.resolve(dataDirForUser(user.name));
+  let service = taskConversationServices.get(userDataDir);
+  if (!service) {
+    const fakeAppServer=process.env.TWM_CODEX_APP_SERVER_SCRIPT?.trim();
+    const conversationManager=fakeAppServer?new CodexConversationManager(new CodexAppServerClient({command:process.execPath,args:[path.resolve(fakeAppServer)],experimentalApi:true,env:{...process.env,TWM_FAKE_DELAY_CONTROL_FILE:path.resolve(userDataDir,"fake-thread-read-delay-ms")}})):new CodexConversationManager();
+    service = new TaskConversationService(await taskStoreForUser(user), conversationManager);
+    taskConversationServices.set(userDataDir, service);
+  }
+  service.ensureRuntimeOwnership();
+  return service;
+}
+
+function taskModeServiceForUser(user: AuthUser): Promise<TaskModeService> {
+  const key = path.resolve(dataDirForUser(user.name));
+  let service = taskModeServices.get(key);
+  if (!service) {
+    service = taskConversationServiceForUser(user).then(conversations => new TaskModeService(conversations));
+    taskModeServices.set(key, service);
+    void service.catch(() => taskModeServices.delete(key));
+  }
+  return service;
+}
+
+function requirementDraftServiceForUser(user: AuthUser): Promise<RequirementDraftService> {
+  // User name is part of the key even when two configured users share a data directory.
+  const directory = path.resolve(dataDirForUser(user.name));
+  const key = `${directory}\0${user.name}`;
+  let service = requirementDraftServices.get(key);
+  if (!service) {
+    service = taskConversationServiceForUser(user).then(conversations => new RequirementDraftService(
+      new RequirementDraftStore(directory, user.name), conversations.manager,
+      { taskExists: taskId => Boolean(conversations.store.get(taskId)) }
+    ));
+    requirementDraftServices.set(key, service);
+    void service.catch(() => requirementDraftServices.delete(key));
+  }
+  return service;
+}
+
+async function provisionTaskCliCredential(user: AuthUser, taskId?: string): Promise<void> {
+  const userDataDir = path.resolve(dataDirForUser(user.name));
+  const task = taskId ? (await taskStoreForUser(user)).get(taskId) : null;
+  await ensureTaskMonitorCliCredential(user, userDataDir, task?.contextDirectory);
 }
 
 app.get("/api/auth/config", (_req, res) => {
@@ -216,12 +275,32 @@ app.get("/api/health", async (_req, res) => {
     tmux,
     zellij,
     nodePty,
-    dataDir: config.dataDir
+    dataDir: config.dataDir,
+    codexConversations: {
+      topology: "single-active-owner",
+      activeManagers: taskConversationServices.size,
+      sseDurability: "memory-ring",
+      approvalTtlMs: 600_000
+    }
   });
 });
 
 app.use("/api", requireAuth);
-app.use("/api/tasks", createTaskRouter(taskStoreForUser));
+app.use("/api/requirement-drafts", createRequirementDraftRouter(requirementDraftServiceForUser));
+app.use("/api/task-mode", createTaskModeRouter(taskModeServiceForUser));
+app.use("/api/tasks", async (req, res, next) => {
+  try {
+    await provisionTaskCliCredential(
+      res.locals.user as AuthUser,
+      taskIdFromMountedTaskPath(req.path)
+    );
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+app.use("/api/tasks/:taskId/conversations", createTaskConversationRouter(taskConversationServiceForUser));
+app.use("/api/tasks", createTaskRouter(taskStoreForUser, storeForUser, taskConversationServiceForUser));
 
 app.get("/api/filesystem/directories", async (req, res) => {
   const requestedPath = typeof req.query.path === "string" ? req.query.path : undefined;
@@ -354,8 +433,11 @@ app.get("/api/sessions", async (req, res) => {
 });
 
 app.post("/api/sessions", async (req, res) => {
-  const store = await storeForUser(res.locals.user as AuthUser);
-  const session = await store.create(req.body as CreateSessionInput);
+  const user = res.locals.user as AuthUser;
+  const input = req.body as CreateSessionInput;
+  await provisionTaskCliCredential(user, input.taskId);
+  const store = await storeForUser(user);
+  const session = await store.create(input);
   void ensureSession(session, store.dataDir, await store.preferences()).catch((error) => {
     console.error(`Failed to start session ${session.id}`, error);
   });
@@ -640,6 +722,20 @@ app.get("/api/sessions/:id/preview", async (req, res) => {
 registerTerminalSockets(io, storeForUser, nativeSessions);
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
+const taskSkillProjectRoot =
+  findTaskSkillProjectRoot([
+    process.cwd(),
+    path.resolve(dirname, "../.."),
+    path.resolve(dirname, "../../..")
+  ]) ?? process.cwd();
+const taskSkillInstall = ensureTaskSkillAvailable({ projectRoot: taskSkillProjectRoot });
+if (taskSkillInstall.status === "linked") {
+  console.log(`TaskMonitor skill linked at ${taskSkillInstall.destination}`);
+} else if (taskSkillInstall.status !== "already_linked") {
+  console.warn(
+    `TaskMonitor skill unavailable (${taskSkillInstall.status}): ${taskSkillInstall.message ?? taskSkillInstall.destination}`
+  );
+}
 const clientDir =
   [path.resolve(dirname, "../../client"), path.resolve(dirname, "../client")].find((candidate) =>
     fs.existsSync(path.join(candidate, "index.html"))
@@ -676,13 +772,16 @@ app.use((req, res, next) => {
 });
 
 const startupUsers = new Set([config.adminUser, ...config.users.map((user) => user.name)]);
-await Promise.all(
-  Array.from(startupUsers, (name) => storeForUser({ name, method: "password" }))
-);
-server.listen(config.port, config.host, () => {
+if (config.authModes.includes("none")) startupUsers.add("local");
+await listenBeforeBootstrap(server, config.port, config.host, async () => {
   console.log(`terminal-web-monitor listening on http://${config.host}:${config.port}`);
   console.log(`data dir: ${config.dataDir}`);
   console.log(`auth modes: ${authConfig().methods.join(", ")}`);
+  await Promise.all(
+    Array.from(startupUsers, (name) => storeForUser({ name, method: "password" }))
+  );
+  // Recover durable Task Mode queues even when no browser is connected.
+  await Promise.all(Array.from(startupUsers, name => taskModeServiceForUser({ name, method: "password" }).catch(error => console.error("Task Mode recovery failed", error))));
 });
 
 let shutdownStarted = false;
@@ -691,11 +790,18 @@ async function shutdown(signal: string) {
     return;
   }
   shutdownStarted = true;
+  // Settle processing clocks before waiting on long-lived HTTP/SSE connections.
+  await Promise.allSettled(Array.from(taskModeServices.values()).map(async service => (await service).close()));
   console.log(`received ${signal}; saving zellij sessions before shutdown`);
   await saveKnownZellijSessions().catch((error) => {
     console.error("Failed to save zellij sessions during shutdown", error);
   });
-  server.close(() => {
+  server.close(async () => {
+    await Promise.allSettled(Array.from(requirementDraftServices.values()).map(async service => (await service).close()));
+    await Promise.allSettled(Array.from(taskModeServices.values()).map(async service => (await service).close()));
+    for (const service of taskConversationServices.values()) {
+      service.close();
+    }
     for (const store of taskStores.values()) {
       store.close();
     }
@@ -737,24 +843,8 @@ function queueStoreSessionRestore(store: SessionStore) {
 async function restoreActiveSessions(store: SessionStore) {
   const sessions = (await store.all()).filter((session) => !session.archived);
   const preferences = await store.preferences();
-  const exitedZellijSessions = new Set(await listExitedZellijSessions().catch(() => []));
   for (const session of sessions) {
     try {
-      if (
-        (await resolveBackend(session)) === "zellij" &&
-        exitedZellijSessions.has(session.tmuxName)
-      ) {
-        const latest = await store.get(session.id);
-        if (
-          latest &&
-          !latest.archived &&
-          (await hasExitedZellijSession(latest.tmuxName))
-        ) {
-          await store.markStopped(latest.id);
-          console.log(`Archived stopped Zellij session ${latest.id} instead of resurrecting it`);
-        }
-        continue;
-      }
       await ensureSession(session, store.dataDir, preferences);
     } catch (error) {
       console.error(`Failed to restore session ${session.id}`, error);
@@ -1538,6 +1628,18 @@ function nextCopyName(name: string, existingNames: string[]): string {
   }
 
   return `${base} ${Date.now()}`;
+}
+
+function taskIdFromMountedTaskPath(value: string): string | undefined {
+  const segment = value.split("/").filter(Boolean)[0];
+  if (!segment || segment === "projects") {
+    return undefined;
+  }
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return undefined;
+  }
 }
 
 function currentProcessUser() {

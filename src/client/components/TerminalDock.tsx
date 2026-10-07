@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from "re
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { io, type Socket } from "socket.io-client";
 import { ArrowDownToLine, Check, Clipboard, ClipboardPaste, History, RefreshCw, RotateCw, X } from "lucide-react";
 import type { TerminalSession } from "../../shared/types";
@@ -34,7 +35,7 @@ interface Props {
 const MOBILE_QUERY = "(max-width: 720px)";
 const ZELLIJ_WEB_COLS = 120;
 const ZELLIJ_WEB_ROWS = 36;
-const TERMINAL_SCROLLBACK_ROWS = 200_000;
+const TERMINAL_SCROLLBACK_ROWS = 20_000;
 const TERMINAL_INPUT_BATCH_MS = 12;
 const TERMINAL_WRITE_CHUNK_CHARS = 8192;
 const TERMINAL_HISTORY_RETAINED_LINES = 100_000;
@@ -43,6 +44,7 @@ const TERMINAL_HISTORY_OVERSCAN_ROWS = 18;
 const TERMINAL_HISTORY_INITIAL_RENDER_ROWS = 120;
 const TERMINAL_OPAQUE_BACKGROUND = "#111614";
 const TERMINAL_IMAGE_BACKGROUND = "rgba(17, 22, 20, 0.68)";
+const TERMINAL_SELECTION_COPY_GRACE_MS = 60_000;
 
 type LatestHistoryStatus = "waiting" | "loading" | "ready" | "error";
 type OlderHistoryStatus = "idle" | "loading" | "ready" | "exhausted" | "error";
@@ -88,10 +90,51 @@ function terminalBackgroundColor(hasBackgroundImage: boolean): string {
   return hasBackgroundImage ? TERMINAL_IMAGE_BACKGROUND : TERMINAL_OPAQUE_BACKGROUND;
 }
 
+function openTerminalWebLink(event: MouseEvent, uri: string): void {
+  if (event.button !== 0 || (!event.ctrlKey && !event.metaKey)) {
+    return;
+  }
+  try {
+    const url = new URL(uri);
+    if (url.protocol === "http:" || url.protocol === "https:") {
+      window.open(url.href, "_blank", "noopener,noreferrer");
+    }
+  } catch {
+    // Ignore malformed links from terminal output.
+  }
+}
+
+function terminalUrlAtPointer(event: MouseEvent): string | null {
+  const target = event.target;
+  if (!(target instanceof HTMLElement) || !target.closest(".xterm-rows")) {
+    return null;
+  }
+  const textNode = target.firstChild;
+  if (!(textNode instanceof Text)) {
+    return null;
+  }
+  const text = textNode.textContent ?? "";
+  for (const match of text.matchAll(/https?:\/\/[^\s"'<>]+/gi)) {
+    const uri = match[0].replace(/[),.!?\]}]+$/, "");
+    const range = document.createRange();
+    range.setStart(textNode, match.index);
+    range.setEnd(textNode, match.index + uri.length);
+    const bounds = range.getBoundingClientRect();
+    if (
+      event.clientX >= bounds.left && event.clientX <= bounds.right &&
+      event.clientY >= bounds.top && event.clientY <= bounds.bottom
+    ) {
+      return uri;
+    }
+  }
+  return null;
+}
+
 export function TerminalDock({ session, backgroundImage, visible, onClose, onRestart, restarting }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const historyScrollRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const lastSelectionRef = useRef<{ text: string; capturedAt: number }>({ text: "", capturedAt: 0 });
   const fitRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const clientIdRef = useRef(makeTerminalClientId(session.id));
@@ -155,8 +198,11 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
   } as CSSProperties;
 
   const updateWriteQueueBytes = useCallback((delta: number) => {
+    const previous = writeQueueBytesRef.current;
     writeQueueBytesRef.current = Math.max(0, writeQueueBytesRef.current + delta);
-    setWriteQueueBytes(writeQueueBytesRef.current);
+    if (previous >= 64 * 1024 || writeQueueBytesRef.current >= 64 * 1024) {
+      setWriteQueueBytes(writeQueueBytesRef.current);
+    }
   }, []);
 
   const updateHistoryVirtualRange = useCallback(() => {
@@ -359,8 +405,10 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
 
   const copyTerminalSelection = useCallback(async () => {
     const terminal = termRef.current;
-    const selectedText = terminal?.getSelection() ?? "";
-    if (!selectedText.trim()) {
+    const recentSelection = lastSelectionRef.current;
+    const selectedText = terminal?.getSelection() ||
+      (Date.now() - recentSelection.capturedAt < TERMINAL_SELECTION_COPY_GRACE_MS ? recentSelection.text : "");
+    if (!selectedText) {
       terminal?.focus();
       return;
     }
@@ -653,6 +701,7 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
 
   useEffect(() => {
     if (!visible) {
+      lastSelectionRef.current = { text: "", capturedAt: 0 };
       const active = document.activeElement;
       if (active instanceof HTMLElement && hostRef.current?.contains(active)) {
         active.blur();
@@ -700,10 +749,21 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
     };
     host.addEventListener("paste", handlePaste, true);
 
+    let hoveredLinkUri: string | null = null;
+    let linkMouseDown: { uri: string; x: number; y: number } | null = null;
+    const handleLinkHover = (_event: MouseEvent, uri: string) => {
+      hoveredLinkUri = uri;
+      host.title = "Ctrl/Cmd+单击，在新标签页打开链接";
+    };
+    const handleLinkLeave = () => {
+      hoveredLinkUri = null;
+      host.removeAttribute("title");
+    };
     const terminal = new Terminal({
       cursorBlink: true,
       allowTransparency: true,
       allowProposedApi: true,
+      linkHandler: { activate: openTerminalWebLink, hover: handleLinkHover, leave: handleLinkLeave },
       rescaleOverlappingGlyphs: true,
       windowsMode: true,
       fontFamily:
@@ -722,10 +782,70 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
     const unicode11 = new Unicode11Addon();
     terminal.loadAddon(fit);
     terminal.loadAddon(unicode11);
+    terminal.loadAddon(new WebLinksAddon(openTerminalWebLink, {
+      hover: handleLinkHover,
+      leave: handleLinkLeave
+    }));
     terminal.unicode.activeVersion = "11";
     terminal.open(host);
     termRef.current = terminal;
     fitRef.current = fit;
+    const rememberSelection = () => {
+      const text = terminal.getSelection();
+      if (text) {
+        lastSelectionRef.current = { text, capturedAt: Date.now() };
+      }
+    };
+    const selectionDisposable = terminal.onSelectionChange(rememberSelection);
+    const handleMouseDown = (event: MouseEvent) => {
+      if (event.button === 0 && !event.shiftKey) {
+        lastSelectionRef.current = { text: "", capturedAt: 0 };
+        const uri = (event.ctrlKey || event.metaKey) && (hoveredLinkUri || terminalUrlAtPointer(event));
+        linkMouseDown = uri
+          ? { uri, x: event.clientX, y: event.clientY }
+          : null;
+        if (linkMouseDown) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+      } else if (event.button === 2 && (terminal.hasSelection() || lastSelectionRef.current.text)) {
+        event.stopPropagation();
+      }
+    };
+    const handleMouseUp = (event: MouseEvent) => {
+      if (event.button === 0) {
+        if (linkMouseDown) {
+          event.preventDefault();
+          event.stopPropagation();
+          if (
+            (event.ctrlKey || event.metaKey) &&
+            Math.hypot(event.clientX - linkMouseDown.x, event.clientY - linkMouseDown.y) < 5
+          ) {
+            openTerminalWebLink(event, linkMouseDown.uri);
+          }
+        }
+        linkMouseDown = null;
+        rememberSelection();
+      } else if (event.button === 2 && (terminal.hasSelection() || lastSelectionRef.current.text)) {
+        event.stopPropagation();
+      }
+    };
+    const handleContextMenu = (event: MouseEvent) => {
+      const recentSelection = lastSelectionRef.current;
+      const selectedText = terminal.getSelection() ||
+        (Date.now() - recentSelection.capturedAt < TERMINAL_SELECTION_COPY_GRACE_MS ? recentSelection.text : "");
+      if (!selectedText) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      void writeClipboardText(selectedText).then(markCopied).catch((error) => {
+        setStatus(error instanceof Error ? error.message : String(error));
+      });
+    };
+    host.addEventListener("mousedown", handleMouseDown, true);
+    host.addEventListener("mouseup", handleMouseUp, true);
+    host.addEventListener("contextmenu", handleContextMenu, true);
     refitTerminal(true);
     terminal.clear();
     terminal.refresh(0, terminal.rows - 1);
@@ -862,10 +982,11 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
         setNewOutputAvailable(true);
       }
       setStatus("live");
-      setHistoryMeta((current) => ({
-        ...current,
-        latest: receivedHistoryInitRef.current ? current.latest : "ready"
-      }));
+      setHistoryMeta((current) =>
+        receivedHistoryInitRef.current || current.latest === "ready"
+          ? current
+          : { ...current, latest: "ready" }
+      );
       enqueueTerminalWrite(terminal, frame.data, {
         kind: "live",
         seq: frame.seq,
@@ -1027,6 +1148,7 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
       window.visualViewport?.removeEventListener("resize", scheduleResize);
       window.clearInterval(sizeTimer);
       disposable.dispose();
+      selectionDisposable.dispose();
       resizeDisposable.dispose();
       scrollDisposable.dispose();
       flushTerminalInput();
@@ -1042,12 +1164,16 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
       writeQueueBytesRef.current = 0;
       writeInProgressRef.current = false;
       socket.disconnect();
+      host.removeEventListener("mousedown", handleMouseDown, true);
+      host.removeEventListener("mouseup", handleMouseUp, true);
+      host.removeEventListener("contextmenu", handleContextMenu, true);
       terminal.dispose();
       if (socketRef.current === socket) {
         socketRef.current = null;
       }
       if (termRef.current === terminal) {
         termRef.current = null;
+        lastSelectionRef.current = { text: "", capturedAt: 0 };
       }
       if (fitRef.current === fit) {
         fitRef.current = null;
@@ -1058,6 +1184,7 @@ export function TerminalDock({ session, backgroundImage, visible, onClose, onRes
     flushTerminalInput,
     isMobileClient,
     pasteFilesToTerminal,
+    markCopied,
     refitTerminal,
     requestOlderHistory,
     recordOlderHistoryLines,

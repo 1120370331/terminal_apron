@@ -2,6 +2,8 @@ node_modules/
 dist/
 data/
 .local-test-data/
+.local-diagnostic/
+.local-diagnostic-absolute/
 .local-test-server.pid
 tools/
 .search-index/

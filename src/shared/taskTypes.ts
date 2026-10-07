@@ -9,11 +9,14 @@ export const TASK_STATUSES = [
 
 export const TASK_PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 
+export const TASK_RELEASE_STATUSES = ["not_released", "local_complete", "production_complete"] as const;
+
 export const TASK_REPORT_STATUSES = ["started", "progress", "blocked", "completed", "note"] as const;
 
 export const TASK_VERIFICATION_RESULTS = ["passed", "failed", "not_run"] as const;
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
+export type TaskReleaseStatus = (typeof TASK_RELEASE_STATUSES)[number];
 export type TaskPriority = (typeof TASK_PRIORITIES)[number];
 export type TaskDifficulty = 1 | 2 | 3 | 4 | 5;
 export type TaskReportStatus = (typeof TASK_REPORT_STATUSES)[number];
@@ -46,20 +49,39 @@ export interface TaskAttachment {
   size: number;
   createdAt: string;
   url: string;
+  /** Missing on legacy clients means user input. */
+  source?: "input" | "feedback";
+  /** Display-only availability of historical feedback; never changes a sent snapshot. */
+  deleted?: boolean;
+  previewUrl?: string;
+  previewFormat?: "html" | "markdown";
+}
+
+export interface TaskRelationSummary {
+  id: string;
+  key: string;
+  title: string;
+  status?: TaskStatus;
 }
 
 export interface TaskItem {
   id: string;
   key: string;
+  parentTaskId?: string;
+  parentTask?: TaskRelationSummary;
+  subtasks: TaskRelationSummary[];
   project: string;
+  group: string;
   title: string;
   descriptionMd: string;
   acceptanceCriteriaMd: string;
   status: TaskStatus;
+  releaseStatus: TaskReleaseStatus;
   priority: TaskPriority;
   difficulty: TaskDifficulty;
   tags: string[];
   repositoryPath: string;
+  contextDirectory: string;
   maxConcurrency: number;
   revision: number;
   archived: boolean;
@@ -86,6 +108,7 @@ export interface TaskListResponse {
 
 export interface TaskProjectSummary {
   name: string;
+  descriptionMd: string;
   rootDirectory: string;
   taskCount: number;
   createdAt: string;
@@ -95,24 +118,51 @@ export interface TaskProjectSummary {
 export interface TaskProjectListResponse {
   projects: TaskProjectSummary[];
   unassignedCount: number;
+  supportsDescription?: boolean;
+}
+
+export interface TaskGroupSummary {
+  name: string;
+  taskCount: number;
+}
+
+export interface TaskGroupListResponse {
+  groups: TaskGroupSummary[];
+  ungroupedCount: number;
+}
+
+export interface TaskTagSummary {
+  name: string;
+  taskCount: number;
+  builtin?: boolean;
+}
+
+export interface TaskTagListResponse {
+  tags: TaskTagSummary[];
+  project?: string;
 }
 
 export interface CreateTaskProjectInput {
   name: string;
+  descriptionMd?: string;
   rootDirectory: string;
 }
 
 export interface UpdateTaskProjectInput {
   name?: string;
+  descriptionMd?: string;
   rootDirectory?: string;
 }
 
 export interface CreateTaskInput {
   title: string;
+  parentTaskId?: string | null;
   project?: string;
+  group?: string;
   descriptionMd?: string;
   acceptanceCriteriaMd?: string;
   status?: TaskStatus;
+  releaseStatus?: TaskReleaseStatus;
   priority?: TaskPriority;
   difficulty?: TaskDifficulty;
   tags?: string[];
@@ -134,6 +184,7 @@ export interface CreateTaskReportInput {
   blockers?: string[];
   nextStep?: string;
   taskStatus?: TaskStatus;
+  releaseStatus?: TaskReleaseStatus;
 }
 
 export interface TaskReportListResponse {
@@ -143,4 +194,15 @@ export interface TaskReportListResponse {
 export interface TaskAttachmentUploadResponse {
   attachments: TaskAttachment[];
   task: TaskItem;
+}
+
+export interface TaskTerminalContextResponse {
+  task: TaskItem;
+  cwd: string;
+}
+
+export interface DeleteTaskResponse {
+  ok: true;
+  taskId: string;
+  unlinkedTerminalCount: number;
 }

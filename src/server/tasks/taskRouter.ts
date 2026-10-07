@@ -10,14 +10,32 @@ import type {
   CreateTaskInput,
   TaskAttachment,
   TaskAttachmentUploadResponse,
+  TaskReleaseStatus,
   TaskStatus,
   UpdateTaskInput,
   UpdateTaskProjectInput
 } from "../../shared/taskTypes.js";
-import { TaskConflictError, TaskStore, TaskValidationError } from "./taskStore.js";
+import { selectTaskTerminalCwd } from "./taskTerminalContext.js";
+import { taskArtifactFormat, TASK_HTML_PREVIEW_POLICY } from "../../shared/taskArtifactTypes.js";
+import { TaskConflictError, TaskConversationConflictError, TaskStore, TaskValidationError } from "./taskStore.js";
+import { TaskConversationServiceError } from "./taskConversationService.js";
 
 const MAX_SCREENSHOT_FILES = 8;
 const MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024;
+
+// Legacy feedback attachments stored a display title instead of a filename.
+// Retain genuine filenames; recover a missing suffix from the stored file.
+export function attachmentDelivery(name: string, storedFilename: string, mimeType: string, download = false) {
+  const extension = path.extname(storedFilename).toLowerCase();
+  const safeExtension = /^\.[a-z0-9]{1,12}$/.test(extension) ? extension : ".bin";
+  const basename = path.win32.basename(path.posix.basename(name)).replace(/[\x00-\x1f\x7f<>:"|?*]/g, "_").replace(/[. ]+$/, "").trim() || "attachment";
+  const filename = basename.toLowerCase().endsWith(safeExtension) ? basename : basename + safeExtension;
+  const knownTypes: Record<string, string> = { ".html": "text/html", ".htm": "text/html", ".md": "text/markdown", ".markdown": "text/markdown", ".txt": "text/plain", ".pdf": "application/pdf", ".json": "application/json", ".csv": "text/csv", ".zip": "application/zip", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation" };
+  const contentType = mimeType.split(";")[0].trim().toLowerCase() === "application/octet-stream" ? knownTypes[extension] ?? mimeType : mimeType;
+  const inline = !download && ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(mimeType);
+  const encoded = encodeURIComponent(filename).replace(/['()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+  return { filename, contentType, disposition: `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encoded}` };
+}
 
 const uploadScreenshots = multer({
   storage: multer.memoryStorage(),
@@ -28,8 +46,18 @@ const uploadScreenshots = multer({
 }).array("files", MAX_SCREENSHOT_FILES);
 
 export type TaskStoreProvider = (user: AuthUser) => Promise<TaskStore>;
+export interface TaskTerminalLinkStore {
+  unlinkTask(taskId: string): Promise<number>;
+}
+export type SessionStoreProvider = (user: AuthUser) => Promise<TaskTerminalLinkStore>;
+export interface TaskConversationLifecycleService { prepareTaskDeletion(taskId: string): Promise<void>; prepareTaskArchive(taskId:string):Promise<void> }
+export type TaskConversationLifecycleProvider = (user: AuthUser) => Promise<TaskConversationLifecycleService>;
 
-export function createTaskRouter(storeForUser: TaskStoreProvider): Router {
+export function createTaskRouter(
+  storeForUser: TaskStoreProvider,
+  sessionStoreForUser?: SessionStoreProvider,
+  conversationServiceForUser?: TaskConversationLifecycleProvider
+): Router {
   const router = Router();
 
   router.get(
@@ -40,7 +68,17 @@ export function createTaskRouter(storeForUser: TaskStoreProvider): Router {
         store.list({
           query: typeof req.query.q === "string" ? req.query.q : undefined,
           status: typeof req.query.status === "string" ? (req.query.status as TaskStatus) : undefined,
+          releaseStatus:
+            typeof req.query.releaseStatus === "string"
+              ? (req.query.releaseStatus as TaskReleaseStatus)
+              : undefined,
           project: typeof req.query.project === "string" ? req.query.project : undefined,
+          group: typeof req.query.group === "string" ? req.query.group : undefined,
+          tags: Array.isArray(req.query.tag)
+            ? req.query.tag.filter((tag): tag is string => typeof tag === "string")
+            : typeof req.query.tag === "string"
+              ? [req.query.tag]
+              : undefined,
           archived: req.query.archived === "true"
         })
       );
@@ -93,6 +131,27 @@ export function createTaskRouter(storeForUser: TaskStoreProvider): Router {
     })
   );
 
+  router.get(
+    "/groups",
+    asyncRoute(async (req, res) => {
+      const store = await requestStore(res, storeForUser);
+      res.json(store.groups(req.query.archived === "true"));
+    })
+  );
+
+  router.get(
+    "/tags",
+    asyncRoute(async (req, res) => {
+      const store = await requestStore(res, storeForUser);
+      res.json(store.tags(req.query.archived === "true",typeof req.query.project==="string"?req.query.project:undefined,req.query.catalog==="true"));
+    })
+  );
+
+  router.patch("/:id/tags",asyncRoute(async(req,res)=>{
+    const store=await requestStore(res,storeForUser);const task=store.updateTags(routeParam(req,"id"),req.body??{});
+    if(!task){res.status(404).json({error:"task not found"});return;}res.json(task);
+  }));
+
   router.post(
     "/projects",
     asyncRoute(async (req, res) => {
@@ -135,6 +194,32 @@ export function createTaskRouter(storeForUser: TaskStoreProvider): Router {
     })
   );
 
+  router.post(
+    "/:id/context/refresh",
+    asyncRoute(async (req, res) => {
+      const store = await requestStore(res, storeForUser);
+      const task = store.refreshContext(routeParam(req, "id"));
+      if (!task) {
+        res.status(404).json({ error: "task not found" });
+        return;
+      }
+      res.json(task);
+    })
+  );
+
+  router.post(
+    "/:id/terminal-context",
+    asyncRoute(async (req, res) => {
+      const store = await requestStore(res, storeForUser);
+      const task = store.refreshContext(routeParam(req, "id"));
+      if (!task) {
+        res.status(404).json({ error: "task not found" });
+        return;
+      }
+      res.json({ task, cwd: selectTaskTerminalCwd(task) });
+    })
+  );
+
   router.patch(
     "/:id",
     asyncRoute(async (req, res) => {
@@ -151,7 +236,11 @@ export function createTaskRouter(storeForUser: TaskStoreProvider): Router {
   router.post(
     "/:id/archive",
     asyncRoute(async (req, res) => {
+      const user = res.locals.user as AuthUser;
       const store = await requestStore(res, storeForUser);
+      if (conversationServiceForUser) {
+        await (await conversationServiceForUser(user)).prepareTaskArchive(routeParam(req, "id"));
+      }
       const task = store.archive(routeParam(req, "id"));
       if (!task) {
         res.status(404).json({ error: "task not found" });
@@ -171,6 +260,47 @@ export function createTaskRouter(storeForUser: TaskStoreProvider): Router {
         return;
       }
       res.json(task);
+    })
+  );
+
+  router.delete(
+    "/:id",
+    asyncRoute(async (req, res) => {
+      const user = res.locals.user as AuthUser;
+      const store = await storeForUser(user);
+      if (conversationServiceForUser) {
+        await (await conversationServiceForUser(user)).prepareTaskDeletion(routeParam(req, "id"));
+      }
+      const removed = store.delete(routeParam(req, "id"));
+      if (!removed) {
+        res.status(404).json({ error: "task not found" });
+        return;
+      }
+
+      let unlinkedTerminalCount = 0;
+      let terminalUnlinkError: unknown;
+      if (sessionStoreForUser) {
+        try {
+          unlinkedTerminalCount = await (await sessionStoreForUser(user)).unlinkTask(removed.id);
+        } catch (error) {
+          terminalUnlinkError = error;
+          console.error(`Failed to unlink terminals for deleted task ${removed.id}`, error);
+        }
+      }
+      await Promise.all([
+        fs.promises.rm(removed.attachmentDirectory, { recursive: true, force: true }),
+        fs.promises.rm(removed.contextDirectory, { recursive: true, force: true })
+      ]);
+      if (removed.parentTaskId) {
+        store.refreshContext(removed.parentTaskId);
+      }
+      if (terminalUnlinkError) {
+        res.status(500).json({
+          error: "task was deleted, but associated terminals could not be unlinked; refresh before retrying"
+        });
+        return;
+      }
+      res.json({ ok: true, taskId: removed.id, unlinkedTerminalCount });
     })
   );
 
@@ -219,12 +349,30 @@ export function createTaskRouter(storeForUser: TaskStoreProvider): Router {
         res.status(404).json({ error: "attachment not found" });
         return;
       }
-      res.setHeader("Content-Type", attachment.mimeType);
-      res.setHeader("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(attachment.name)}`);
-      res.setHeader("Cache-Control", "private, max-age=3600");
-      res.sendFile(attachment.filePath);
+      const root = fs.realpathSync(store.attachmentDirectory(attachment.taskId)), target = fs.realpathSync(attachment.filePath), relative = path.relative(root, target);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) { res.status(404).json({ error: "attachment not found" }); return; }
+      const delivery = attachmentDelivery(attachment.name, attachment.storageName, attachment.mimeType, req.query.download === "1");
+      res.setHeader("Content-Type", delivery.contentType);
+      res.setHeader("Content-Disposition", delivery.disposition);
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Cache-Control", "private, no-store");
+      res.sendFile(target);
     })
   );
+
+  router.get("/:id/attachments/:attachmentId/preview", asyncRoute(async (req, res) => {
+    const store = await requestStore(res, storeForUser);
+    const taskId = routeParam(req, "id"), attachment = store.attachment(taskId, routeParam(req, "attachmentId"));
+    if (!attachment || !fs.existsSync(attachment.filePath)) { res.status(404).json({ error: "材料不存在或已删除" }); return; }
+    const format = taskArtifactFormat(attachment.storageName, attachment.mimeType);
+    if (!format) { res.status(415).json({ error: "该材料不支持文档预览，请下载查看" }); return; }
+    const root = fs.realpathSync(store.attachmentDirectory(taskId)), target = fs.realpathSync(attachment.filePath), relative = path.relative(root, target);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) { res.status(404).json({ error: "材料不存在" }); return; }
+    if (fs.statSync(target).size > MAX_SCREENSHOT_BYTES) { res.status(413).json({ error: "预览文件不能超过 10 MB" }); return; }
+    res.set({ "Content-Type": format === "html" ? "text/html; charset=utf-8" : "text/plain; charset=utf-8", "Content-Disposition": "inline", "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" });
+    if (format === "html") res.set("Content-Security-Policy", `sandbox allow-scripts; ${TASK_HTML_PREVIEW_POLICY}; frame-ancestors 'self'`);
+    res.sendFile(target);
+  }));
 
   router.delete(
     "/:id/attachments/:attachmentId",
@@ -244,6 +392,14 @@ export function createTaskRouter(storeForUser: TaskStoreProvider): Router {
   );
 
   router.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (error instanceof TaskConversationServiceError) {
+      res.status(error.status).json({ error: { code: error.code, message: error.message, retryable: error.status >= 500, ...error.details } });
+      return;
+    }
+    if (error instanceof TaskConversationConflictError) {
+      res.status(409).json({ error: { code: error.code, message: error.message, retryable: false, ...error.details } });
+      return;
+    }
     if (error instanceof TaskValidationError) {
       res.status(400).json({ error: error.message });
       return;
@@ -324,7 +480,7 @@ async function handleScreenshotUpload(
   res.status(201).json(response);
 }
 
-function validateScreenshot(file: Express.Multer.File): {
+export function validateScreenshot(file: Express.Multer.File): {
   buffer: Buffer;
   extension: string;
   mimeType: string;

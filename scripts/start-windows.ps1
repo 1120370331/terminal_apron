@@ -1,7 +1,12 @@
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$EnvFile = Join-Path $ProjectRoot ".env"
+$ConfiguredEnvFile = $env:TWM_ENV_FILE
+$EnvFile = if ($ConfiguredEnvFile -and (Test-Path -LiteralPath $ConfiguredEnvFile)) {
+  (Resolve-Path -LiteralPath $ConfiguredEnvFile).Path
+} else {
+  Join-Path $ProjectRoot ".env"
+}
 $DataDir = Join-Path $ProjectRoot "data"
 $LogFile = Join-Path $DataDir "runtime.log"
 
@@ -22,6 +27,10 @@ if (Test-Path $EnvFile) {
       [Environment]::SetEnvironmentVariable($name, $value, "Process")
     }
   }
+}
+
+if ($env:TWM_ZELLIJ_BIN_OVERRIDE) {
+  $env:TWM_ZELLIJ_BIN = $env:TWM_ZELLIJ_BIN_OVERRIDE
 }
 
 if (-not $env:TWM_HOST) { $env:TWM_HOST = "127.0.0.1" }

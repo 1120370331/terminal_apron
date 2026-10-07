@@ -1,0 +1,28 @@
+.task-usage-badge { display:inline-flex; align-items:center; gap:5px; min-width:0; color:var(--tp-blue,#91bed0); font-size:12px; line-height:1.5; font-variant-numeric:tabular-nums; }
+.task-usage-badge svg { width:14px; height:14px; flex:none; }
+.task-usage-badge>span { white-space:nowrap; }
+.task-usage-badge small { color:var(--tp-muted,#8ba7b8); font-size:10px; white-space:nowrap; }
+.task-usage-pending { color:var(--tp-muted,#8ba7b8); font-size:11px; }
+#tp-task-mode .tp-task-card .task-usage-badge,#tp-task-mode .tp-task-row .task-usage-badge { display:flex; margin-top:5px; font-size:11px; }
+#tp-task-mode .tm-task-usage { min-width:0; border:1px solid var(--tp-line); border-radius:8px; background:var(--tp-bg); font-size:12px; }
+#tp-task-mode .tm-task-usage>summary { display:flex; align-items:center; flex-wrap:wrap; gap:9px; padding:10px 12px; cursor:pointer; }
+#tp-task-mode .tm-task-usage>summary>span:first-child { color:var(--tp-muted); }
+#tp-task-mode .task-usage-open-hint { margin-left:auto; color:var(--tp-muted); font-size:10px; }
+#tp-task-mode .task-usage-body { padding:0 13px 12px; }
+#tp-task-mode .task-usage-numbers { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border-top:1px solid var(--tp-line); border-bottom:1px solid var(--tp-line); padding:12px 0; gap:10px; }
+#tp-task-mode .task-usage-numbers span { display:block; color:var(--tp-muted); font-size:10px; }
+#tp-task-mode .task-usage-numbers strong { display:block; margin-top:4px; font:600 18px/1.3 Consolas,monospace; }
+#tp-task-mode .task-usage-note { margin:10px 0; color:var(--tp-muted); font-size:11px; line-height:1.7; }
+#tp-task-mode .task-usage-threads { display:grid; gap:6px; }
+#tp-task-mode .task-usage-threads>div { display:flex; align-items:center; justify-content:space-between; gap:10px; min-width:0; }
+#tp-task-mode .task-usage-threads>div>span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+#tp-task-mode .task-usage-rates-link { display:inline-block; margin-top:10px; font-size:11px; }
+#tp-task-mode .task-usage-updated { display:block; margin-top:8px; color:var(--tp-muted); font-size:10px; }
+#tp-task-mode .tm-conversation-toolbar { flex-wrap:wrap; }
+#tp-task-mode .tm-conversation-toolbar .task-usage-badge { flex-wrap:wrap; }
+#tp-task-mode .tm-conversation-thread .task-usage-badge { margin-top:3px; font-size:10px; }
+.task-conversation-usage { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:7px 14px; border-bottom:1px solid rgba(145,190,217,.14); font-size:11px; color:#8ba7b8; }
+@media(max-width:720px) {
+  #tp-task-mode .task-usage-numbers { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  #tp-task-mode .tm-task-usage>summary .task-usage-badge { flex-wrap:wrap; }
+}

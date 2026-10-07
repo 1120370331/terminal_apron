@@ -7,20 +7,22 @@ import { DirectoryPicker } from "./DirectoryPicker";
 interface Props {
   projects: TaskProjectSummary[];
   initialProjectName?: string;
+  startCreating?: boolean;
   onClose: () => void;
   onSaved: (project: TaskProjectSummary, previousName: string | null) => void;
 }
 
-export function ProjectEditor({ projects, initialProjectName, onClose, onSaved }: Props) {
+export function ProjectEditor({ projects, initialProjectName, startCreating = false, onClose, onSaved }: Props) {
   const initial = useMemo(
     () => projects.find((project) => project.name === initialProjectName) ?? projects[0] ?? null,
     [initialProjectName, projects]
   );
-  const [selectedName, setSelectedName] = useState<string | null>(initial?.name ?? null);
-  const [creating, setCreating] = useState(projects.length === 0);
+  const [selectedName, setSelectedName] = useState<string | null>(startCreating ? null : initial?.name ?? null);
+  const [creating, setCreating] = useState(startCreating || projects.length === 0);
   const selected = projects.find((project) => project.name === selectedName) ?? null;
-  const [name, setName] = useState(initial?.name ?? "");
-  const [rootDirectory, setRootDirectory] = useState(initial?.rootDirectory ?? "");
+  const [name, setName] = useState(startCreating ? "" : initial?.name ?? "");
+  const [descriptionMd, setDescriptionMd] = useState(startCreating ? "" : initial?.descriptionMd ?? "");
+  const [rootDirectory, setRootDirectory] = useState(startCreating ? "" : initial?.rootDirectory ?? "");
   const [directoryOpen, setDirectoryOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -28,10 +30,11 @@ export function ProjectEditor({ projects, initialProjectName, onClose, onSaved }
   useEffect(() => {
     if (!creating && selected) {
       setName(selected.name);
+      setDescriptionMd(selected.descriptionMd ?? "");
       setRootDirectory(selected.rootDirectory);
       setError("");
     }
-  }, [creating, selected?.name, selected?.rootDirectory]);
+  }, [creating, selected?.name, selected?.descriptionMd, selected?.rootDirectory]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -43,10 +46,11 @@ export function ProjectEditor({ projects, initialProjectName, onClose, onSaved }
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [directoryOpen, onClose]);
 
-  const startCreating = () => {
+  const beginCreation = () => {
     setCreating(true);
     setSelectedName(null);
     setName("");
+    setDescriptionMd("");
     setRootDirectory("");
     setError("");
   };
@@ -71,9 +75,15 @@ export function ProjectEditor({ projects, initialProjectName, onClose, onSaved }
     setBusy(true);
     setError("");
     try {
+      if (descriptionMd.trim()) {
+        const available = await taskApi.projects();
+        if (!available.supportsDescription) {
+          throw new Error("Apron 服务需要重启后才能保存项目说明。路径和任务资料不会被修改，请重启后重试。");
+        }
+      }
       const saved = creating
-        ? await taskApi.createProject({ name, rootDirectory })
-        : await taskApi.updateProject(selected!.name, { name, rootDirectory });
+        ? await taskApi.createProject({ name, descriptionMd, rootDirectory })
+        : await taskApi.updateProject(selected!.name, { name, descriptionMd, rootDirectory });
       onSaved(saved, creating ? null : selected!.name);
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "项目保存失败");
@@ -104,7 +114,7 @@ export function ProjectEditor({ projects, initialProjectName, onClose, onSaved }
 
         <div className="task-project-editor-body">
           <aside className="task-project-list">
-            <button className="task-project-new" type="button" onClick={startCreating}>
+            <button className="task-project-new" type="button" onClick={beginCreation}>
               <Plus size={16} />
               新建项目
             </button>
@@ -147,6 +157,18 @@ export function ProjectEditor({ projects, initialProjectName, onClose, onSaved }
                 onChange={(event) => setName(event.target.value)}
                 placeholder="例如：Terminal Apron"
               />
+            </label>
+
+            <label className="task-field">
+              <span>项目说明</span>
+              <textarea
+                value={descriptionMd}
+                onChange={(event) => setDescriptionMd(event.target.value)}
+                maxLength={10000}
+                rows={4}
+                placeholder="介绍项目目标、技术背景或约束（可选，支持 Markdown）"
+              />
+              <small>任务发送给代理时，会保存当时的项目说明。</small>
             </label>
 
             <label className="task-field">

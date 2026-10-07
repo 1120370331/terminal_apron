@@ -1,3 +1,4 @@
+import { createClientId } from "../clientId";
 import {
   Bold,
   CalendarClock,
@@ -34,6 +35,7 @@ interface Props {
   task: TaskItem | null;
   projects: TaskProjectSummary[];
   initialProject?: string;
+  initialGroup?: string;
   onManageProjects: () => void;
   onClose: () => void;
   onSaved: (task: TaskItem, options?: { close?: boolean }) => void;
@@ -54,10 +56,11 @@ const STATUS_LABELS: Record<TaskStatus, string> = {
   blocked: "阻塞"
 };
 
-export function TaskEditor({ task, projects, initialProject, onManageProjects, onClose, onSaved }: Props) {
+export function TaskEditor({ task, projects, initialProject, initialGroup, onManageProjects, onClose, onSaved }: Props) {
   const initialProjectRecord = projects.find((item) => item.name === (task?.project || initialProject));
   const [title, setTitle] = useState(task?.title ?? "");
   const [project, setProject] = useState(task?.project ?? initialProjectRecord?.name ?? "");
+  const [group, setGroup] = useState(task?.group ?? initialGroup ?? "");
   const [descriptionMd, setDescriptionMd] = useState(task?.descriptionMd ?? "");
   const [acceptanceCriteriaMd, setAcceptanceCriteriaMd] = useState(task?.acceptanceCriteriaMd ?? "");
   const [status, setStatus] = useState<TaskStatus>(task?.status ?? "not_started");
@@ -101,6 +104,7 @@ export function TaskEditor({ task, projects, initialProject, onManageProjects, o
     () => ({
       title,
       project,
+      group,
       descriptionMd,
       acceptanceCriteriaMd,
       status,
@@ -119,6 +123,7 @@ export function TaskEditor({ task, projects, initialProject, onManageProjects, o
       createdAt,
       descriptionMd,
       difficulty,
+      group,
       maxConcurrency,
       priority,
       project,
@@ -194,7 +199,7 @@ export function TaskEditor({ task, projects, initialProject, onManageProjects, o
     });
     const remaining = Math.max(0, 8 - pendingImages.length);
     const added = valid.slice(0, remaining).map((file) => ({
-      id: crypto.randomUUID(),
+      id: createClientId(),
       file,
       previewUrl: URL.createObjectURL(file)
     }));
@@ -259,7 +264,7 @@ export function TaskEditor({ task, projects, initialProject, onManageProjects, o
   };
 
   const deleteExistingAttachment = async (attachmentId: string) => {
-    if (!task || busy || !window.confirm("移除这张任务截图？")) {
+    if (!task || busy || !window.confirm("删除这个任务附件？已发送指示的快照会保留。")) {
       return;
     }
     setBusy(true);
@@ -277,7 +282,7 @@ export function TaskEditor({ task, projects, initialProject, onManageProjects, o
       }
       onSaved(saved, { close: false });
     } catch (deleteError) {
-      setError(deleteError instanceof Error ? deleteError.message : "截图移除失败");
+      setError(deleteError instanceof Error ? deleteError.message : "附件删除失败");
     } finally {
       setBusy(false);
     }
@@ -427,9 +432,9 @@ export function TaskEditor({ task, projects, initialProject, onManageProjects, o
               <div className="task-editor-image-grid">
                 {task?.attachments.map((attachment) => (
                   <figure key={attachment.id}>
-                    <img src={attachment.url} alt={attachment.name} />
-                    <figcaption title={attachment.name}>{attachment.name}</figcaption>
-                    <button type="button" onClick={() => void deleteExistingAttachment(attachment.id)} title="移除截图">
+                    {attachment.mimeType.startsWith("image/") ? <img src={attachment.url} alt={attachment.name} /> : <a href={attachment.previewUrl??attachment.url} target="_blank" rel="noreferrer">打开材料</a>}
+                    <figcaption title={attachment.name}>{attachment.source==="feedback"?"AI 反馈材料":"用户输入附件"} · {attachment.name}</figcaption>
+                    <button type="button" disabled={busy} onClick={() => void deleteExistingAttachment(attachment.id)} title="删除附件" aria-label={`删除附件 ${attachment.name}`}>
                       <Trash2 size={14} />
                     </button>
                   </figure>
@@ -487,6 +492,15 @@ export function TaskEditor({ task, projects, initialProject, onManageProjects, o
                     </option>
                   ))}
                 </select>
+              </label>
+              <label className="task-field">
+                <span>任务分组</span>
+                <input
+                  value={group}
+                  maxLength={80}
+                  onChange={(event) => setGroup(event.target.value)}
+                  placeholder="例如：本周发布"
+                />
               </label>
               <label className="task-field">
                 <span>优先级</span>

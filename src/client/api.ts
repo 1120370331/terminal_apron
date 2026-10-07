@@ -3,6 +3,7 @@ import type {
   AuthUser,
   BackgroundUploadResult,
   CreateSessionInput,
+  DirectoryBrowserResult,
   FileTransferListResponse,
   FileTransferUploadResponse,
   HealthStatus,
@@ -80,6 +81,10 @@ export const api = {
   health: () => request<HealthStatus>("/api/health"),
   systemMetrics: () => request<SystemMetrics>("/api/system/metrics"),
   preferences: () => request<UserPreferences>("/api/preferences"),
+  browseDirectory: (directoryPath?: string, signal?: AbortSignal) => {
+    const query = directoryPath ? `?path=${encodeURIComponent(directoryPath)}` : "";
+    return request<DirectoryBrowserResult>(`/api/filesystem/directories${query}`, { signal });
+  },
   updatePreferences: (input: Partial<UserPreferences>) =>
     request<UserPreferences>("/api/preferences", {
       method: "PATCH",

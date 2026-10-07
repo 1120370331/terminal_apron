@@ -50,7 +50,7 @@ const dataDir = path.resolve(process.env.TWM_DATA_DIR ?? path.join(process.cwd()
 const authorizedKeysFile = expandHome(
   process.env.TWM_AUTHORIZED_KEYS_FILE ?? path.join("~", ".ssh", "authorized_keys")
 );
-const zellijBin = resolveBinaryPath(process.env.TWM_ZELLIJ_BIN ?? "zellij");
+const zellijBin = resolveWindowsExecutablePath(resolveBinaryPath(process.env.TWM_ZELLIJ_BIN ?? "zellij"));
 const codexBin = resolveBinaryPath(process.env.TWM_CODEX_BIN ?? "codex");
 const adminUser = sanitizeUserName(process.env.TWM_ADMIN_USER ?? "admin", "admin");
 const configuredUsers = buildConfiguredUsers(dataDir, adminUser, authorizedKeysFile);
@@ -152,6 +152,28 @@ function resolveBinaryPath(value: string): string {
     return path.resolve(expanded);
   }
   return expanded;
+}
+
+function resolveWindowsExecutablePath(value: string): string {
+  if (process.platform !== "win32") {
+    return value;
+  }
+
+  const executable = value.toLowerCase().endsWith(".exe") ? value : `${value}.exe`;
+  const directories = path.isAbsolute(executable)
+    ? [""]
+    : (process.env.PATH ?? "").split(path.delimiter).map((directory) => directory.replace(/^"|"$/g, ""));
+  for (const directory of directories) {
+    const candidate = directory ? path.join(directory, executable) : executable;
+    try {
+      if (fs.statSync(candidate).isFile()) {
+        return path.resolve(candidate);
+      }
+    } catch {
+      // Keep searching PATH; the health endpoint reports a genuinely missing binary.
+    }
+  }
+  return value;
 }
 
 function buildConfiguredUsers(rootDataDir: string, legacyAdminUser: string, legacyAuthorizedKeysFile: string): ConfigUser[] {

@@ -49,7 +49,7 @@ interface PreviewSettings {
 
 const DEFAULT_PREVIEW_SETTINGS: PreviewSettings = {
   lines: 600,
-  refreshMs: 1_000,
+  refreshMs: 2_500,
   fontSize: 16,
   scale: 1,
   minHeight: 500
@@ -197,7 +197,7 @@ export function TaskTerminalPanel({
       previewInFlightRef.current.add(sessionId);
       try {
         const knownSignature = force ? "" : previewContentSignature(previewsRef.current[sessionId]);
-        const preview = await api.preview(sessionId, settings.lines, PREVIEW_MAX_CHARS, true, force, knownSignature);
+        const preview = await api.preview(sessionId, Math.min(settings.lines, 360), PREVIEW_MAX_CHARS, true, force, knownSignature);
         if (preview.unchanged) {
           return previewsRef.current[sessionId] ?? null;
         }
@@ -728,7 +728,7 @@ function terminalMonitorPreviewSettings(userName: string): PreviewSettings {
     const parsed = JSON.parse(stored) as Record<string, unknown>;
     return {
       lines: clampNumber(parsed.previewLines, 600, 20, 1_200),
-      refreshMs: clampNumber(parsed.previewRefreshMs, 1_000, 1_000, 30_000),
+      refreshMs: clampNumber(parsed.previewRefreshMs, 2_500, 2_500, 30_000),
       fontSize: clampNumber(parsed.listTerminalFontSize, 16, 12, 24),
       scale: clampNumber(parsed.listTerminalScale, 100, 80, 140) / 100,
       minHeight: clampNumber(parsed.previewMinHeight, 500, 160, 1_400)

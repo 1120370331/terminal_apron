@@ -1,0 +1,29 @@
+.ta-document-page { min-height:100dvh; background:var(--page-bg); color:var(--text); }
+.ta-document-header { display:flex; align-items:center; gap:20px; padding:18px 28px; background:var(--surface); border-bottom:1px solid var(--border); }
+.ta-document-heading { flex:1; min-width:0; }
+.ta-document-heading span { display:block; color:var(--text-muted); font-size:12px; overflow-wrap:anywhere; }
+.ta-document-heading h1 { margin:4px 0 0; color:var(--text-strong); font-size:19px; overflow-wrap:anywhere; }
+.ta-document-actions { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+.ta-document-button { display:inline-flex; align-items:center; justify-content:center; gap:6px; flex:none; min-height:44px; padding:8px 12px; color:var(--text); background:var(--surface); border:1px solid var(--border); border-radius:8px; text-decoration:none; cursor:pointer; font-size:13px; }
+.ta-document-button:hover { background:var(--hover-bg); border-color:var(--hover-border); }
+.ta-document-button svg { width:17px; height:17px; }
+.ta-document-markdown { max-width:1000px; margin:28px auto; padding:36px 48px; background:var(--surface); border:1px solid var(--border); border-radius:12px; line-height:1.8; overflow-wrap:anywhere; }
+.ta-document-markdown h1,.ta-document-markdown h2,.ta-document-markdown h3 { color:var(--text-strong); scroll-margin-top:20px; }
+.ta-document-markdown h2 { margin-top:32px; padding-bottom:8px; border-bottom:1px solid var(--border); font-size:21px; }
+.ta-document-markdown a { color:var(--accent); }
+.ta-document-markdown img { max-width:100%; height:auto; }
+.ta-document-markdown pre { padding:14px; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--surface-soft); border-radius:8px; }
+.ta-document-markdown table { display:block; max-width:100%; overflow:auto; border-collapse:collapse; }
+.ta-document-markdown th,.ta-document-markdown td { padding:8px 12px; border:1px solid var(--border); }
+.ta-document-html { display:block; width:100%; height:calc(100dvh - 102px); min-height:70dvh; border:0; background:#fff; }
+.ta-document-empty { display:flex; align-items:center; justify-content:center; gap:10px; padding:70px 24px; color:var(--text-muted); }
+@media(max-width:720px) {
+  .ta-document-header { flex-wrap:wrap; gap:12px; padding:14px; }
+  .ta-document-heading { flex-basis:calc(100% - 140px); }
+  .ta-document-heading h1 { font-size:16px; }
+  .ta-document-actions { width:100%; justify-content:flex-end; }
+  .ta-document-markdown { margin:12px; padding:20px; }
+  .ta-document-markdown h1 { font-size:23px; }
+  .ta-document-markdown h2 { font-size:19px; }
+  .ta-document-html { height:calc(100dvh - 160px); }
+}

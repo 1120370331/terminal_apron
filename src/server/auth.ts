@@ -16,7 +16,7 @@ interface Challenge {
 }
 
 const TOKEN_COOKIE = "twm_token";
-const TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+export const AUTH_TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const challenges = new Map<string, Challenge>();
 
 function secretPath(): string {
@@ -55,7 +55,7 @@ export async function createToken(user: AuthUser): Promise<string> {
   const payload = base64url(
     JSON.stringify({
       user,
-      exp: Date.now() + TOKEN_TTL_MS
+      exp: Date.now() + AUTH_TOKEN_TTL_MS
     })
   );
   const signature = crypto.createHmac("sha256", secret).update(payload).digest("base64url");
@@ -132,16 +132,20 @@ export function authConfig(): AuthConfig {
 
 export function setAuthCookie(res: Response, token: string): void {
   const parts = [
-    `${TOKEN_COOKIE}=${encodeURIComponent(token)}`,
+    taskMonitorCookieHeader(token),
     "Path=/",
     "HttpOnly",
     "SameSite=Lax",
-    `Max-Age=${TOKEN_TTL_MS / 1000}`
+    `Max-Age=${AUTH_TOKEN_TTL_MS / 1000}`
   ];
   if (config.cookieSecure) {
     parts.push("Secure");
   }
   res.setHeader("Set-Cookie", parts.join("; "));
+}
+
+export function taskMonitorCookieHeader(token: string): string {
+  return `${TOKEN_COOKIE}=${encodeURIComponent(token)}`;
 }
 
 export function clearAuthCookie(res: Response): void {

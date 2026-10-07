@@ -1,0 +1,295 @@
+.terminal-directory-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: var(--modal-backdrop);
+}
+
+.terminal-directory-backdrop .task-directory-panel {
+  display: flex;
+  width: min(860px, 100%);
+  height: min(650px, calc(100vh - 40px));
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.terminal-directory-backdrop .task-directory-header,
+.terminal-directory-backdrop .task-directory-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+}
+
+.terminal-directory-backdrop .task-directory-header {
+  border-bottom: 1px solid var(--border);
+}
+
+.terminal-directory-backdrop .task-directory-header > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--accent);
+}
+
+.terminal-directory-backdrop .task-directory-header strong,
+.terminal-directory-backdrop .task-directory-header small {
+  display: block;
+}
+
+.terminal-directory-backdrop .task-directory-header strong {
+  color: var(--text-strong);
+  font-size: 16px;
+}
+
+.terminal-directory-backdrop .task-directory-header small {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.terminal-directory-backdrop .task-directory-address {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.terminal-directory-backdrop .task-directory-address > label {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--accent);
+}
+
+.terminal-directory-backdrop .task-directory-address input {
+  min-width: 0;
+  height: 38px;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--control-text);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+}
+
+.terminal-directory-backdrop .task-directory-body {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  grid-template-columns: 170px minmax(0, 1fr);
+}
+
+.terminal-directory-backdrop .task-directory-locations {
+  overflow-y: auto;
+  padding: 12px 9px;
+  border-right: 1px solid var(--border);
+  background: var(--surface-soft);
+}
+
+.terminal-directory-backdrop .task-directory-locations > span {
+  display: block;
+  margin: 2px 8px 8px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.terminal-directory-backdrop .task-directory-locations button,
+.terminal-directory-backdrop .task-directory-item {
+  width: 100%;
+  min-height: 38px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.terminal-directory-backdrop .task-directory-locations button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  font-size: 13px;
+}
+
+.terminal-directory-backdrop .task-directory-locations button:hover,
+.terminal-directory-backdrop .task-directory-locations button.active,
+.terminal-directory-backdrop .task-directory-item:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.terminal-directory-backdrop .task-directory-content {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.terminal-directory-backdrop .task-directory-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 50px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.terminal-directory-backdrop .task-directory-breadcrumbs {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.terminal-directory-backdrop .task-directory-breadcrumbs > span {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-faint);
+}
+
+.terminal-directory-backdrop .task-directory-breadcrumbs button {
+  padding: 4px 5px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.terminal-directory-backdrop .task-directory-breadcrumbs button:hover {
+  color: var(--accent);
+}
+
+.terminal-directory-backdrop .task-directory-search {
+  display: flex;
+  width: 180px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-faint);
+}
+
+.terminal-directory-backdrop .task-directory-search input {
+  min-width: 0;
+  height: 32px;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--control-text);
+  font-size: 12px;
+}
+
+.terminal-directory-backdrop .task-directory-list {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.terminal-directory-backdrop .task-directory-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.terminal-directory-backdrop .task-directory-item span,
+.terminal-directory-backdrop .task-directory-footer code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-directory-backdrop .task-directory-message {
+  display: flex;
+  min-height: 100%;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.terminal-directory-backdrop .task-directory-message.error {
+  color: var(--form-error-text);
+}
+
+.terminal-directory-backdrop .task-directory-footer {
+  border-top: 1px solid var(--border);
+  background: var(--surface-soft);
+}
+
+.terminal-directory-backdrop .task-directory-footer code {
+  color: var(--path-text);
+  font-size: 12px;
+}
+
+.terminal-directory-backdrop .task-directory-footer > div {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+@media (max-width: 680px) {
+  .terminal-directory-backdrop {
+    padding: 8px;
+  }
+
+  .terminal-directory-backdrop .task-directory-panel {
+    height: calc(100vh - 16px);
+  }
+
+  .terminal-directory-backdrop .task-directory-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .terminal-directory-backdrop .task-directory-locations {
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 7px;
+  }
+
+  .terminal-directory-backdrop .task-directory-locations > span {
+    display: none;
+  }
+
+  .terminal-directory-backdrop .task-directory-locations button {
+    width: auto;
+    flex: 0 0 auto;
+  }
+
+  .terminal-directory-backdrop .task-directory-search {
+    width: 120px;
+  }
+}

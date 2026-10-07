@@ -17,7 +17,8 @@
   "risks": [],
   "blockers": [],
   "nextStep": "Add browser regression coverage",
-  "taskStatus": "in_progress"
+  "taskStatus": "in_progress",
+  "releaseStatus": "local_complete"
 }
 ```
 
@@ -30,6 +31,7 @@
 - `risks` and `blockers`: up to 20 concise entries each.
 - `nextStep`: the next executable action, maximum 2,000 characters.
 - `taskStatus`: optional TaskMonitor stage: `not_started`, `in_progress`, `pending_auto_acceptance`, `pending_manual_acceptance`, `done`, or `blocked`.
+- `releaseStatus`: optional independent release stage: `not_released`, `local_complete`, or `production_complete`.
 
 TaskMonitor applies safe defaults:
 
@@ -38,5 +40,7 @@ TaskMonitor applies safe defaults:
 - `completed` moves the task to `pending_auto_acceptance`, never directly to `done`.
 
 The report insert and task update occur in one SQLite transaction through the backend service.
+
+`releaseStatus` is never inferred from report or task status. Report `local_complete` only with observed local verification evidence, and `production_complete` only after observing the target production deployment succeed.
 
 For a human decision that is required before work can continue, use the CLI `confirm` command. It submits a `note` report without changing the discrete task stage and emits `TASK_MONITOR_STATE: needs_confirmation` in the Terminal output for the live monitor.

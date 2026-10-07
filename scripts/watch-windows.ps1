@@ -13,7 +13,7 @@ function Write-WatchLog {
 }
 
 function Get-ConfiguredPort {
-  $envFile = Join-Path $ProjectRoot ".env"
+  $envFile = Get-ConfiguredEnvFile
   if (Test-Path $envFile) {
     $line = Get-Content $envFile | Where-Object { $_ -match "^TWM_PORT=" } | Select-Object -First 1
     if ($line) {
@@ -27,7 +27,7 @@ function Get-ConfiguredPort {
 }
 
 function Get-ConfiguredHost {
-  $envFile = Join-Path $ProjectRoot ".env"
+  $envFile = Get-ConfiguredEnvFile
   if (Test-Path $envFile) {
     $line = Get-Content $envFile | Where-Object { $_ -match "^TWM_HOST=" } | Select-Object -First 1
     if ($line) {
@@ -43,6 +43,10 @@ function Get-ConfiguredHost {
 function Resolve-MonitorHost {
   param([string] $HostValue)
 
+  if ($HostValue -in @("0.0.0.0", "::")) {
+    return "127.0.0.1"
+  }
+
   if ($HostValue.ToLowerInvariant() -ne "tailscale") {
     return $HostValue
   }
@@ -57,6 +61,14 @@ function Resolve-MonitorHost {
   }
 
   return "127.0.0.1"
+}
+
+function Get-ConfiguredEnvFile {
+  $configured = $env:TWM_ENV_FILE
+  if ($configured -and (Test-Path -LiteralPath $configured)) {
+    return (Resolve-Path -LiteralPath $configured).Path
+  }
+  return Join-Path $ProjectRoot ".env"
 }
 
 function Test-Health {

@@ -979,7 +979,7 @@ select {
 .terminal-preview-canvas {
   display: block;
   flex: 0 0 auto;
-  margin-top: auto;
+  margin-top: 0;
   max-width: none;
   transform-origin: top left;
 }
@@ -1202,6 +1202,35 @@ select {
 .editor label,
 .modal-actions {
   margin: 0 16px;
+}
+
+.editor-directory-field {
+  display: grid;
+  gap: 6px;
+  margin: 0 16px;
+}
+
+.editor-directory-field > label {
+  margin: 0;
+}
+
+.editor-directory-input {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.editor-directory-input input {
+  min-width: 0;
+  flex: 1;
+}
+
+.editor-directory-input button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
 }
 
 .editor input,

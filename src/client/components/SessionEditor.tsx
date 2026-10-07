@@ -1,7 +1,8 @@
-import { X } from "lucide-react";
+import { FolderOpen, X } from "lucide-react";
 import { FormEvent, useState } from "react";
 import type { CreateSessionInput, TerminalBackgroundMode, TerminalSession } from "../../shared/types";
 import { BackgroundImagePicker } from "./BackgroundImagePicker";
+import { DirectoryPicker } from "../task-monitor/DirectoryPicker";
 
 interface Props {
   session: TerminalSession | null;
@@ -37,6 +38,7 @@ export function SessionEditor({
     session?.backgroundImage ?? defaults?.backgroundImage ?? null
   );
   const [busy, setBusy] = useState(false);
+  const [directoryOpen, setDirectoryOpen] = useState(false);
   const [error, setError] = useState("");
 
   const submit = async (event: FormEvent) => {
@@ -94,10 +96,21 @@ export function SessionEditor({
           标签
           <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="project, codex" />
         </label>
-        <label>
-          路径
-          <input value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="/home/me/project" />
-        </label>
+        <div className="editor-directory-field">
+          <label htmlFor="terminal-working-directory">路径</label>
+          <div className="editor-directory-input">
+            <input
+              id="terminal-working-directory"
+              value={cwd}
+              onChange={(event) => setCwd(event.target.value)}
+              placeholder="选择或输入终端工作目录"
+            />
+            <button className="secondary-button" type="button" onClick={() => setDirectoryOpen(true)} disabled={busy}>
+              <FolderOpen size={16} />
+              选择文件夹
+            </button>
+          </div>
+        </div>
         <label>
           Shell
           <input value={shell} onChange={(event) => setShell(event.target.value)} placeholder="bash / zsh / pwsh" />
@@ -140,6 +153,19 @@ export function SessionEditor({
           </button>
         </footer>
       </form>
+      {directoryOpen && (
+        <DirectoryPicker
+          initialPath={cwd}
+          title="选择 terminal 工作目录"
+          description="terminal 将以这个文件夹作为工作目录"
+          terminalMode
+          onClose={() => setDirectoryOpen(false)}
+          onSelect={(selectedPath) => {
+            setCwd(selectedPath);
+            setDirectoryOpen(false);
+          }}
+        />
+      )}
     </div>
   );
 }

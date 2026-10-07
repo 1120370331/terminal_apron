@@ -37,6 +37,33 @@ test("persists optional task links and allows a terminal to be unlinked", async 
   }
 });
 
+test("unlinks a deleted task without archiving or removing its terminals", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-apron-session-store-"));
+  const taskId = "10a2aad4-9eaf-4458-9f0a-90b655be66c9";
+  try {
+    const store = new SessionStore(directory);
+    await store.init();
+    const linked = await store.create({
+      name: "TA-2 implementation",
+      taskId,
+      taskKey: "TA-2",
+      cwd: directory
+    });
+    const ordinary = await store.create({ name: "ordinary terminal", cwd: directory });
+
+    const count = await store.unlinkTask(taskId);
+
+    assert.equal(count, 1);
+    assert.equal((await store.get(linked.id))?.taskId, undefined);
+    assert.equal((await store.get(linked.id))?.taskKey, undefined);
+    assert.equal((await store.get(linked.id))?.archived, false);
+    assert.equal((await store.get(ordinary.id))?.name, ordinary.name);
+    assert.equal((await store.all()).length, 2);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("drops malformed task metadata while loading legacy session data", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-apron-session-store-"));
   try {

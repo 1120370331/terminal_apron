@@ -3,9 +3,13 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const baseUrl = (process.env.TASK_MONITOR_URL || "http://127.0.0.1:3131").replace(/\/+$/, "");
+const CREDENTIAL_FILE_NAME = ".task-monitor-credential.json";
+const configuredBaseUrl = (process.env.TASK_MONITOR_URL || "").trim();
+let baseUrl = (configuredBaseUrl || "http://127.0.0.1:3131").replace(/\/+$/, "");
 let sessionCookie = (process.env.TASK_MONITOR_COOKIE || "").trim();
+let credentialLoadPromise;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -28,9 +32,14 @@ async function main() {
     const status = option(parsed, "status");
     const query = option(parsed, "query");
     const project = option(parsed, "project");
+    const group = option(parsed, "group");
+    const releaseStatus = option(parsed, "release-status");
     if (status) params.set("status", status);
     if (query) params.set("q", query);
     if (project !== undefined) params.set("project", project);
+    if (group !== undefined) params.set("group", group);
+    if (releaseStatus !== undefined) params.set("releaseStatus", releaseStatus);
+    for (const tag of options(parsed, "tag")) params.append("tag", tag);
     if (flag(parsed, "archived")) params.set("archived", "true");
     const suffix = params.size ? `?${params}` : "";
     print(await request(`/api/tasks${suffix}`));
@@ -43,17 +52,134 @@ async function main() {
     return;
   }
 
+  if (command === "groups" || command === "tags") {
+    const params=new URLSearchParams();if(flag(parsed,"archived"))params.set("archived","true");
+    if(command==="tags"){const project=option(parsed,"project");if(project!==undefined)params.set("project",project);if(project!==undefined||flag(parsed,"catalog"))params.set("catalog","true");}
+    const suffix=params.size?`?${params}`:"";
+    print(await request(`/api/tasks/${command}${suffix}`));
+    return;
+  }
+
+  if (command === "create-project") {
+    print(
+      await request("/api/tasks/projects", {
+        method: "POST",
+        body: JSON.stringify({
+          name: requiredOption(parsed, "name"),
+          rootDirectory: requiredOption(parsed, "root-directory")
+        })
+      })
+    );
+    return;
+  }
+
+  if (command === "update-project") {
+    const projectName = requiredPositional(parsed, "project name");
+    const input = compactObject({
+      name: option(parsed, "name"),
+      rootDirectory: option(parsed, "root-directory")
+    });
+    if (Object.keys(input).length === 0) {
+      throw new Error("update-project requires --name and/or --root-directory.");
+    }
+    print(
+      await request(`/api/tasks/projects/${encodeURIComponent(projectName)}`, {
+        method: "PATCH",
+        body: JSON.stringify(input)
+      })
+    );
+    return;
+  }
+
+  if (command === "create") {
+    const input = await taskInput(parsed, { requireTitle: true });
+    print(await request("/api/tasks", { method: "POST", body: JSON.stringify(input) }));
+    return;
+  }
+
   const taskReference = parsed.positionals[0] || process.env.TASK_MONITOR_TASK_ID;
   if (!taskReference) {
     throw new Error("A task UUID/key is required, or set TASK_MONITOR_TASK_ID.");
   }
   const task = await resolveTask(taskReference);
 
+  if (command === "show") {
+    print(task);
+    return;
+  }
+
+  if(command==="tag"){
+    const add=options(parsed,"add"),remove=options(parsed,"remove"),set=options(parsed,"set"),clear=flag(parsed,"clear");
+    if((set.length||clear)&&(add.length||remove.length))throw new Error("Use --set/--clear separately from --add/--remove.");
+    if(set.length&&clear)throw new Error("Use --set or --clear, not both.");
+    if(!add.length&&!remove.length&&!set.length&&!clear)throw new Error("tag requires --add, --remove, --set, or --clear.");
+    const input=set.length||clear?{tags:clear?[]:set,revision:integerOption(parsed,"revision")??task.revision}:{add,remove,...(integerOption(parsed,"revision")!==undefined?{revision:integerOption(parsed,"revision")}: {})};
+    const updated=await request(`/api/tasks/${encodeURIComponent(task.id)}/tags`,{method:"PATCH",body:JSON.stringify(input)});
+    print({taskId:updated.id,key:updated.key,project:updated.project,tags:updated.tags,revision:updated.revision});return;
+  }
+
+  if (command === "update") {
+    const input = await taskInput(parsed);
+    if (Object.keys(input).length === 0) {
+      throw new Error("update requires at least one task field option.");
+    }
+    input.revision = integerOption(parsed, "revision") ?? task.revision;
+    print(
+      await request(`/api/tasks/${encodeURIComponent(task.id)}`, {
+        method: "PATCH",
+        body: JSON.stringify(input)
+      })
+    );
+    return;
+  }
+
+  if (command === "archive" || command === "restore") {
+    print(await request(`/api/tasks/${encodeURIComponent(task.id)}/${command}`, { method: "POST" }));
+    return;
+  }
+
+  if (command === "delete") {
+    if (!flag(parsed, "yes")) {
+      throw new Error("delete permanently removes task reports, attachments, and its context workspace; repeat with --yes.");
+    }
+    print(await request(`/api/tasks/${encodeURIComponent(task.id)}`, { method: "DELETE" }));
+    return;
+  }
+
+  if (command === "attachments") {
+    print({ taskId: task.id, key: task.key, attachments: task.attachments ?? [] });
+    return;
+  }
+
+  if (command === "upload") {
+    const filePaths = options(parsed, "file");
+    if (filePaths.length === 0) throw new Error("upload requires at least one --file path.");
+    const form = new FormData();
+    for (const filePath of filePaths) {
+      const resolvedPath = path.resolve(filePath);
+      const file = await fs.readFile(resolvedPath);
+      const mimeType = imageMimeType(file);
+      if (!mimeType) throw new Error(`upload supports PNG, JPEG, WebP, and GIF only: ${resolvedPath}`);
+      form.append("files", new Blob([file], { type: mimeType }), path.basename(resolvedPath));
+    }
+    print(
+      await request(`/api/tasks/${encodeURIComponent(task.id)}/attachments`, {
+        method: "POST",
+        body: form
+      })
+    );
+    return;
+  }
+
   if (command === "context") {
+    const refreshedTask = await request(`/api/tasks/${encodeURIComponent(task.id)}/context/refresh`, { method: "POST" });
     const history = await request(`/api/tasks/${encodeURIComponent(task.id)}/reports?limit=50`);
-    const attachmentContext = await downloadTaskAttachments(task);
+    const attachmentContext = await downloadTaskAttachments(refreshedTask);
+    const workspaceArtifacts = await readWorkspaceArtifacts(refreshedTask.contextDirectory);
     print({
-      task: { ...task, attachments: attachmentContext.attachments },
+      task: { ...refreshedTask, attachments: attachmentContext.attachments },
+      contextDirectory: refreshedTask.contextDirectory,
+      workspaceArtifacts,
       attachmentDirectory: attachmentContext.directory,
       reports: history.reports
     });
@@ -90,6 +216,13 @@ async function main() {
   }
 
   const taskStatus = option(parsed, "task-status");
+  const releaseStatus = option(parsed, "release-status");
+  if (
+    releaseStatus !== undefined &&
+    !["not_released", "local_complete", "production_complete"].includes(releaseStatus)
+  ) {
+    throw new Error("--release-status must be not_released, local_complete, or production_complete.");
+  }
   const payload = {
     status,
     summary,
@@ -98,7 +231,8 @@ async function main() {
     risks: options(parsed, "risk"),
     blockers,
     nextStep: option(parsed, "next") || "",
-    ...(taskStatus === undefined ? {} : { taskStatus })
+    ...(taskStatus === undefined ? {} : { taskStatus }),
+    ...(releaseStatus === undefined ? {} : { releaseStatus })
   };
 
   const result = await request(`/api/tasks/${encodeURIComponent(task.id)}/reports`, {
@@ -113,6 +247,20 @@ async function main() {
   } else if (command === "complete") {
     printStateMarker("completed", summary);
   }
+}
+
+async function readWorkspaceArtifacts(directory) {
+  if (!directory) return null;
+  const artifacts = {};
+  for (const name of ["context.md", "task.md", "project.json", "reports.json", "attachments.json"]) {
+    const artifactPath = path.join(directory, name);
+    try {
+      artifacts[name] = { path: artifactPath, content: await fs.readFile(artifactPath, "utf8") };
+    } catch (error) {
+      artifacts[name] = { path: artifactPath, readError: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  return artifacts;
 }
 
 async function resolveTask(reference) {
@@ -136,9 +284,72 @@ async function resolveTask(reference) {
   return matches[0];
 }
 
+async function taskInput(parsed, taskInputOptions = {}) {
+  const input = compactObject({
+    title: option(parsed, "title"),
+    project: option(parsed, "project"),
+    group: option(parsed, "group"),
+    status: option(parsed, "status"),
+    releaseStatus: option(parsed, "release-status"),
+    priority: option(parsed, "priority"),
+    difficulty: integerOption(parsed, "difficulty"),
+    repositoryPath: option(parsed, "repository-path"),
+    maxConcurrency: integerOption(parsed, "max-concurrency"),
+    createdAt: option(parsed, "created-at"),
+    descriptionMd: await textValue(parsed, "description", "description-file"),
+    acceptanceCriteriaMd: await textValue(parsed, "acceptance", "acceptance-file")
+  });
+  if (hasOption(parsed, "tag")) input.tags = options(parsed, "tag");
+  if (hasOption(parsed, "parent")) {
+    const parent = option(parsed, "parent");
+    input.parentTaskId = !parent || ["none", "null"].includes(parent.toLowerCase()) ? null : (await resolveTask(parent)).id;
+  }
+  if (taskInputOptions.requireTitle && !input.title) throw new Error("--title is required.");
+  return input;
+}
+
+async function textValue(parsed, inlineName, fileName) {
+  const inlineValue = option(parsed, inlineName);
+  const filePath = option(parsed, fileName);
+  if (inlineValue !== undefined && filePath !== undefined) {
+    throw new Error(`Use either --${inlineName} or --${fileName}, not both.`);
+  }
+  return filePath === undefined ? inlineValue : fs.readFile(path.resolve(filePath), "utf8");
+}
+
+function integerOption(parsed, name) {
+  const value = option(parsed, name);
+  if (value === undefined) return undefined;
+  if (!/^[0-9]+$/.test(value)) throw new Error(`--${name} must be a non-negative integer.`);
+  return Number(value);
+}
+
+function compactObject(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined));
+}
+
+function imageMimeType(buffer) {
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return "image/png";
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (
+    buffer.length >= 12 &&
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  if (buffer.length >= 6 && ["GIF87a", "GIF89a"].includes(buffer.subarray(0, 6).toString("ascii"))) return "image/gif";
+  return undefined;
+}
+
 async function request(path, init = {}, allowLogin = true) {
+  await loadCurrentUserCredential();
   const headers = new Headers(init.headers || {});
-  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (typeof init.body === "string" && init.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
   if (sessionCookie) headers.set("Cookie", sessionCookie);
 
   let response;
@@ -169,7 +380,7 @@ async function login() {
   if (!password) {
     throw new HttpError(
       401,
-      "TaskMonitor authentication required. Set TASK_MONITOR_COOKIE or TASK_MONITOR_USER/TASK_MONITOR_PASSWORD."
+      "TaskMonitor authentication required. Open TaskMonitor with the current user, or set TASK_MONITOR_CREDENTIAL_FILE, TASK_MONITOR_COOKIE, or TASK_MONITOR_USER/TASK_MONITOR_PASSWORD."
     );
   }
   const response = await fetch(`${baseUrl}/api/auth/login`, {
@@ -213,6 +424,7 @@ async function downloadTaskAttachments(task) {
 }
 
 async function requestBinary(resourcePath, allowLogin = true) {
+  await loadCurrentUserCredential();
   const headers = new Headers();
   if (sessionCookie) headers.set("Cookie", sessionCookie);
   let response;
@@ -229,6 +441,82 @@ async function requestBinary(resourcePath, allowLogin = true) {
     throw new HttpError(response.status, `attachment download returned ${response.status}`);
   }
   return Buffer.from(await response.arrayBuffer());
+}
+
+async function loadCurrentUserCredential() {
+  if (sessionCookie) return;
+  credentialLoadPromise ??= discoverCurrentUserCredential();
+  await credentialLoadPromise;
+}
+
+async function discoverCurrentUserCredential() {
+  for (const credentialPath of await credentialCandidates()) {
+    try {
+      const parsed = JSON.parse(await fs.readFile(credentialPath, "utf8"));
+      const cookie = typeof parsed.cookie === "string" ? parsed.cookie.trim() : "";
+      const expiresAt = Date.parse(typeof parsed.expiresAt === "string" ? parsed.expiresAt : "");
+      const credentialUrl = normalizeLoopbackUrl(parsed.url);
+      if (
+        parsed.version !== 1 ||
+        !/^twm_token=[A-Za-z0-9._~%+-]+$/.test(cookie) ||
+        !Number.isFinite(expiresAt) ||
+        expiresAt <= Date.now() ||
+        !credentialUrl
+      ) {
+        continue;
+      }
+      sessionCookie = cookie;
+      if (!configuredBaseUrl) baseUrl = credentialUrl;
+      return;
+    } catch {
+      // Try the next local credential. Never print credential contents or paths.
+    }
+  }
+}
+
+async function credentialCandidates() {
+  const candidates = [];
+  const explicit = (process.env.TASK_MONITOR_CREDENTIAL_FILE || "").trim();
+  if (explicit) candidates.push(path.resolve(explicit));
+
+  addAncestorCandidates(candidates, process.cwd());
+  try {
+    const realScriptPath = await fs.realpath(fileURLToPath(import.meta.url));
+    addAncestorCandidates(candidates, path.dirname(realScriptPath));
+  } catch {
+    // The cwd and explicit path remain available.
+  }
+  return [...new Set(candidates.map((candidate) => path.normalize(candidate)))];
+}
+
+function addAncestorCandidates(candidates, start) {
+  let current = path.resolve(start);
+  for (let depth = 0; depth < 12; depth += 1) {
+    candidates.push(path.join(current, CREDENTIAL_FILE_NAME));
+    candidates.push(path.join(current, "data", ".terminal-apron", CREDENTIAL_FILE_NAME));
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+function normalizeLoopbackUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const parsed = new URL(value.trim());
+    const host = parsed.hostname.toLowerCase();
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      !["127.0.0.1", "localhost", "::1", "[::1]"].includes(host) ||
+      parsed.username ||
+      parsed.password
+    ) {
+      return null;
+    }
+    return parsed.origin.replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
 }
 
 function safeFileName(value) {
@@ -277,6 +565,16 @@ function requiredOption(parsed, name) {
   return value;
 }
 
+function requiredPositional(parsed, name) {
+  const value = parsed.positionals[0];
+  if (!value) throw new Error(`${name} is required.`);
+  return value;
+}
+
+function hasOption(parsed, name) {
+  return parsed.valuesByName.has(name);
+}
+
 function flag(parsed, name) {
   return parsed.valuesByName.has(name);
 }
@@ -298,8 +596,21 @@ function printHelp() {
   process.stdout.write(`TaskMonitor CLI
 
 Usage:
-  task-monitor.mjs list [--query text] [--status status] [--project name] [--archived]
+  task-monitor.mjs list [task filters] [--archived]
   task-monitor.mjs projects [--archived]
+  task-monitor.mjs groups [--archived]
+  task-monitor.mjs tags [--project name] [--catalog] [--archived]
+  task-monitor.mjs tag <task> --add name [--add name] [--remove name]
+  task-monitor.mjs tag <task> --set name [--set name] | --clear [--revision number]
+  task-monitor.mjs create-project --name text --root-directory path
+  task-monitor.mjs update-project <project-name> [--name text] [--root-directory path]
+  task-monitor.mjs create --title text [task fields]
+  task-monitor.mjs show <task-id-or-key>
+  task-monitor.mjs update <task-id-or-key> [task fields] [--revision number]
+  task-monitor.mjs archive|restore <task-id-or-key>
+  task-monitor.mjs delete <task-id-or-key> --yes
+  task-monitor.mjs attachments <task-id-or-key>
+  task-monitor.mjs upload <task-id-or-key> --file image-path [--file image-path]
   task-monitor.mjs context <task-id-or-key>
   task-monitor.mjs start <task> --summary text
   task-monitor.mjs report <task> --summary text [report options]
@@ -307,9 +618,19 @@ Usage:
   task-monitor.mjs block <task> --summary text --blocker text [--next text]
   task-monitor.mjs complete <task> --summary text --passed command [report options]
 
+Task filters:
+  --query text --status status --release-status status --project name --group name --tag name
+
+Task fields:
+  --title text --parent task-id-or-key|none --project name --group name --tag name
+  --description text|--description-file path --acceptance text|--acceptance-file path
+  --status status --release-status status --priority P0|P1|P2|P3 --difficulty 1..5
+  --repository-path path --max-concurrency number --created-at ISO-8601
+
 Report options:
   --report-status status  started|progress|blocked|completed|note
   --task-status status    not_started|in_progress|pending_auto_acceptance|pending_manual_acceptance|done|blocked
+  --release-status status not_released|local_complete|production_complete
   --changed-file path     Repeat for each materially changed file
   --passed command        Repeat for each passed verification
   --failed command        Repeat for each failed verification

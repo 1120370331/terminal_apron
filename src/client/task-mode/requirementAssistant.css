@@ -1,0 +1,23 @@
+#tp-task-mode .tm-dialog:has(.ra-layout) { width:min(1240px,96vw); max-width:96vw; }
+.ra-layout { display:grid; grid-template-columns:minmax(0,1.35fr) minmax(300px,1fr); gap:24px; align-items:start; }
+.ra-layout > .tp-stack { min-width:0; }
+.ra-assistant { min-width:0; position:sticky; top:0; border:1px solid var(--tp-line); border-radius:10px; padding:16px; background:var(--tp-surface); display:flex; flex-direction:column; gap:12px; }
+.ra-header { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between; }
+.ra-header h3 { display:flex; gap:8px; align-items:center; margin:0; font-size:15px; }
+.ra-header span,.ra-tool { color:var(--tp-muted); font-size:12px; }
+.ra-messages { overflow:auto; max-height:40vh; min-height:100px; overflow-wrap:anywhere; }
+.ra-turn + .ra-turn { border-top:1px solid var(--tp-line); padding-top:12px; }
+.ra-message { padding:10px; border-radius:8px; margin-bottom:8px; }
+.ra-message strong { font-size:12px; color:var(--tp-muted); }
+.ra-user { background:var(--tp-blue-bg); }
+.ra-message pre { overflow:auto; white-space:pre-wrap; }
+.ra-tool { margin:4px 10px; }
+.ra-compose { display:grid; gap:6px; font-size:13px; }
+.ra-compose textarea { min-height:86px; }
+.ra-actions,.ra-conflict-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.ra-actions > :last-child { margin-left:auto; }
+.ra-conflict { border:1px solid var(--tp-blue); border-radius:8px; padding:12px; font-size:13px; }
+.ra-conflict-versions { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.ra-conflict-versions > div { min-width:0; }
+.ra-conflict pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:160px; overflow:auto; padding:8px; background:var(--tp-bg); }
+@media(max-width:850px) { .ra-layout { grid-template-columns:1fr; } .ra-assistant { position:static; } }

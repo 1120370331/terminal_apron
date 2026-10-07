@@ -22,7 +22,7 @@
 
 ## 要求
 
-- Node.js 20+
+- Node.js 24+（任务存储使用内置 SQLite）
 - Zellij 0.44+，Windows 可使用官方 `zellij-x86_64-pc-windows-msvc.zip`
 - 可选：Tailscale
 - 可选：OpenSSH keys，用于 SSH 签名登录
@@ -80,6 +80,24 @@ Windows 后台启动使用：
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1
 ```
+
+## Task Mode
+
+Apron 顶栏的 **Task Mode** 进入 `/task-monitor/?mode=task-mode`。提供任务板、双栏工作台、文档页三种布局；时间、状态、项目、协作方式和材料可组合筛选。手动排序支持卡片、任务列表与状态列拖拽，双栏宽度可调整，视图偏好保存在当前用户的数据空间。
+
+任务支持即时渲染的 Markdown、剪贴板图片、文件附件和任务/文档引用。每条发送的指示保存独立需求快照；附件快照在原附件删除后仍可查看。点击开始执行后，真实 Codex 代理先理解并拆分任务，将原文交给独立 Worker 会话，收集代码改动和验证证据，再检查结果并更新状态。执行中可追加指示、排队、暂停和恢复；需要人工确认的结果保留在对应步骤内。
+
+任务详情的“Codex 对话”页签和侧栏入口可查看代理与各 Worker 的原始消息、命令、文件改动及当前轮次进度。执行期间 Task Mode 定期向 Codex 确认会话状态，连接中断会显示自动恢复次数和下次检查时间；确认仍在运行的回合后继续跟踪，意外中断的回合会先检查已有改动再续做，连续恢复失败则标记为需要处理。
+
+左侧“项目”保存项目名称、可选的 Markdown 说明和代码库根目录。新建任务时从项目列表选择，工作目录会自动填入项目路径；项目说明也会进入发送给代理的需求快照。修改项目目录会影响后续选择项目时填写的路径，已有任务保留自己的工作目录。
+
+运行前安装并登录 Codex CLI，在任务中设置实际项目工作目录。默认模型为 `gpt-6.1-sol`，可在代理设置中分别配置代理/Worker 模型、提示词、协作方式、Worker 上限、权限和审查策略。Windows 支持 PATH 中的自定义 npm 全局安装目录，也可通过 `TWM_CODEX_BIN` 指定 `codex.exe` 或 `bin/codex.js`。
+
+使用 `npm run build:all` 构建终端和任务页面。`node scripts/qa-task-mode.mjs` 在独立数据目录使用可控 Codex 传输验证页面/API；`node --import tsx scripts/qa-task-mode-real.mjs` 是可选的真实 Codex 联调，会调用已登录账号并在隔离目录执行一个小任务。
+
+## TaskMonitor CLI
+
+TaskMonitor 通过同一服务的 `/task-monitor/` 页面和项目内 Skill 提供任务管理。Codex 等客户端可使用认证后的 JSON CLI 创建、查询、更新、归档、上传任务证据，并提交结构化工作汇报；完整命令和接口约定见 [TaskMonitor CLI 文档](docs/task-monitor-cli.md)。
 
 ## Tailscale
 

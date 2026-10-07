@@ -48,7 +48,7 @@ const DEFAULT_BROWSER_TITLE = "Terminal Web Monitor";
 const DEFAULT_ROW_HEIGHT = 48;
 const DEFAULT_CARD_ROWS = 12;
 const MIN_CARD_ROWS = 6;
-const SESSION_REFRESH_MS = 1000;
+const SESSION_REFRESH_MS = 3000;
 const SYSTEM_METRICS_REFRESH_MS = 1000;
 const SYSTEM_METRICS_HISTORY_LIMIT = 120;
 const DEFAULT_PREVIEW_LINES = 600;
@@ -122,7 +122,7 @@ const DEFAULT_SETTINGS: PanelSettings = {
   minCardRows: MIN_CARD_ROWS,
   previewMinHeight: 500,
   previewLines: DEFAULT_PREVIEW_LINES,
-  previewRefreshMs: 1000,
+  previewRefreshMs: 2500,
   maxPreviewCards: 24,
   listTerminalFontSize: 16,
   listTerminalScale: 100,
@@ -256,7 +256,7 @@ function loadPanelSettings(storageKey = SETTINGS_STATE_KEY): PanelSettings {
       minCardRows: clampNumber(parsed.minCardRows, DEFAULT_SETTINGS.minCardRows, 3, 32),
       previewMinHeight: clampNumber(parsed.previewMinHeight, DEFAULT_SETTINGS.previewMinHeight, 160, 1400),
       previewLines: clampNumber(parsed.previewLines, DEFAULT_SETTINGS.previewLines, 20, MAX_LIST_PREVIEW_LINES),
-      previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000),
+      previewRefreshMs: clampNumber(parsed.previewRefreshMs, DEFAULT_SETTINGS.previewRefreshMs, 2500, 30000),
       maxPreviewCards: clampNumber(parsed.maxPreviewCards, DEFAULT_SETTINGS.maxPreviewCards, 1, 100),
       listTerminalFontSize: clampNumber(parsed.listTerminalFontSize, DEFAULT_SETTINGS.listTerminalFontSize, 12, 24),
       listTerminalScale: clampNumber(parsed.listTerminalScale, DEFAULT_SETTINGS.listTerminalScale, 80, 140),
@@ -1117,7 +1117,7 @@ export function App() {
         const shouldLoadFull = true;
         const knownSignature = now - lastFullAt >= fullPreviewRefreshMs ? "" : previewContentSignature(previous);
         const preview = await runPreviewRequest(() =>
-          api.preview(sessionId, settings.previewLines, previewMaxChars, shouldLoadFull, false, knownSignature)
+          api.preview(sessionId, Math.min(settings.previewLines, 360), previewMaxChars, shouldLoadFull, false, knownSignature)
         );
         if (cancelled || !visibleIds.has(sessionId)) {
           return;
@@ -1491,9 +1491,9 @@ export function App() {
           </div>
         </div>
         <div className="topbar-actions">
-          <a className="secondary-button terminal-mode-link" href="/task-monitor/" title="打开任务工作台">
+          <a className="secondary-button terminal-mode-link" href="/task-monitor/?mode=task-mode" title="切换到 Task Mode">
             <ListTodo size={16} />
-            任务
+            Task Mode
           </a>
           <HealthPill health={health} />
           <button
@@ -1882,7 +1882,7 @@ function SettingsModal({
               step="500"
               value={settings.previewRefreshMs}
               onChange={(event) =>
-                update("previewRefreshMs", clampNumber(event.target.value, DEFAULT_SETTINGS.previewRefreshMs, 1000, 30000))
+                update("previewRefreshMs", clampNumber(event.target.value, DEFAULT_SETTINGS.previewRefreshMs, 2500, 30000))
               }
             />
           </label>

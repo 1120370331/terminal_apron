@@ -60,6 +60,8 @@ const RING_MAX_FRAMES = 5000;
 const RING_MAX_BYTES = 4 * 1024 * 1024;
 const HISTORY_PAUSE_UNACKED_BYTES = 512 * 1024;
 const LIVE_FLOW_UNACKED_BYTES = 2 * 1024 * 1024;
+const TRANSCRIPT_FLUSH_BYTES = 32 * 1024;
+const TRANSCRIPT_FLUSH_MS = 50;
 
 export interface TerminalBrokerSubscribeOptions {
   clientId: string;
@@ -181,6 +183,8 @@ export class TerminalBroker {
   private ttlTimer: NodeJS.Timeout | null = null;
   private saveTimer: NodeJS.Timeout | null = null;
   private transcriptQueue = Promise.resolve();
+  private pendingTranscript = "";
+  private transcriptFlushTimer: NodeJS.Timeout | null = null;
   private inputQueue = Promise.resolve();
   private terminalInputBuffer = "";
   private bracketedPaste = false;
@@ -241,7 +245,12 @@ export class TerminalBroker {
       canceledHistory: new Set()
     };
 
+    const previous = this.subscribers.get(subscriber.id);
     this.subscribers.set(subscriber.id, subscriber);
+    if (previous) {
+      previous.closed = true;
+      previous.socket.disconnect(true);
+    }
     if (subscriber.mode === "interactive" && !this.resizeOwnerId) {
       this.resizeOwnerId = subscriber.id;
     }
@@ -310,7 +319,7 @@ export class TerminalBroker {
     });
 
     socket.on("disconnect", () => {
-      this.unsubscribe(subscriber.id);
+      this.unsubscribe(subscriber);
     });
   }
 
@@ -357,6 +366,7 @@ export class TerminalBroker {
       this.handlePtyData(data);
     });
     term.onExit((event) => {
+      this.flushTranscript();
       this.closed = true;
       this.term = null;
       this.clearSaveTimer();
@@ -401,10 +411,31 @@ export class TerminalBroker {
     const frame = this.createDataFrame("live", filtered, this.nextSeq());
     this.ringBuffer.push(frame);
     this.broadcastData(frame);
-    this.transcriptQueue = this.transcriptQueue
-      .then(() => appendZellijTranscript(this.session.id, filtered, this.dataDir))
-      .catch(() => undefined);
+    this.queueTranscript(filtered);
     this.scheduleSave();
+  }
+
+  private queueTranscript(data: string): void {
+    this.pendingTranscript += data;
+    if (Buffer.byteLength(this.pendingTranscript, "utf8") >= TRANSCRIPT_FLUSH_BYTES) {
+      this.flushTranscript();
+    } else if (!this.transcriptFlushTimer) {
+      this.transcriptFlushTimer = setTimeout(() => this.flushTranscript(), TRANSCRIPT_FLUSH_MS);
+    }
+  }
+
+  private flushTranscript(): void {
+    if (this.transcriptFlushTimer) {
+      clearTimeout(this.transcriptFlushTimer);
+      this.transcriptFlushTimer = null;
+    }
+    const data = this.pendingTranscript;
+    this.pendingTranscript = "";
+    if (data) {
+      this.transcriptQueue = this.transcriptQueue
+        .then(() => appendZellijTranscript(this.session.id, data, this.dataDir))
+        .catch(() => undefined);
+    }
   }
 
   private broadcastData(frame: TerminalDataFrame): void {
@@ -885,16 +916,15 @@ export class TerminalBroker {
     }
   }
 
-  private unsubscribe(subscriberId: string): void {
-    const subscriber = this.subscribers.get(subscriberId);
-    if (!subscriber) {
+  private unsubscribe(subscriber: TerminalSubscriber): void {
+    if (this.subscribers.get(subscriber.id) !== subscriber) {
       return;
     }
     subscriber.closed = true;
     subscriber.historySerial += 1;
     terminalHistoryService.cancelSession(this.session.id);
-    this.subscribers.delete(subscriberId);
-    if (this.resizeOwnerId === subscriberId) {
+    this.subscribers.delete(subscriber.id);
+    if (this.resizeOwnerId === subscriber.id) {
       this.resizeOwnerId = nextInteractiveSubscriberId(this.subscribers);
     }
     if (this.subscribers.size === 0) {
@@ -922,6 +952,7 @@ export class TerminalBroker {
     this.cancelTtl();
     this.closed = true;
     this.clearSaveTimer();
+    this.flushTranscript();
     terminalHistoryService.cancelSession(this.session.id);
     const term = this.term;
     this.term = null;

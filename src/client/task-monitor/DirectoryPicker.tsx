@@ -15,12 +15,16 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { DirectoryBrowserResult, FilesystemLocationKind } from "../../shared/types";
-import { taskApi } from "../taskApi";
+import { api } from "../api";
+import "./terminalDirectoryPicker.css";
 
 interface Props {
   initialPath: string;
   onClose: () => void;
   onSelect: (path: string) => void;
+  title?: string;
+  description?: string;
+  terminalMode?: boolean;
 }
 
 const LOCATION_ICONS: Record<FilesystemLocationKind, typeof Home> = {
@@ -31,7 +35,14 @@ const LOCATION_ICONS: Record<FilesystemLocationKind, typeof Home> = {
   drive: HardDrive
 };
 
-export function DirectoryPicker({ initialPath, onClose, onSelect }: Props) {
+export function DirectoryPicker({
+  initialPath,
+  onClose,
+  onSelect,
+  title = "选择项目根目录",
+  description = "Codex 将以这个文件夹作为任务代码库",
+  terminalMode = false
+}: Props) {
   const [browser, setBrowser] = useState<DirectoryBrowserResult | null>(null);
   const [address, setAddress] = useState(initialPath);
   const [query, setQuery] = useState("");
@@ -46,7 +57,7 @@ export function DirectoryPicker({ initialPath, onClose, onSelect }: Props) {
     setLoading(true);
     setError("");
     try {
-      const result = await taskApi.browseDirectory(nextPath, controller.signal);
+      const result = await api.browseDirectory(nextPath, controller.signal);
       setBrowser(result);
       setAddress(result.path);
       setQuery("");
@@ -91,7 +102,7 @@ export function DirectoryPicker({ initialPath, onClose, onSelect }: Props) {
 
   return (
     <div
-      className="task-directory-backdrop"
+      className={terminalMode ? "task-directory-backdrop terminal-directory-backdrop" : "task-directory-backdrop"}
       role="presentation"
       onMouseDown={(event) => {
         event.stopPropagation();
@@ -102,25 +113,25 @@ export function DirectoryPicker({ initialPath, onClose, onSelect }: Props) {
         className="task-directory-panel"
         role="dialog"
         aria-modal="true"
-        aria-label="选择项目根目录"
+        aria-label={title}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header className="task-directory-header">
           <div>
             <FolderOpen size={20} />
             <span>
-              <strong>选择项目根目录</strong>
-              <small>Codex 将以这个文件夹作为任务代码库</small>
+              <strong>{title}</strong>
+              <small>{description}</small>
             </span>
           </div>
-          <button className="task-icon-button" type="button" onClick={onClose} title="关闭">
+          <button className="task-icon-button icon-button" type="button" onClick={onClose} title="关闭">
             <X size={17} />
           </button>
         </header>
 
         <form className="task-directory-address" onSubmit={submitAddress}>
           <button
-            className="task-icon-button"
+            className="task-icon-button icon-button"
             type="button"
             disabled={!browser?.parentPath || loading}
             onClick={() => void loadDirectory(browser?.parentPath || undefined)}
@@ -138,7 +149,7 @@ export function DirectoryPicker({ initialPath, onClose, onSelect }: Props) {
             />
           </label>
           <button
-            className="task-icon-button"
+            className="task-icon-button icon-button"
             type="button"
             disabled={!browser || loading}
             onClick={() => void loadDirectory(browser?.path)}
@@ -225,11 +236,11 @@ export function DirectoryPicker({ initialPath, onClose, onSelect }: Props) {
         <footer className="task-directory-footer">
           <code title={browser?.path}>{browser?.path || "正在读取目录…"}</code>
           <div>
-            <button className="task-secondary-button" type="button" onClick={onClose}>
+            <button className="task-secondary-button secondary-button" type="button" onClick={onClose}>
               取消
             </button>
             <button
-              className="task-primary-button"
+              className="task-primary-button primary-button"
               type="button"
               disabled={!browser || loading || Boolean(error)}
               onClick={() => browser && onSelect(browser.path)}

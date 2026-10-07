@@ -11,14 +11,19 @@ import {
   Image as ImageIcon,
   ListFilter,
   ListTodo,
+  Layers3,
   Plus,
   RefreshCw,
   RotateCcw,
   Search,
+  Settings2,
   ShieldAlert,
   Sparkles,
   TerminalSquare,
-  TimerReset
+  TimerReset,
+  Tags,
+  Trash2,
+  X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SessionPreview, TerminalSession } from "../../shared/types";
@@ -27,14 +32,17 @@ import {
   TASK_STATUSES,
   type TaskDashboardStats,
   type TaskDifficulty,
+  type TaskGroupSummary,
   type TaskItem,
   type TaskPriority,
   type TaskProjectSummary,
   type TaskReportStatus,
   type TaskStatus,
+  type TaskTagSummary,
   type UpdateTaskInput
 } from "../../shared/taskTypes";
 import { TaskApiError, taskApi } from "../taskApi";
+import { newClientMessageId, TaskConversationApiError, taskConversationApi } from "../taskConversationApi";
 import { api, ApiError as TerminalApiError } from "../api";
 import {
   detectCodexStatus,
@@ -46,7 +54,11 @@ import {
 import { MarkdownContent } from "./MarkdownContent";
 import { TaskEditor } from "./TaskEditor";
 import { ProjectEditor } from "./ProjectEditor";
+import { TaskSavedViews } from "./TaskSavedViews";
+import type { TaskSearchFilters } from "./taskSearchFilters";
 import { TaskTerminalPanel } from "./TaskTerminalPanel";
+import { TaskConversationPanel, type TaskConversationLaunch } from "./TaskConversationPanel";
+import { TaskConversationDefaultsDialog } from "./TaskConversationDefaults";
 
 interface Props {
   userName: string;
@@ -88,9 +100,14 @@ const EMPTY_STATS: TaskDashboardStats = {
 const ALL_PROJECTS_FILTER = "__task_monitor_all_projects__";
 const UNASSIGNED_PROJECT_FILTER = "__task_monitor_unassigned__";
 const PROJECT_FILTER_PREFIX = "project:";
+const ALL_GROUPS_FILTER = "__task_monitor_all_groups__";
+const UNGROUPED_GROUP_FILTER = "__task_monitor_ungrouped__";
+const GROUP_FILTER_PREFIX = "group:";
+const conversationStartsInFlight = new Set<string>();
 
 type LiveSyncState = "connecting" | "live" | "reconnecting";
 type ArrangementStage = "creating" | "starting_terminal" | "starting_codex" | "sending_task";
+type ConversationStartStage = "creating_conversation" | "sending_task";
 
 interface TaskProjectGroup {
   key: string;
@@ -117,10 +134,15 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [projects, setProjects] = useState<TaskProjectSummary[]>([]);
   const [unassignedCount, setUnassignedCount] = useState(0);
+  const [groups, setGroups] = useState<TaskGroupSummary[]>([]);
+  const [ungroupedCount, setUngroupedCount] = useState(0);
+  const [tagSummaries, setTagSummaries] = useState<TaskTagSummary[]>([]);
   const [stats, setStats] = useState<TaskDashboardStats>(EMPTY_STATS);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<TaskStatus | "all">("all");
   const [projectFilter, setProjectFilter] = useState(ALL_PROJECTS_FILTER);
+  const [groupFilter, setGroupFilter] = useState(ALL_GROUPS_FILTER);
+  const [tagFilterText, setTagFilterText] = useState("");
   const [showArchived, setShowArchived] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [editorTask, setEditorTask] = useState<TaskItem | "new" | null>(null);
@@ -129,13 +151,21 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
   const [linkedTerminals, setLinkedTerminals] = useState<TerminalSession[]>([]);
   const [terminalPreviews, setTerminalPreviews] = useState<Record<string, SessionPreview>>({});
   const [terminalPanelTarget, setTerminalPanelTarget] = useState<TaskItem | null>(null);
+  const [conversationTarget, setConversationTarget] = useState<TaskItem | null>(null);
+  const [conversationSettingsTarget, setConversationSettingsTarget] = useState<TaskItem | null>(null);
+  const [conversationInitialError, setConversationInitialError] = useState("");
+  const [conversationLaunch, setConversationLaunch] = useState<TaskConversationLaunch | null>(null);
+  const [conversationStartingId, setConversationStartingId] = useState<string | null>(null);
+  const [conversationStartStage, setConversationStartStage] = useState<ConversationStartStage | null>(null);
   const [arrangingId, setArrangingId] = useState<string | null>(null);
   const [arrangementStage, setArrangementStage] = useState<ArrangementStage | null>(null);
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<TaskItem | null>(null);
   const [error, setError] = useState("");
   const [liveSyncState, setLiveSyncState] = useState<LiveSyncState>("connecting");
   const requestSequence = useRef(0);
+  const taskUpdateQueues = useRef(new Map<string, Promise<void>>());
   const liveRefreshTimer = useRef<number | null>(null);
   const terminalPreviewsRef = useRef(terminalPreviews);
 
@@ -143,18 +173,54 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
     terminalPreviewsRef.current = terminalPreviews;
   }, [terminalPreviews]);
 
+  const tagFilters = useMemo(() => {
+    const unique = new Map<string, string>();
+    for (const tag of tagFilterText.split(",")) {
+      const normalized = tag.trim();
+      if (normalized && !unique.has(normalized.toLocaleLowerCase())) {
+        unique.set(normalized.toLocaleLowerCase(), normalized);
+      }
+    }
+    return Array.from(unique.values()).slice(0, 12);
+  }, [tagFilterText]);
+
+  const currentFilters = useMemo<TaskSearchFilters>(
+    () => ({
+      query,
+      status: statusFilter,
+      project: projectFilterValue(projectFilter),
+      group: groupFilterValue(groupFilter),
+      tags: tagFilters,
+      archived: showArchived
+    }),
+    [groupFilter, projectFilter, query, showArchived, statusFilter, tagFilters]
+  );
+
+  const applySavedView = useCallback((filters: TaskSearchFilters) => {
+    setQuery(filters.query);
+    setStatusFilter(filters.status);
+    setProjectFilter(projectFilterKey(filters.project));
+    setGroupFilter(groupFilterKey(filters.group));
+    setTagFilterText(filters.tags.join(", "));
+    setShowArchived(filters.archived);
+  }, []);
+
   const loadTasks = useCallback(async () => {
     const sequence = ++requestSequence.current;
     setLoading(true);
     try {
-      const [response, projectResponse] = await Promise.all([
+      const [response, projectResponse, groupResponse, tagResponse] = await Promise.all([
         taskApi.list({
           query,
           status: statusFilter,
           project: projectFilterValue(projectFilter),
+          group: groupFilterValue(groupFilter),
+          tags: tagFilters,
           archived: showArchived
         }),
-        taskApi.projects(showArchived)
+        taskApi.projects(showArchived),
+        taskApi.groups(showArchived),
+        taskApi.tags(showArchived)
       ]);
       if (sequence !== requestSequence.current) {
         return;
@@ -163,6 +229,9 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
       setStats(response.stats);
       setProjects(projectResponse.projects);
       setUnassignedCount(projectResponse.unassignedCount);
+      setGroups(groupResponse.groups);
+      setUngroupedCount(groupResponse.ungroupedCount);
+      setTagSummaries(tagResponse.tags);
       setError("");
     } catch (loadError) {
       if (loadError instanceof TaskApiError && loadError.status === 401) {
@@ -175,7 +244,7 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
         setLoading(false);
       }
     }
-  }, [onUnauthorized, projectFilter, query, showArchived, statusFilter]);
+  }, [groupFilter, onUnauthorized, projectFilter, query, showArchived, statusFilter, tagFilters]);
 
   const loadTasksRef = useRef(loadTasks);
   useEffect(() => {
@@ -359,28 +428,35 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
     [tasks, terminalPanelTarget]
   );
 
-  const updateTask = async (task: TaskItem, patch: UpdateTaskInput) => {
-    if (savingId === task.id) {
-      return;
-    }
-    setSavingId(task.id);
-    setError("");
-    try {
-      const updated = await taskApi.update(task.id, { ...patch, revision: task.revision });
-      replaceTask(updated);
-      void loadTasks();
-    } catch (updateError) {
-      setError(
-        updateError instanceof TaskApiError && updateError.status === 409
-          ? "任务刚刚被其他操作更新，已重新加载最新内容"
-          : updateError instanceof Error
-            ? updateError.message
-            : "任务更新失败"
-      );
-      void loadTasks();
-    } finally {
-      setSavingId(null);
-    }
+  const updateTask = (task: TaskItem, patch: UpdateTaskInput) => {
+    const previous = taskUpdateQueues.current.get(task.id) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(async () => {
+      setSavingId(task.id);
+      setError("");
+      try {
+        const current = await taskApi.get(task.id);
+        const updated = await taskApi.update(task.id, { ...patch, revision: current.revision });
+        replaceTask(updated);
+        void loadTasks();
+      } catch (updateError) {
+        setError(
+          updateError instanceof TaskApiError && updateError.status === 409
+            ? "任务刚刚被其他操作更新，已重新加载最新内容"
+            : updateError instanceof Error
+              ? updateError.message
+              : "任务更新失败"
+        );
+        void loadTasks();
+      }
+    });
+    taskUpdateQueues.current.set(task.id, operation);
+    void operation.finally(() => {
+      if (taskUpdateQueues.current.get(task.id) === operation) {
+        taskUpdateQueues.current.delete(task.id);
+        setSavingId((current) => (current === task.id ? null : current));
+      }
+    });
+    return operation;
   };
 
   const archiveTask = async (task: TaskItem) => {
@@ -394,6 +470,27 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
       await loadTasks();
     } catch (archiveError) {
       setError(archiveError instanceof Error ? archiveError.message : "任务状态更新失败");
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  const deleteTask = async (task: TaskItem) => {
+    if (savingId === task.id) {
+      return;
+    }
+    setSavingId(task.id);
+    setError("");
+    try {
+      await taskApi.delete(task.id);
+      setTasks((current) => current.filter((candidate) => candidate.id !== task.id));
+      setSelectedId((current) => (current === task.id ? null : current));
+      setEditorTask((current) => (current && current !== "new" && current.id === task.id ? null : current));
+      setTerminalPanelTarget((current) => (current?.id === task.id ? null : current));
+      setDeleteTarget(null);
+      await Promise.all([loadTasks(), loadLinkedTerminals()]);
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "任务删除失败");
     } finally {
       setSavingId(null);
     }
@@ -472,7 +569,7 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
         }
         session = await api.createSession({
           name: nextArrangementTerminalName(task, allSessions),
-          group: task.project || "TaskMonitor",
+          group: task.group || task.project || "TaskMonitor",
           tags: Array.from(new Set(["task", task.key, ...task.tags])).slice(0, 12),
           taskId: task.id,
           taskKey: task.key,
@@ -524,6 +621,56 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
       setArrangementStage(null);
     }
   };
+
+  const openConversation = (task: TaskItem, initialError = "", launch?: TaskConversationLaunch) => {
+    setConversationInitialError(initialError);
+    if (launch) setConversationLaunch(launch);
+    else setConversationLaunch((current) => current?.taskId === task.id ? current : null);
+    setConversationTarget(task);
+  };
+
+  const startTaskInNewConversation = async (task: TaskItem) => {
+    if (conversationStartsInFlight.has(task.id) || conversationStartingId || arrangingId) return;
+    conversationStartsInFlight.add(task.id);
+    setConversationStartingId(task.id);
+    setConversationStartStage("creating_conversation");
+    setError("");
+    const launchId = newClientMessageId();
+    const prompt = taskArrangementPrompt(task);
+    const launch: TaskConversationLaunch = { id: launchId, taskId: task.id, prompt, stage: "creating" };
+    openConversation(task, "", launch);
+    let createdConversation: TaskConversationLaunch["conversation"];
+    try {
+      const created = await taskConversationApi.create(task.id, { clientMessageId: newClientMessageId() });
+      createdConversation = created.conversation;
+      setConversationStartStage("sending_task");
+      setConversationLaunch((current) => current?.id === launchId ? { ...current, stage: "sending", conversation: created.conversation } : current);
+      await taskConversationApi.send(task.id, created.conversation.threadId, {
+        clientMessageId: newClientMessageId(),
+        text: prompt
+      });
+      setConversationLaunch((current) => current?.id === launchId ? { ...current, stage: "completed", conversation: created.conversation } : current);
+    } catch (startError) {
+      const reason = startError instanceof Error ? startError.message : "未知错误";
+      const message = createdConversation
+        ? `已创建新对话，但任务指令发送失败：${reason === "未知错误" ? "请在对话中重新发送" : reason}`
+        : startError instanceof Error ? startError.message : "新建 Codex 对话失败";
+      setConversationLaunch((current) => current?.id === launchId
+        ? { ...current, stage: "failed", conversation: createdConversation, error: message }
+        : current);
+      if (startError instanceof TaskConversationApiError && startError.status === 401) {
+        onUnauthorized();
+      }
+    } finally {
+      conversationStartsInFlight.delete(task.id);
+      setConversationStartingId(null);
+      setConversationStartStage(null);
+    }
+  };
+
+  const consumeConversationLaunch = useCallback((launchId: string) => {
+    setConversationLaunch((current) => current?.id === launchId ? null : current);
+  }, []);
 
   return (
     <section className="task-monitor" aria-label="Task Monitor">
@@ -582,7 +729,7 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
           <input
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索任务、项目、标签或仓库"
+            placeholder="搜索任务、项目、分组、标签或仓库"
           />
         </label>
         <label className="task-filter-select">
@@ -620,6 +767,33 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
             <FolderCog size={16} />
           </button>
         </div>
+        <label className="task-filter-select task-group-filter">
+          <Layers3 size={16} />
+          <select value={groupFilter} onChange={(event) => setGroupFilter(event.target.value)}>
+            <option value={ALL_GROUPS_FILTER}>全部分组</option>
+            {groups.map((group) => (
+              <option key={group.name} value={`${GROUP_FILTER_PREFIX}${encodeURIComponent(group.name)}`}>
+                {group.name} · {group.taskCount}
+              </option>
+            ))}
+            {ungroupedCount > 0 && <option value={UNGROUPED_GROUP_FILTER}>未分组 · {ungroupedCount}</option>}
+          </select>
+        </label>
+        <label className="task-filter-select task-tag-filter">
+          <Tags size={16} />
+          <input
+            list="task-tag-filter-options"
+            value={tagFilterText}
+            onChange={(event) => setTagFilterText(event.target.value)}
+            placeholder="标签（逗号分隔）"
+            aria-label="按标签筛选任务"
+          />
+          <datalist id="task-tag-filter-options">
+            {tagSummaries.map((tag) => (
+              <option key={tag.name} value={tag.name} label={`${tag.name} · ${tag.taskCount}`} />
+            ))}
+          </datalist>
+        </label>
         <button
           className={showArchived ? "task-filter-button active" : "task-filter-button"}
           type="button"
@@ -628,6 +802,7 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
           <Archive size={16} />
           已归档
         </button>
+        <TaskSavedViews filters={currentFilters} onApply={applySavedView} />
         <button className="task-filter-button" type="button" onClick={() => void loadTasks()} title="刷新任务">
           <RefreshCw size={16} className={loading ? "spin" : ""} />
           刷新
@@ -668,16 +843,16 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
                   <ListTodo size={31} />
                 </div>
                 <h3>
-                  {query || statusFilter !== "all" || projectFilter !== ALL_PROJECTS_FILTER || showArchived
+                  {query || statusFilter !== "all" || projectFilter !== ALL_PROJECTS_FILTER || groupFilter !== ALL_GROUPS_FILTER || tagFilters.length > 0 || showArchived
                     ? "没有匹配的任务"
                     : "从第一个开发问题开始"}
                 </h3>
                 <p>
-                  {query || statusFilter !== "all" || projectFilter !== ALL_PROJECTS_FILTER || showArchived
+                  {query || statusFilter !== "all" || projectFilter !== ALL_PROJECTS_FILTER || groupFilter !== ALL_GROUPS_FILTER || tagFilters.length > 0 || showArchived
                     ? "换一个筛选条件，或者回到活动任务。"
                     : "填写任务名称、Markdown 描述和截图，创建一条可追踪的执行记录。"}
                 </p>
-                {!query && statusFilter === "all" && projectFilter === ALL_PROJECTS_FILTER && !showArchived && (
+                {!query && statusFilter === "all" && projectFilter === ALL_PROJECTS_FILTER && groupFilter === ALL_GROUPS_FILTER && tagFilters.length === 0 && !showArchived && (
                   <button className="task-primary-button" type="button" onClick={() => setEditorTask("new")}>
                     <Plus size={17} />
                     创建第一个任务
@@ -703,6 +878,8 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
                 <header className="task-table-header">
                   <span>任务</span>
                   <span>项目</span>
+                  <span>分组</span>
+                  <span>标签</span>
                   <span>进度</span>
                   <span>优先级</span>
                   <span>难度</span>
@@ -717,10 +894,16 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
                       selected={task.id === selectedId}
                       saving={savingId === task.id}
                       onSelect={() => setSelectedId(task.id)}
+                      onEdit={() => setEditorTask(task)}
                       onUpdate={(patch) => void updateTask(task, patch)}
+                      projects={projects}
+                      groups={groups}
+                      tagSummaries={tagSummaries}
                       terminalSessions={terminalsByTask.get(task.id) ?? []}
                       terminalStatuses={terminalStatusesByTask.get(task.id) ?? []}
                       onTerminals={() => setTerminalPanelTarget(task)}
+                      onConversation={() => openConversation(task)}
+                      onSettings={() => setConversationSettingsTarget(task)}
                       onArrange={() => void arrangeTask(task)}
                       arranging={arrangingId === task.id}
                       arrangementLabel={arrangingId === task.id && arrangementStage ? ARRANGEMENT_LABELS[arrangementStage] : undefined}
@@ -739,10 +922,22 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
               saving={savingId === selectedTask.id}
               onEdit={() => setEditorTask(selectedTask)}
               onArchive={() => void archiveTask(selectedTask)}
+              onDelete={() => setDeleteTarget(selectedTask)}
               onUpdate={(patch) => void updateTask(selectedTask, patch)}
               terminalSessions={terminalsByTask.get(selectedTask.id) ?? []}
               terminalStatuses={terminalStatusesByTask.get(selectedTask.id) ?? []}
               onTerminals={() => setTerminalPanelTarget(selectedTask)}
+              onConversation={() => openConversation(selectedTask)}
+              onSettings={() => setConversationSettingsTarget(selectedTask)}
+              onStartConversation={() => void startTaskInNewConversation(selectedTask)}
+              conversationStarting={conversationStartingId === selectedTask.id}
+              conversationStartLabel={
+                conversationStartingId === selectedTask.id
+                  ? conversationStartStage === "creating_conversation"
+                    ? "正在新建对话"
+                    : "正在发送任务"
+                  : undefined
+              }
               onArrange={() => void arrangeTask(selectedTask)}
               arranging={arrangingId === selectedTask.id}
               arrangementLabel={arrangingId === selectedTask.id && arrangementStage ? ARRANGEMENT_LABELS[arrangementStage] : undefined}
@@ -761,6 +956,7 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
           task={editorTask === "new" ? null : editorTask}
           projects={projects}
           initialProject={editorTask === "new" ? projectFilterValue(projectFilter) : undefined}
+          initialGroup={editorTask === "new" ? groupFilterValue(groupFilter) : undefined}
           onManageProjects={() => openProjectEditor(editorTask === "new" ? projectFilterValue(projectFilter) : editorTask.project)}
           onClose={() => setEditorTask(null)}
           onSaved={handleSaved}
@@ -786,6 +982,42 @@ export function TaskMonitorPage({ userName, onUnauthorized }: Props) {
           onSessionsLoaded={handleTerminalSessionsLoaded}
         />
       )}
+
+      {conversationTarget && (
+        <TaskConversationPanel
+          task={tasks.find((task) => task.id === conversationTarget.id) ?? conversationTarget}
+          initialError={conversationInitialError}
+          launch={conversationLaunch?.taskId === conversationTarget.id ? conversationLaunch : undefined}
+          onLaunchConsumed={consumeConversationLaunch}
+          onClose={() => {
+            setConversationTarget(null);
+            setConversationInitialError("");
+          }}
+          onTerminal={() => {
+            setTerminalPanelTarget(conversationTarget);
+            setConversationTarget(null);
+            setConversationInitialError("");
+          }}
+        />
+      )}
+
+      {conversationSettingsTarget && (
+        <TaskConversationDefaultsDialog
+          taskId={conversationSettingsTarget.id}
+          taskLabel={`${conversationSettingsTarget.key} · ${conversationSettingsTarget.title}`}
+          onClose={() => setConversationSettingsTarget(null)}
+        />
+      )}
+
+      {deleteTarget && (
+        <TaskDeleteDialog
+          task={deleteTarget}
+          deleting={savingId === deleteTarget.id}
+          linkedTerminalCount={terminalsByTask.get(deleteTarget.id)?.length ?? 0}
+          onCancel={() => setDeleteTarget(null)}
+          onConfirm={() => void deleteTask(deleteTarget)}
+        />
+      )}
     </section>
   );
 }
@@ -795,10 +1027,16 @@ function TaskRow({
   selected,
   saving,
   onSelect,
+  onEdit,
   onUpdate,
+  projects,
+  groups,
+  tagSummaries,
   terminalSessions,
   terminalStatuses,
   onTerminals,
+  onConversation,
+  onSettings,
   onArrange,
   arranging,
   arrangementLabel
@@ -807,10 +1045,16 @@ function TaskRow({
   selected: boolean;
   saving: boolean;
   onSelect: () => void;
+  onEdit: () => void;
   onUpdate: (patch: UpdateTaskInput) => void;
+  projects: TaskProjectSummary[];
+  groups: TaskGroupSummary[];
+  tagSummaries: TaskTagSummary[];
   terminalSessions: TerminalSession[];
   terminalStatuses: CodexSessionStatus[];
   onTerminals: () => void;
+  onConversation: () => void;
+  onSettings: () => void;
   onArrange: () => void;
   arranging: boolean;
   arrangementLabel?: string;
@@ -820,6 +1064,7 @@ function TaskRow({
     <article
       className={`task-table-row priority-${task.priority.toLowerCase()} ${selected ? "selected" : ""}`}
       onClick={onSelect}
+      onDoubleClick={onEdit}
     >
       <div className="task-row-title">
         <code>{task.key}</code>
@@ -827,7 +1072,7 @@ function TaskRow({
           <strong>{task.title}</strong>
           <span>{taskSummary(task)}</span>
         </div>
-        <div className="task-row-signals">
+        <div className="task-row-signals" onDoubleClick={(event) => event.stopPropagation()}>
           {task.attachments.length > 0 && (
             <small title={`${task.attachments.length} 张截图`}>
               <ImageIcon size={13} /> {task.attachments.length}
@@ -852,25 +1097,57 @@ function TaskRow({
             type="button"
             onClick={(event) => {
               event.stopPropagation();
-              onArrange();
+              onConversation();
             }}
-            disabled={arranging}
-            title="自动创建 Task Terminal、启动 Codex 并发送任务指令"
+            title="直接打开 Task Codex 对话"
           >
-            {arranging ? <RefreshCw className="spin" size={12} /> : <Sparkles size={12} />}
-            {arrangementLabel || "一键安排"}
+            <Sparkles size={12} />
+            Codex 对话
+          </button>
+          <button
+            className="task-row-settings"
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onSettings();
+            }}
+            title={`设置 ${task.key} 的默认模型、推理强度和权限`}
+            aria-label={`${task.key} Codex 默认设置`}
+          >
+            <Settings2 size={12} />
+            默认设置
           </button>
         </div>
       </div>
-      <span className={task.project ? "task-project-pill" : "task-project-pill unassigned"}>
-        <FolderKanban size={13} />
-        {task.project || "未归属"}
-      </span>
+      <select
+        className={task.project ? "task-inline-select task-project-select" : "task-inline-select task-project-select unassigned"}
+        value={task.project}
+        disabled={saving}
+        onClick={(event) => event.stopPropagation()}
+        onDoubleClick={(event) => event.stopPropagation()}
+        onChange={(event) => onUpdate({ project: event.target.value })}
+        aria-label={`${task.key} 项目`}
+      >
+        <option value="">未归属</option>
+        {projects.map((project) => (
+          <option key={project.name} value={project.name}>
+            {project.name}
+          </option>
+        ))}
+      </select>
+      <TaskGroupInlineInput task={task} groups={groups} disabled={saving} onUpdate={onUpdate} />
+      <TaskTagsInlineInput
+        task={task}
+        tags={tagSummaries}
+        disabled={saving}
+        onUpdate={onUpdate}
+      />
       <select
         className={`task-inline-select task-status-select status-${task.status}`}
         value={task.status}
         disabled={saving}
         onClick={(event) => event.stopPropagation()}
+        onDoubleClick={(event) => event.stopPropagation()}
         onChange={(event) => onUpdate({ status: event.target.value as TaskStatus })}
         aria-label={`${task.key} 处理进度`}
       >
@@ -885,6 +1162,7 @@ function TaskRow({
         value={task.priority}
         disabled={saving}
         onClick={(event) => event.stopPropagation()}
+        onDoubleClick={(event) => event.stopPropagation()}
         onChange={(event) => onUpdate({ priority: event.target.value as TaskPriority })}
         aria-label={`${task.key} 优先级`}
       >
@@ -899,6 +1177,7 @@ function TaskRow({
         value={task.difficulty}
         disabled={saving}
         onClick={(event) => event.stopPropagation()}
+        onDoubleClick={(event) => event.stopPropagation()}
         onChange={(event) => onUpdate({ difficulty: Number(event.target.value) as TaskDifficulty })}
         aria-label={`${task.key} 难度`}
       >
@@ -914,30 +1193,215 @@ function TaskRow({
   );
 }
 
+function TaskTagsInlineInput({
+  task,
+  tags,
+  disabled,
+  onUpdate
+}: {
+  task: TaskItem;
+  tags: TaskTagSummary[];
+  disabled: boolean;
+  onUpdate: (patch: UpdateTaskInput) => void;
+}) {
+  const [value, setValue] = useState(() => task.tags.join(", "));
+  const [editing, setEditing] = useState(false);
+  const listId = `task-tag-options-${task.id}`;
+  const options = useMemo(() => {
+    const values = new Map<string, string>();
+    [...task.tags, ...tags.map((tag) => tag.name)].forEach((tag) => {
+      const normalized = tag.trim();
+      if (normalized && !values.has(normalized.toLocaleLowerCase())) {
+        values.set(normalized.toLocaleLowerCase(), normalized);
+      }
+    });
+    return Array.from(values.values());
+  }, [tags, task.tags]);
+
+  useEffect(() => {
+    if (!editing) {
+      setValue(task.tags.join(", "));
+    }
+  }, [editing, task.tags]);
+
+  const commit = () => {
+    const next = normalizeInlineTags(value);
+    setValue(next.join(", "));
+    if (!sameTags(next, task.tags)) {
+      onUpdate({ tags: next });
+    }
+  };
+
+  return (
+    <div
+      className="task-inline-tags"
+      onClick={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
+    >
+      <Tags size={13} aria-hidden="true" />
+      <input
+        list={listId}
+        value={value}
+        disabled={disabled}
+        onChange={(event) => setValue(event.target.value)}
+        onFocus={() => setEditing(true)}
+        onBlur={() => {
+          setEditing(false);
+          commit();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            event.currentTarget.blur();
+          }
+          if (event.key === "Escape") {
+            setValue(task.tags.join(", "));
+            event.currentTarget.blur();
+          }
+        }}
+        placeholder="添加标签"
+        aria-label={`${task.key} 标签，使用逗号分隔`}
+        title="从建议中选择，或输入标签后按 Enter 保存"
+      />
+      <datalist id={listId}>
+        {options.map((tag) => (
+          <option key={tag} value={tag} />
+        ))}
+      </datalist>
+    </div>
+  );
+}
+
+function TaskGroupInlineInput({
+  task,
+  groups,
+  disabled,
+  onUpdate
+}: {
+  task: TaskItem;
+  groups: TaskGroupSummary[];
+  disabled: boolean;
+  onUpdate: (patch: UpdateTaskInput) => void;
+}) {
+  const [value, setValue] = useState(task.group);
+  const [editing, setEditing] = useState(false);
+  const listId = `task-group-options-${task.id}`;
+  const options = useMemo(() => {
+    const values = new Map<string, string>();
+    [task.group, ...groups.map((group) => group.name)].forEach((group) => {
+      const normalized = normalizeInlineGroup(group);
+      if (normalized && !values.has(normalized.toLocaleLowerCase())) {
+        values.set(normalized.toLocaleLowerCase(), normalized);
+      }
+    });
+    return Array.from(values.values());
+  }, [groups, task.group]);
+
+  useEffect(() => {
+    if (!editing) {
+      setValue(task.group);
+    }
+  }, [editing, task.group]);
+
+  const commit = () => {
+    const next = normalizeInlineGroup(value);
+    setValue(next);
+    if (next.toLocaleLowerCase() !== task.group.toLocaleLowerCase()) {
+      onUpdate({ group: next });
+    }
+  };
+
+  return (
+    <div
+      className={task.group ? "task-inline-group" : "task-inline-group unassigned"}
+      onClick={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
+    >
+      <Layers3 size={13} aria-hidden="true" />
+      <input
+        list={listId}
+        value={value}
+        disabled={disabled}
+        onChange={(event) => setValue(event.target.value)}
+        onFocus={() => setEditing(true)}
+        onBlur={() => {
+          setEditing(false);
+          commit();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            event.currentTarget.blur();
+          }
+        }}
+        placeholder="添加分组"
+        aria-label={`${task.key} 分组`}
+        title="从建议中选择，或输入新分组后按 Enter 保存"
+      />
+      <datalist id={listId}>
+        {options.map((group) => (
+          <option key={group} value={group} />
+        ))}
+      </datalist>
+    </div>
+  );
+}
+
+function normalizeInlineTags(value: string): string[] {
+  const unique = new Map<string, string>();
+  value.split(",").forEach((tag) => {
+    const normalized = tag.replace(/\s+/g, " ").trim().slice(0, 40);
+    if (normalized && !unique.has(normalized.toLocaleLowerCase())) {
+      unique.set(normalized.toLocaleLowerCase(), normalized);
+    }
+  });
+  return Array.from(unique.values()).slice(0, 12);
+}
+
+function normalizeInlineGroup(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 80);
+}
+
+function sameTags(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((tag, index) => tag.toLocaleLowerCase() === right[index]?.toLocaleLowerCase());
+}
+
 function TaskInspector({
   task,
   saving,
   onEdit,
   onArchive,
+  onDelete,
   onUpdate,
   terminalSessions,
   terminalStatuses,
   onTerminals,
+  onConversation,
+  onSettings,
+  onStartConversation,
   onArrange,
   arranging,
-  arrangementLabel
+  arrangementLabel,
+  conversationStarting,
+  conversationStartLabel
 }: {
   task: TaskItem;
   saving: boolean;
   onEdit: () => void;
   onArchive: () => void;
+  onDelete: () => void;
   onUpdate: (patch: UpdateTaskInput) => void;
   terminalSessions: TerminalSession[];
   terminalStatuses: CodexSessionStatus[];
   onTerminals: () => void;
+  onConversation: () => void;
+  onSettings: () => void;
+  onStartConversation: () => void;
   onArrange: () => void;
   arranging: boolean;
   arrangementLabel?: string;
+  conversationStarting: boolean;
+  conversationStartLabel?: string;
 }) {
   const codexSummary = summarizeCodexStatuses(terminalStatuses);
   return (
@@ -955,8 +1419,20 @@ function TaskInspector({
           <button className="task-icon-button" type="button" onClick={onEdit} title="编辑任务">
             <Edit3 size={17} />
           </button>
+          <button className="task-icon-button" type="button" onClick={onSettings} title="Codex 默认设置" aria-label={`${task.key} Codex 默认设置`}>
+            <Settings2 size={17} />
+          </button>
           <button className="task-icon-button" type="button" onClick={onArchive} title={task.archived ? "恢复" : "归档"}>
             {task.archived ? <RotateCcw size={17} /> : <Archive size={17} />}
+          </button>
+          <button
+            className="task-icon-button task-delete-action"
+            type="button"
+            onClick={onDelete}
+            title="永久删除任务"
+            aria-label={`永久删除 ${task.key}`}
+          >
+            <Trash2 size={17} />
           </button>
         </div>
       </header>
@@ -966,6 +1442,9 @@ function TaskInspector({
       <div className="task-inspector-meta">
         <span className={task.project ? "task-project-meta" : "task-project-meta unassigned"}>
           <FolderKanban size={14} /> {task.project || "未归属项目"}
+        </span>
+        <span className={task.group ? "task-group-meta" : "task-group-meta unassigned"}>
+          <Layers3 size={14} /> {task.group || "未分组"}
         </span>
         <span className={`priority-${task.priority.toLowerCase()}`}>{task.priority}</span>
         <span className={`difficulty-d${task.difficulty}`}>难度 D{task.difficulty}</span>
@@ -1054,28 +1533,55 @@ function TaskInspector({
 
       {task.attachments.length > 0 && (
         <section className="task-inspector-section">
-          <h4>截图 · {task.attachments.length}</h4>
+          <h4>任务附件 · {task.attachments.length}</h4>
           <div className="task-attachment-grid">
             {task.attachments.map((attachment) => (
-              <a href={attachment.url} target="_blank" rel="noreferrer" key={attachment.id} title={attachment.name}>
-                <img src={attachment.url} alt={attachment.name} />
-                <span>{attachment.name}</span>
+              <a href={attachment.previewUrl??attachment.url} target="_blank" rel="noreferrer" key={attachment.id} title={attachment.name}>
+                {attachment.mimeType.startsWith("image/") && <img src={attachment.url} alt={attachment.name} />}
+                <span>{attachment.source==="feedback"?"AI 反馈材料":"用户输入附件"} · {attachment.name}</span>
               </a>
             ))}
           </div>
         </section>
       )}
 
-      <button className="task-auto-arrange" type="button" onClick={onArrange} disabled={arranging}>
+      <button
+        className="task-auto-arrange task-conversation-start"
+        type="button"
+        onClick={onStartConversation}
+        disabled={conversationStarting || arranging}
+      >
         <div className="task-auto-arrange-icon">
-          {arranging ? <RefreshCw className="spin" size={20} /> : <Sparkles size={20} />}
+          {conversationStarting ? <RefreshCw className="spin" size={20} /> : <Sparkles size={20} />}
         </div>
         <div>
-          <span>Codex 自动执行</span>
-          <strong>{arrangementLabel || "一键安排任务"}</strong>
-          <small>自动创建并关联 Terminal、启动 Codex，然后发送带 Task Skill 的任务指令。</small>
+          <span>Task Codex</span>
+          <strong>{conversationStartLabel || "新建对话并开始任务"}</strong>
+          <small>创建新的任务对话并立即发送执行指令；使用此 Task 保存的默认推理和权限。</small>
         </div>
         <ArrowUpRight size={17} />
+      </button>
+
+      <button
+        className="task-auto-arrange task-conversation-launch"
+        type="button"
+        onClick={onConversation}
+        disabled={conversationStarting}
+      >
+        <div className="task-auto-arrange-icon">
+          <Sparkles size={20} />
+        </div>
+        <div>
+          <span>Codex 对话</span>
+          <strong>打开任务会话工作台</strong>
+          <small>直接加载历史、发送与中断任务，不创建 Terminal；工作目录固定为 Task 上下文。</small>
+        </div>
+        <ArrowUpRight size={17} />
+      </button>
+
+      <button className="task-secondary-arrange" type="button" onClick={onArrange} disabled={arranging || conversationStarting}>
+        {arranging ? <RefreshCw className="spin" size={16} /> : <TerminalSquare size={16} />}
+        {arrangementLabel || "使用高级 Terminal 执行"}
       </button>
 
       <button className={`task-launch-foundation state-${codexSummary.state}`} type="button" onClick={onTerminals}>
@@ -1095,6 +1601,73 @@ function TaskInspector({
         </div>
         <Sparkles size={17} />
       </button>
+    </div>
+  );
+}
+
+function TaskDeleteDialog({
+  task,
+  deleting,
+  linkedTerminalCount,
+  onCancel,
+  onConfirm
+}: {
+  task: TaskItem;
+  deleting: boolean;
+  linkedTerminalCount: number;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !deleting) {
+        onCancel();
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [deleting, onCancel]);
+
+  return (
+    <div
+      className="task-delete-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !deleting) {
+          onCancel();
+        }
+      }}
+    >
+      <section className="task-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="task-delete-title">
+        <header>
+          <span className="task-delete-mark"><Trash2 size={20} /></span>
+          <div>
+            <small>永久操作 · {task.key}</small>
+            <h3 id="task-delete-title">删除“{task.title}”？</h3>
+          </div>
+          <button type="button" className="task-icon-button" onClick={onCancel} disabled={deleting} aria-label="关闭">
+            <X size={17} />
+          </button>
+        </header>
+        <div className="task-delete-copy">
+          <p>任务记录、{task.attachments.length} 个附件和全部 Codex 进度汇报将被永久删除，无法恢复。</p>
+          {linkedTerminalCount > 0 && (
+            <p className="terminal-safe">关联的 {linkedTerminalCount} 个 Terminal 会保留运行，只解除任务归属；不会停止或删除 Zellij 会话。</p>
+          )}
+        </div>
+        <footer>
+          <button className="task-secondary-button" type="button" onClick={onCancel} disabled={deleting}>取消</button>
+          <button
+            className="task-delete-confirm"
+            type="button"
+            onClick={onConfirm}
+            disabled={deleting}
+          >
+            {deleting ? <RefreshCw className="spin" size={16} /> : <Trash2 size={16} />}
+            {deleting ? "正在删除" : "永久删除任务"}
+          </button>
+        </footer>
+      </section>
     </div>
   );
 }
@@ -1152,7 +1725,7 @@ function nextArrangementTerminalName(task: TaskItem, sessions: TerminalSession[]
   return `${task.key} · Codex ${Date.now().toString(36).slice(-4)}`;
 }
 
-function taskArrangementPrompt(task: TaskItem): string {
+export function taskArrangementPrompt(task: TaskItem): string {
   return [
     `请使用 $manage-terminal-apron-tasks 读取并处理 ${task.key}。`,
     "先执行 Skill 的 context 和 start 流程，检查任务描述、验收标准、项目目录与全部截图，再开始修改代码。",
@@ -1246,6 +1819,39 @@ function projectFilterValue(filter: string): string | undefined {
     return decodeURIComponent(filter.slice(PROJECT_FILTER_PREFIX.length));
   }
   return undefined;
+}
+
+function projectFilterKey(project: string | undefined): string {
+  if (project === undefined) {
+    return ALL_PROJECTS_FILTER;
+  }
+  if (!project) {
+    return UNASSIGNED_PROJECT_FILTER;
+  }
+  return `${PROJECT_FILTER_PREFIX}${encodeURIComponent(project)}`;
+}
+
+function groupFilterValue(filter: string): string | undefined {
+  if (filter === ALL_GROUPS_FILTER) {
+    return undefined;
+  }
+  if (filter === UNGROUPED_GROUP_FILTER) {
+    return "";
+  }
+  if (filter.startsWith(GROUP_FILTER_PREFIX)) {
+    return decodeURIComponent(filter.slice(GROUP_FILTER_PREFIX.length));
+  }
+  return undefined;
+}
+
+function groupFilterKey(group: string | undefined): string {
+  if (group === undefined) {
+    return ALL_GROUPS_FILTER;
+  }
+  if (!group) {
+    return UNGROUPED_GROUP_FILTER;
+  }
+  return `${GROUP_FILTER_PREFIX}${encodeURIComponent(group)}`;
 }
 
 function formatTaskDate(value: string): string {

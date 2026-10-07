@@ -2,17 +2,21 @@ import type {
   CreateTaskProjectInput,
   CreateTaskReportInput,
   CreateTaskInput,
+  DeleteTaskResponse,
   TaskAttachmentUploadResponse,
   TaskItem,
+  TaskGroupListResponse,
   TaskListResponse,
   TaskProjectListResponse,
   TaskProjectSummary,
   TaskReportListResponse,
   TaskStatus,
+  TaskTagListResponse,
   UpdateTaskInput,
   UpdateTaskProjectInput
 } from "../shared/taskTypes";
 import type { AuthConfig, AuthUser, DirectoryBrowserResult } from "../shared/types";
+import type { TaskTagMutation } from "../shared/taskTags";
 
 export class TaskApiError extends Error {
   constructor(
@@ -36,8 +40,8 @@ async function taskRequest<T>(path: string, init: RequestInit = {}): Promise<T> 
   if (!response.ok) {
     let message = response.statusText;
     try {
-      const body = (await response.json()) as { error?: string };
-      message = body.error ?? message;
+      const body = (await response.json()) as { error?: string | { message?: string } };
+      message = typeof body.error === "string" ? body.error : body.error?.message ?? message;
     } catch {
       // Keep the response status text.
     }
@@ -47,7 +51,14 @@ async function taskRequest<T>(path: string, init: RequestInit = {}): Promise<T> 
 }
 
 export const taskApi = {
-  list: (options: { query?: string; status?: TaskStatus | "all"; project?: string; archived?: boolean } = {}) => {
+  list: (options: {
+    query?: string;
+    status?: TaskStatus | "all";
+    project?: string;
+    group?: string;
+    tags?: string[];
+    archived?: boolean;
+  } = {}) => {
     const params = new URLSearchParams();
     if (options.query?.trim()) {
       params.set("q", options.query.trim());
@@ -58,6 +69,14 @@ export const taskApi = {
     if (options.project !== undefined) {
       params.set("project", options.project);
     }
+    if (options.group !== undefined) {
+      params.set("group", options.group);
+    }
+    options.tags?.forEach((tag) => {
+      if (tag.trim()) {
+        params.append("tag", tag.trim());
+      }
+    });
     if (options.archived) {
       params.set("archived", "true");
     }
@@ -66,6 +85,11 @@ export const taskApi = {
   },
   projects: (archived = false) =>
     taskRequest<TaskProjectListResponse>(`/api/tasks/projects${archived ? "?archived=true" : ""}`),
+  groups: (archived = false) =>
+    taskRequest<TaskGroupListResponse>(`/api/tasks/groups${archived ? "?archived=true" : ""}`),
+  tags: (archived = false) => taskRequest<TaskTagListResponse>(`/api/tasks/tags${archived ? "?archived=true" : ""}`),
+  tagCatalog: (project?:string) => taskRequest<TaskTagListResponse>(`/api/tasks/tags?catalog=true${project!==undefined?`&project=${encodeURIComponent(project)}`:""}`),
+  setTags: (id:string,input:TaskTagMutation) => taskRequest<TaskItem>(`/api/tasks/${encodeURIComponent(id)}/tags`,{method:"PATCH",body:JSON.stringify(input)}),
   createProject: (input: CreateTaskProjectInput) =>
     taskRequest<TaskProjectSummary>("/api/tasks/projects", {
       method: "POST",
@@ -95,6 +119,8 @@ export const taskApi = {
     taskRequest<TaskItem>(`/api/tasks/${encodeURIComponent(id)}/archive`, { method: "POST" }),
   restore: (id: string) =>
     taskRequest<TaskItem>(`/api/tasks/${encodeURIComponent(id)}/restore`, { method: "POST" }),
+  delete: (id: string) =>
+    taskRequest<DeleteTaskResponse>(`/api/tasks/${encodeURIComponent(id)}`, { method: "DELETE" }),
   reports: (id: string, limit = 50) =>
     taskRequest<TaskReportListResponse>(
       `/api/tasks/${encodeURIComponent(id)}/reports?limit=${encodeURIComponent(String(limit))}`

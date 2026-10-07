@@ -74,6 +74,8 @@ const CARD_PREVIEW_MAX_LINES = 360;
 const CARD_PREVIEW_MAX_CHARS = 80_000;
 const CARD_PREVIEW_MAX_NODES = 2_000;
 const DEFAULT_PREVIEW_FONT_SIZE = 16;
+const MIN_READABLE_PREVIEW_FONT_SIZE = 14;
+const MAX_CONSECUTIVE_EMPTY_PREVIEW_ROWS = 2;
 const MOBILE_QUERY = "(max-width: 720px)";
 
 function SessionCardComponent({
@@ -823,13 +825,15 @@ function drawPreviewCanvas(
   }
 
   const fontSize = options.fontSize;
-  const scale = options.scale;
   const lineHeight = Math.ceil(fontSize * 1.35);
   const fontFamily = '"Cascadia Mono", "SFMono-Regular", Consolas, "Noto Sans Mono CJK SC", "Microsoft YaHei Mono", NSimSun, monospace';
   context.font = `${fontSize}px ${fontFamily}`;
   const cellWidth = Math.max(8, Math.ceil(context.measureText("M").width * 100) / 100);
+  const rows = compactPreviewGridRows(grid.rows);
   const naturalWidth = Math.max(1, grid.cols * cellWidth);
-  const naturalHeight = Math.max(lineHeight, grid.rows.length * lineHeight);
+  const naturalHeight = Math.max(lineHeight, rows.length * lineHeight);
+  const fitScale = availableWidth && availableWidth > 0 ? Math.min(1, availableWidth / naturalWidth) : 1;
+  const scale = Math.max(fitScale, MIN_READABLE_PREVIEW_FONT_SIZE / fontSize) * options.scale;
   const width = Math.max(1, Math.ceil(naturalWidth * scale));
   const height = Math.max(1, Math.ceil(naturalHeight * scale));
   const dpr = window.devicePixelRatio || 1;
@@ -849,8 +853,8 @@ function drawPreviewCanvas(
   context.imageSmoothingEnabled = false;
   context.clearRect(0, 0, naturalWidth, naturalHeight);
 
-  for (let rowIndex = 0; rowIndex < grid.rows.length; rowIndex += 1) {
-    const row = grid.rows[rowIndex];
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const row = rows[rowIndex];
     let x = 0;
     const y = rowIndex * lineHeight;
     for (const segment of row.segments) {
@@ -859,6 +863,19 @@ function drawPreviewCanvas(
       x += segmentWidth;
     }
   }
+}
+
+function compactPreviewGridRows(rows: TerminalPreviewGrid["rows"]): TerminalPreviewGrid["rows"] {
+  const result: TerminalPreviewGrid["rows"] = [];
+  let emptyRows = 0;
+  for (const row of rows) {
+    const empty = row.segments.every((segment) => !segment.text.trim() && !segment.bg);
+    emptyRows = empty ? emptyRows + 1 : 0;
+    if (!empty || emptyRows <= MAX_CONSECUTIVE_EMPTY_PREVIEW_ROWS) {
+      result.push(row);
+    }
+  }
+  return result;
 }
 
 function contentWidth(element: HTMLElement): number {

@@ -222,6 +222,25 @@ export class SessionStore {
     });
   }
 
+  async unlinkTask(taskId: string): Promise<number> {
+    const normalizedTaskId = normalizeTaskId(taskId);
+    if (!normalizedTaskId) {
+      return 0;
+    }
+    return this.mutate((db) => {
+      let unlinked = 0;
+      db.sessions = db.sessions.map((session) => {
+        if (session.taskId !== normalizedTaskId) {
+          return session;
+        }
+        unlinked += 1;
+        const { taskId: _taskId, taskKey: _taskKey, ...preserved } = session;
+        return { ...preserved, updatedAt: now() };
+      });
+      return unlinked;
+    });
+  }
+
   async markStopped(id: string): Promise<TerminalSession | null> {
     return this.mutate(async (db) => {
       const index = db.sessions.findIndex((session) => session.id === id);
