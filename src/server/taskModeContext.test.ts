@@ -7,6 +7,19 @@ import test from "node:test";
 import { DEFAULT_TASK_MODE_SETTINGS,type TaskExecutionJob,type TaskExecutionRun,type TaskModeState } from "../shared/taskModeTypes.js";
 import { prepareTaskModeInput,TASK_MODE_INLINE_CHAR_LIMIT } from "./tasks/taskModeContext.js";
 
+test("large quick context retains direct evidence without introducing dispatch instructions",()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),"apron-quick-context-"));
+  try{
+    const job:TaskExecutionJob={id:"direct",role:"execute",name:"消息代理",objective:"",ownedPaths:[],text:"完整快速要求\n"+"保留材料".repeat(20000),status:"pending",attempt:0,model:"gpt-6.1-sol",items:[]};
+    const previous={...job,id:"previous",status:"completed" as const,output:{summary:"已有直接执行结果"}};
+    const settings={...DEFAULT_TASK_MODE_SETTINGS,executionMode:"quick" as const};
+    const run:TaskExecutionRun={id:"quick",instructionIds:[],createdAt:"",settings,jobs:[previous,job],reviewAttempt:0};
+    const state:TaskModeState={taskId:"task",phase:"working",settings,instructions:[],runs:[run],events:[],heartbeat:{status:"healthy",recoveryAttempts:0},revision:0,updatedAt:""};
+    const result=prepareTaskModeInput(directory,state,run,job);assert.ok(result.packet);
+    const evidence=JSON.parse(fs.readFileSync(result.packet.evidencePath,"utf8"));assert.equal(evidence.executionMode,"quick");assert.equal(evidence.workers.length,0);assert.equal(evidence.directExecutions[0].result.summary,"已有直接执行结果");assert.match(result.text,/直接完成剩余实施/);assert.doesNotMatch(result.text,/需要修复或补验时交回原负责人/);assert.equal(fs.readFileSync(result.packet.path,"utf8"),job.text);
+  }finally{fs.rmSync(directory,{recursive:true,force:true});}
+});
+
 test("large generated task input is delivered by reference with its full original and structured evidence retained",()=>{
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),"apron-context-packet-"));
   try{

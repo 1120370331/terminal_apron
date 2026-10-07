@@ -14,6 +14,8 @@ export interface StoredRequirementAssistant {
 }
 
 export interface StoredTaskDraft {
+  executionMode?: "collaborative" | "quick";
+  publishRequestId?: string;
   savedAt?: number;
   title: string;
   description: string;

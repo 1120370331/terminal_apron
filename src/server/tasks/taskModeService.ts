@@ -3,7 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { TaskItem, TaskStatus, TaskAttachment, TaskVerification } from "../../shared/taskTypes.js";
-import { DEFAULT_TASK_MODE_SETTINGS, type RequirementSnapshot, type SubmitTaskInstruction, type TaskExecutionJob, type TaskExecutionRun, type TaskInstruction, type TaskModeAction, type TaskModeDetail, type TaskModeSettings, type TaskModeState, type TaskRunResult } from "../../shared/taskModeTypes.js";
+import { DEFAULT_TASK_MODE_SETTINGS, QUICK_TASK_MODE_AGENT_PROMPT, type RequirementSnapshot, type SubmitTaskInstruction, type TaskExecutionJob, type TaskExecutionRun, type TaskInstruction, type TaskModeAction, type TaskModeDetail, type TaskModeSettings, type TaskModeState, type TaskRunResult } from "../../shared/taskModeTypes.js";
 import type { TaskConversationEvent } from "../../shared/taskConversationTypes.js";
 import { TaskConversationService, TaskConversationServiceError } from "./taskConversationService.js";
 import { CodexRpcError } from "../codexAppServerClient.js";
@@ -30,6 +30,11 @@ const REVIEW_DECISION="按整个任务的验收条件作出持续执行决定。
 const DOCUMENT_GUIDANCE = "涉及实验、方案比较、较多实施结果或验证证据时，把完整内容整理为一个 Markdown 或自包含 HTML 文档，并在 artifacts 中返回实际 path 和清晰 title。文档按结论、目标与方法、实施或实验结果、验证与证据、未完成与风险、用户需要做什么、下一步分章节；用表格比较数据，区分已验证事实与推测。任务内保留简短结论，详细内容放文档。HTML 的样式、脚本和图表内嵌，图片内嵌或使用归档材料，不能依赖外部脚本或网络请求。文档只是审查材料，不能以产出文档为由提前停止未完成任务。";
 const REPORT_GUIDANCE = "汇报必须让人类一眼知道任务的实际进展和下一步。summary 先直接回答任务效果，用 ## 本轮结论、## 已完成、## 尚未完成 分章节，通常不超过600字；内部执行安排不出现在摘要或agentNextSteps。stopReason 解释原执行回合实际停下的原因，不得将本次补报告的只读限制说成用户要求停下。若仅有执行提前结束的证据，应明确代理未继续完成剩余验收，不得虚构用户限制。agentNextSteps 中的主线程、验收进程等内部角色统一写作代理负责的工作；不能以等待主线程为由把可继续执行的工作留给用户。stopReason 写实际停下的原因，区分外部条件与代理可自行解决的技术问题。humanActions 仅列确实需要用户处理的事项，每项 action 写具体动作和提交位置，reason 写为什么必须由用户处理，unblocks 写完成后恢复哪项工作；不要要求在任务文本中粘贴密码或令牌。先检查已有授权材料，不得重复索取。若当前无需用户操作，humanActions 返回空数组，并在 agentNextSteps 写代理负责的具体工作。agentNextSteps 列出代理能独立执行及拿到条件后执行的步骤。禁止用‘可先继续推进’‘下一次汇报再明确’等含糊措辞。不要把浏览器配置占用、下载失败等可修复问题转嫁用户。不得用 CI 构建成功代替安装回归或类型检查通过。";
 const STEER_SCHEMA = objectSchema({ userUpdate:stringSchema, deliveryMode:{type:"string",enum:["steer","reply_only"]}, understanding:stringSchema, workerIds:stringsSchema, instructions:stringSchema });
+const {nextWorkers: _nextWorkers, ...directDecision} = REVIEW_SCHEMA.properties;
+const DIRECT_SCHEMA = objectSchema({...WORK_SCHEMA.properties, ...directDecision, instructionReplies:{type:"array",items:objectSchema({instructionId:stringSchema,replyOnly:{type:"boolean"},userUpdate:stringSchema})}});
+const QUICK_MANDATE = "当前为快速模式：你是向用户负责的消息代理，亲自完成代码更改、验证及汇报，全程不得分配 Worker 或创建子代理。系统默认协作角色及历史线程中的禁止直接实现要求在此模式不适用；用户自定义限制、权限和审批约束仍须遵守。按本轮实际授权权限执行，只读时不得写入或擅自提升权限。持续完成全部验收；未完成且可以继续时返回 continue 并直接继续，不生成 Worker 计划。保留原文、快照、附件和引用，检查引用图片，沿用已验证证据。追加消息仅询问进度时直接答复并在 instructionReplies 中标记 replyOnly=true，不将其作为实施目标。其他追加指示纳入本轮。返回真实 changedFiles、verification、artifacts 和验收结论；失败或未执行的必要检查不得标记完成。";
+const isQuick = (run:TaskExecutionRun) => run.settings.executionMode === "quick";
+const agentPrompt = (settings:TaskModeSettings) => settings.executionMode === "quick" && settings.agentPrompt === DEFAULT_TASK_MODE_SETTINGS.agentPrompt ? QUICK_TASK_MODE_AGENT_PROMPT : settings.agentPrompt;
 const activePhases = new Set(["planning","working","reviewing"]);
 const readyPhases = new Set(["idle","completed","needs_confirmation"]);
 const queuedInstruction = (entry:TaskInstruction) => entry.status==="queued"&&!entry.archivedAt&&!entry.deletedAt;
@@ -41,6 +46,13 @@ const text = (value:unknown) => typeof value === "string" ? value : "";
 const array = (value:unknown): unknown[] => Array.isArray(value) ? value : [];
 const object = (value:unknown): Record<string,unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string,unknown> : {};
 const strings = (value:unknown) => array(value).map(text).filter(Boolean);
+function verificationFor(job:TaskExecutionJob,direct:boolean):TaskVerification[] {
+  return array(job.output?.verification).map(object).filter(value=>["passed","failed","not_run"].includes(text(value.result))).map(value=>{
+    const command=text(value.command),observed=[...job.items].reverse().find(item=>item.kind==="command"&&item.command===command);
+    const failed=direct&&observed?.kind==="command"&&observed.exitCode!==undefined&&observed.exitCode!==null&&observed.exitCode!==0;
+    return {command,result:failed?"failed":text(value.result) as TaskVerification["result"],details:failed?`执行记录退出码 ${observed.exitCode}；代理报告：${text(value.result)}。${text(value.details)}`:text(value.details)};
+  });
+}
 
 export class TaskModeError extends Error { constructor(readonly status:number,message:string) { super(message); } }
 
@@ -137,7 +149,7 @@ export class TaskModeService extends EventEmitter {
   async settings(input:unknown, taskId?:string) {
     const normalized=validateSettings(input);
     if(normalized.permissionPreset==="full_access"&&object(input).fullAccessConfirmed!==true)throw new TaskModeError(400,"请明确确认完全访问权限后保存");
-    if(taskId)return this.serial(taskId,async()=>{this.requireTask(taskId);const state=this.data.ensure(taskId);state.settings=normalized;const activeRun=state.runs.find(run=>run.id===state.activeRunId);if(activeRun&&!activeRun.result)activeRun.settings.approvalsReviewer=normalized.approvalsReviewer;this.save(state,"任务设置已更新；审批策略用于后续 Codex 回合，其余设置用于下一轮执行");return normalized;});
+    if(taskId)return this.serial(taskId,async()=>{this.requireTask(taskId);const state=this.data.ensure(taskId);state.settings=normalized;this.save(state,"任务设置已更新；全部设置用于下一轮执行，当前轮次保持发送时的配置");return normalized;});
     this.data.saveSettings(normalized);return normalized;
   }
   submit(taskId:string,input:SubmitTaskInstruction) {
@@ -196,7 +208,7 @@ export class TaskModeService extends EventEmitter {
       }
       if(action==="pause"){
         if(!activePhases.has(state.phase))throw new TaskModeError(409,"当前没有正在执行的任务");
-        state.phase="paused";state.heartbeat.status="idle";state.heartbeat.message="任务已暂停，心跳检查等待恢复";state.heartbeat.nextRetryAt=undefined;this.save(state,"已请求暂停；正在中断代理和 Worker");
+        state.phase="paused";state.heartbeat.status="idle";state.heartbeat.message="任务已暂停，心跳检查等待恢复";state.heartbeat.nextRetryAt=undefined;this.save(state,run&&isQuick(run)?"已请求暂停；正在中断消息代理的直接执行":"已请求暂停；正在中断代理和 Worker");
         const errors:string[]=[];
         for(const job of run?.jobs.filter(job=>job.status==="active")??[]){if(job.threadId&&job.turnId)try{await this.conversations.interrupt(taskId,job.threadId,job.turnId);}catch(error){errors.push(errorText(error));}}
         if(errors.length){state.error=`部分中断未确认：${errors.join("；")}`;this.save(state,state.error);}
@@ -238,8 +250,12 @@ export class TaskModeService extends EventEmitter {
       run={id:id(),instructionIds:queued.map(entry=>entry.id),createdAt:now(),settings:structuredClone(state.settings),jobs:[],reviewAttempt:0};
       state.runs.push(run);state.activeRunId=run.id;state.phase="planning";state.error=undefined;
       for(const entry of queued){entry.status="submitted";entry.runId=run.id;}
-      const plan=this.job("plan","任务代理 · 理解与拆分",this.planText(state,run),run.settings.agentModel);plan.threadId=state.agentThreadId;run.jobs.push(plan);
-      this.save(state,"代理开始理解需求并安排 Worker");this.syncTaskStatus(state);
+      const previous=state.runs.at(-2);
+      // A fresh agent thread at a mode boundary avoids inherited read-only/dispatch mandates.
+      if(previous && isQuick(previous)!==isQuick(run))state.agentThreadId=undefined;
+      const first=isQuick(run)?this.directJob(state,run):this.job("plan","任务代理 · 理解与拆分",this.planText(state,run),run.settings.agentModel);
+      first.threadId=state.agentThreadId;run.jobs.push(first);state.phase=isQuick(run)?"working":"planning";
+      this.save(state,isQuick(run)?"消息代理开始直接执行，不分配 Worker":"代理开始理解需求并安排 Worker");this.syncTaskStatus(state);
     }
     if(!run)return;
     // Read the authoritative turn before advancing the durable workflow.
@@ -268,11 +284,14 @@ export class TaskModeService extends EventEmitter {
       if(job.role==="plan")this.acceptPlan(state,run,job);
       if(job.role==="steer")await this.deliverSteer(state,run,job);
       if(job.role==="review"&&(!run.result||job.purpose==="clarify_report"))await this.finishRun(state,run,job);
+      if(job.role==="execute"&&!run.result)await this.finishDirect(state,run,job);
       job.processed=true;this.data.save(state);
     }
     if(run.result&&!run.jobs.some(job=>job.purpose==="clarify_report"&&!job.processed)){state.heartbeat.status="idle";state.heartbeat.checkedAt=now();state.heartbeat.nextRetryAt=undefined;this.data.save(state);this.syncTaskStatus(state);if(state.instructions.some(queuedInstruction))setTimeout(()=>this.schedule(taskId),0);return;}
     const additions=state.instructions.filter(entry=>queuedInstruction(entry)&&entry.timing==="now");
-    if(additions.length&&state.phase==="planning"){
+    if(isQuick(run)){
+      await this.deliverDirectAdditions(state,run,additions);
+    }else if(additions.length&&state.phase==="planning"){
       const planner=run.jobs.find(job=>job.role==="plan"&&job.status==="active");
       if(planner?.threadId&&planner.turnId){for(const entry of additions){await this.conversations.steer(taskId,planner.threadId,{clientMessageId:`tm-steer-${entry.id}`,expectedTurnId:planner.turnId,text:this.instructionText(entry)});entry.status="agent_received";entry.agentReceivedAt=now();entry.runId=run.id;run.instructionIds.push(entry.id);}this.save(state,"追加指示已送达任务代理");}
     }else if(additions.length&&state.phase==="working"&&!run.jobs.some(job=>job.role==="steer"&&["active","pending"].includes(job.status))){
@@ -337,20 +356,21 @@ export class TaskModeService extends EventEmitter {
     heartbeat.recoveryAttempts=0;heartbeat.nextRetryAt=undefined;heartbeat.message=undefined;
   }
   private async startJob(state:TaskModeState,run:TaskExecutionRun,job:TaskExecutionJob):Promise<void> {
+    if(isQuick(run)&&["plan","worker","steer"].includes(job.role))throw new Error("快速模式禁止创建 Worker 或协作计划");
     const task=this.requireTask(state.taskId);const cwd=task.repositoryPath||task.contextDirectory;
     const toolRoot=findTaskSkillProjectRoot([process.cwd(),path.resolve(import.meta.dirname,"../../.."),path.resolve(import.meta.dirname,"../../../..")]);
     const quote=(value:string)=>`'${value.replaceAll("'",process.platform==="win32"?"''":"'\\''")}'`;
     const tagTools=toolRoot?`\n任务标签工具（当前任务 ${task.id}）：可通过 exec 命令查询项目标签并按明确需求补充当前任务标签。\nnode ${quote(path.join(taskSkillSource(toolRoot),"scripts","task-monitor.mjs"))} tags --project ${quote(task.project)}\nnode ${quote(path.join(taskSkillSource(toolRoot),"scripts","task-monitor.mjs"))} tag ${quote(task.id)} --add '选择的标签名称'\n调用前将占位名称替换为当前任务对应的目录标签；按任务内容选择，不固定套用示例。使用 --remove 移除明确不再适用的标签。优先复用项目目录中的标签，单任务最多12个；保留无关和人工设置的标签，不用标签替代执行状态。CLI 私下加载认证，不读取或打印认证文件。标签变更无需重启任务。`:"";
-    const developerInstructions=(job.role==="worker"?run.settings.workerPrompt:`${run.settings.agentPrompt}\n${AGENT_MANDATE}\n${TASK_AGENT_COMMUNICATION}\n当前负责的任务：${task.title}`)+tagTools;
+    const developerInstructions=(job.role==="worker"?run.settings.workerPrompt:`${agentPrompt(run.settings)}\n${isQuick(run)?QUICK_MANDATE:AGENT_MANDATE}\n${TASK_AGENT_COMMUNICATION}\n当前负责的任务：${task.title}`)+(job.purpose==="clarify_report"?"\n本回合仅只读补充已有报告，不执行代码更改、命令或重新验收。":"")+tagTools;
     if(!job.threadId){let created;try{created=await this.conversations.create(task.id,{clientMessageId:`tm-create-${job.id}-${job.attempt}`,displayName:`${task.key} · ${job.name}`,model:job.model},{cwd,approvalsReviewer:run.settings.approvalsReviewer,developerInstructions,primary:job.role!=="worker"});}catch(error){if(error instanceof TaskConversationServiceError&&error.code==="CREATE_FAILED"){job.attempt++;this.data.save(state);return this.startJob(state,run,job);}throw error;}job.threadId=created.conversation.threadId;if(job.role!=="worker")state.agentThreadId=job.threadId;this.data.save(state);}
-    const outputSchema=job.role==="plan"?PLAN_SCHEMA:job.role==="worker"?WORK_SCHEMA:job.role==="steer"?STEER_SCHEMA:REVIEW_SCHEMA;
+    const outputSchema=job.role==="execute"?DIRECT_SCHEMA:job.role==="plan"?PLAN_SCHEMA:job.role==="worker"?WORK_SCHEMA:job.role==="steer"?STEER_SCHEMA:REVIEW_SCHEMA;
     const prepared=prepareTaskModeInput(task.contextDirectory,state,run,job);
-    if(prepared.packet){const changed=job.contextPacket?.sha256!==prepared.packet.sha256;job.contextPacket=prepared.packet;if(changed)this.save(state,`大段任务材料已完整保存（${prepared.packet.originalCharacters} 字符），${job.name} 将按需读取证据；已有 Worker 结果沿用`);}
-    const sent=await this.conversations.send(task.id,job.threadId,{clientMessageId:`tm-turn-${job.id}-${job.attempt}`,text:prepared.text,model:job.model,effort:run.settings.effort,permissionPreset:job.role==="worker"?run.settings.permissionPreset:"read_only"},{cwd,outputSchema,approvalsReviewer:run.settings.approvalsReviewer,developerInstructions});
+    if(prepared.packet){const changed=job.contextPacket?.sha256!==prepared.packet.sha256;job.contextPacket=prepared.packet;if(changed)this.save(state,`大段任务材料已完整保存（${prepared.packet.originalCharacters} 字符），${job.name} 将按需读取证据；${isQuick(run)?"已有直接执行结果沿用":"已有 Worker 结果沿用"}`);}
+    const sent=await this.conversations.send(task.id,job.threadId,{clientMessageId:`tm-turn-${job.id}-${job.attempt}`,text:prepared.text,model:job.model,effort:run.settings.effort,permissionPreset:job.role==="worker"||job.role==="execute"?run.settings.permissionPreset:"read_only"},{cwd,outputSchema,approvalsReviewer:run.settings.approvalsReviewer,developerInstructions});
     if(sent.operation.state==="failed"){job.attempt++;this.data.save(state);return this.startJob(state,run,job);}
     const turnId=sent.operation.turnId||text(object(sent.turn).id);if(!turnId)throw new Error("执行请求正在恢复，尚未得到确定的 turnId");
     job.turnId=turnId;job.status="active";job.error=undefined;job.errorCode=undefined;job.outputReadAttempts=undefined;
-    for(const entry of state.instructions.filter(entry=>run.instructionIds.includes(entry.id))){if(job.role==="plan"){entry.status="agent_received";entry.agentReceivedAt??=now();}if(job.role==="worker"){entry.status="worker_received";entry.workerReceivedAt??=now();entry.deliveries.push({workerId:job.id,turnId,receivedAt:now()});}}
+    for(const entry of state.instructions.filter(entry=>run.instructionIds.includes(entry.id))){if(job.role==="plan"||job.role==="execute"){entry.status="agent_received";entry.agentReceivedAt??=now();}if(job.role==="worker"){entry.status="worker_received";entry.workerReceivedAt??=now();entry.deliveries.push({workerId:job.id,turnId,receivedAt:now()});}}
     this.save(state,`${job.name} 已接收执行请求`);
   }
   private acceptPlan(state:TaskModeState,run:TaskExecutionRun,job:TaskExecutionJob) {
@@ -406,6 +426,35 @@ export class TaskModeService extends EventEmitter {
     for(const entry of entries)if(!run.instructionIds.includes(entry.id)){entry.status="queued";entry.runId=undefined;entry.timing="after";}
     this.save(state,delivered?"追加指示已送达对应 Worker":"当前 Worker 已结束，追加指示进入下一轮");
   }
+  private directJob(state:TaskModeState,run:TaskExecutionRun,previous?:TaskRunResult):TaskExecutionJob {
+    const job=this.job("execute","消息代理 · 直接执行与汇报",`${agentPrompt(run.settings)}\n${QUICK_MANDATE}\n${TASK_AGENT_COMMUNICATION}\n${DOCUMENT_GUIDANCE}\n${REPORT_GUIDANCE}\n验收输出：全部完成且必要检查真实通过才 acceptanceReady=true、status=done；仍可继续则 acceptanceReady=false、status=continue、pauseCategory=none、remainingWork 列出具体工作；确有阻塞返回 blocked 及具体 pauseCategory、stopReason、humanActions。instructionReplies 记录本轮追加消息的真实答复（没有时为空数组）。\n工作目录：${this.requireTask(state.taskId).repositoryPath}\n本轮原始需求和全部指示：\n${this.runText(state,run)}\n${previous?`此前阶段结果：${JSON.stringify(previous)}\n沿用已有改动、验证和材料，先检查实际状态，只处理剩余目标，避免重复副作用。`:""}`,run.settings.agentModel);
+    job.threadId=state.agentThreadId;job.cycle=run.iteration??0;return job;
+  }
+  private async deliverDirectAdditions(state:TaskModeState,run:TaskExecutionRun,entries:TaskInstruction[]) {
+    const executor=run.jobs.find(job=>job.role==="execute"&&["active","pending"].includes(job.status));
+    if(!executor)return;
+    for(const entry of entries){
+      const message=`${QUICK_MANDATE}\n追加指示（纯进度询问直接答复并标记 replyOnly，不改变实施目标）：\n${this.instructionText(entry)}`;
+      if(executor.status==="pending")executor.text+="\n\n"+message;
+      else if(executor.threadId&&executor.turnId){
+        const prepared=prepareTaskModeInput(this.requireTask(state.taskId).contextDirectory,state,{...run,instructionIds:[...run.instructionIds,entry.id]},{...executor,id:`${executor.id}-${entry.id}`,text:message});
+        try{await this.conversations.steer(state.taskId,executor.threadId,{clientMessageId:`tm-direct-steer-${entry.id}`,expectedTurnId:executor.turnId,text:prepared.text});}
+        catch(error){if(error instanceof TaskConversationServiceError&&error.status===409){entry.timing="after";continue;}throw error;}
+      }else continue;
+      entry.status="agent_received";entry.agentReceivedAt=now();entry.runId=run.id;
+      if(!run.instructionIds.includes(entry.id))run.instructionIds.push(entry.id);
+      this.save(state,"追加指示已送达消息代理，继续直接执行");
+    }
+  }
+  private async finishDirect(state:TaskModeState,run:TaskExecutionRun,job:TaskExecutionJob) {
+    for(const value of array(job.output?.instructionReplies)){
+      const reply=object(value),entry=state.instructions.find(entry=>entry.id===reply.instructionId&&run.instructionIds.includes(entry.id));
+      if(!entry)continue;
+      entry.agentReply=text(reply.userUpdate);
+      if(reply.replyOnly===true){entry.replyOnly=true;entry.status="completed";entry.completedAt=now();entry.result=undefined;run.instructionIds=run.instructionIds.filter(id=>id!==entry.id);}
+    }
+    await this.finishRun(state,run,job);
+  }
   private async finishRun(state:TaskModeState,run:TaskExecutionRun,review:TaskExecutionJob) {
     review.processed=true;
     if(review.purpose==="clarify_report"&&run.result){
@@ -414,18 +463,23 @@ export class TaskModeService extends EventEmitter {
       if(!hasTaskActionGuidance(result))throw new Error("代理仍未提供具体行动说明，原汇报和执行结果已保留");
       this.saveRunResult(state,run,result);return;
     }
-    const workers=this.latestWorkers(run),cycleWorkers=run.jobs.filter(job=>job.role==="worker"&&(job.cycle??0)===(run.iteration??0));
+    const evidenceRole=isQuick(run)?"execute":"worker";
+    const workers=isQuick(run)?run.jobs.filter(job=>job.role==="execute"&&job.status==="completed"):this.latestWorkers(run),cycleWorkers=run.jobs.filter(job=>job.role===evidenceRole&&(job.cycle??0)===(run.iteration??0));
     const artifacts:TaskAttachment[]=[],artifactRisks:string[]=[];
-    for(const worker of workers)for(const entry of array(worker.output?.artifacts).slice(0,12)){try{const attachment=this.importArtifact(state.taskId,`${run.id}:${worker.id}`,text(object(entry).path),text(object(entry).title));if(attachment)artifacts.push(attachment);}catch(error){artifactRisks.push(errorText(error));}}
+    for(const worker of workers)for(const entry of array(worker.output?.artifacts).slice(0,12)){try{const attachment=this.importArtifact(state.taskId,`${run.id}:${worker.id}`,text(object(entry).path),text(object(entry).title),isQuick(run));if(attachment&&!artifacts.some(file=>file.id===attachment.id))artifacts.push(attachment);}catch(error){artifactRisks.push(errorText(error));}}
     const reported=text(review.output?.status);if(!["done","continue","blocked","needs_confirmation"].includes(reported))throw new Error("代理没有返回有效的验收结论");
-    const currentFailures=cycleWorkers.some(worker=>strings(worker.output?.blockers).length>0||array(worker.output?.verification).some(check=>object(check).result==="failed"));
+    const allChecks=workers.flatMap(worker=>verificationFor(worker,isQuick(run)));
+    // Keep the full history in jobs; a later unrelated check cannot erase an unresolved failure.
+    const verification=isQuick(run)?[...new Map(allChecks.map(check=>[check.command,check])).values()]:allChecks;
+    const failedChecks=isQuick(run)?verification.some(check=>check.result==="failed"||check.result==="not_run"):cycleWorkers.some(worker=>verificationFor(worker,false).some(check=>check.result==="failed"));
+    const currentFailures=cycleWorkers.some(worker=>strings(worker.output?.blockers).length>0)||failedChecks||isQuick(run)&&run.jobs.some(job=>job.role==="execute"&&(strings(job.output?.changedFiles).length>0||job.items.some(item=>item.kind==="file_change")))&&!verification.some(check=>check.result==="passed");
     const explicit=typeof review.output?.acceptanceReady==="boolean";
     const remaining=strings(review.output?.remainingWork);
     const nextWorkers=array(review.output?.nextWorkers).map(object).filter(value=>text(value.objective).trim());
     const pause=text(review.output?.pauseCategory);
     const ready=(explicit?review.output!.acceptanceReady===true&&remaining.length===0&&pause==="none":reported==="done"||reported==="needs_confirmation")&&!currentFailures&&!artifactRisks.length;
     const needsReview=run.settings.reviewPolicy==="always"||(run.settings.reviewPolicy==="artifacts"&&artifacts.length>0);
-    const result:TaskRunResult={status:"in_progress",summary:text(review.output?.summary),changedFiles:[...new Set(run.jobs.filter(job=>job.role==="worker").flatMap(worker=>[...strings(worker.output?.changedFiles),...worker.items.flatMap(item=>item.kind==="file_change"?item.paths:[])]))],verification:workers.flatMap(worker=>array(worker.output?.verification).map(object).filter(value=>["passed","failed","not_run"].includes(text(value.result))).map(value=>({command:text(value.command),result:text(value.result) as TaskVerification["result"],details:text(value.details)}))),risks:[...new Set([...strings(review.output?.risks),...cycleWorkers.flatMap(worker=>[...strings(worker.output?.risks),...strings(worker.output?.blockers)]),...artifactRisks])],artifacts,changes:run.jobs.filter(job=>job.role==="worker").flatMap(worker=>worker.items.flatMap(item=>item.kind==="file_change"?item.changes??[]:[])),...this.actionGuidance(review),acceptanceReady:ready};
+    const result:TaskRunResult={status:"in_progress",summary:text(review.output?.summary),changedFiles:[...new Set(run.jobs.filter(job=>job.role===evidenceRole).flatMap(worker=>[...strings(worker.output?.changedFiles),...worker.items.flatMap(item=>item.kind==="file_change"?item.paths:[])]))],verification,risks:[...new Set([...strings(review.output?.risks),...cycleWorkers.flatMap(worker=>[...strings(worker.output?.risks),...strings(worker.output?.blockers)]),...artifactRisks])],artifacts,changes:run.jobs.filter(job=>job.role===evidenceRole).flatMap(worker=>worker.items.flatMap(item=>item.kind==="file_change"?item.changes??[]:[])),...this.actionGuidance(review),acceptanceReady:ready};
     const human=result.humanActions??[];
     if(ready&&pause!=="blocked"&&pause!=="unclear_requirement"&&pause!=="exception"){
       result.status=reported==="needs_confirmation"||needsReview||human.length>0?"needs_confirmation":"done";
@@ -441,7 +495,7 @@ export class TaskModeService extends EventEmitter {
     result.humanActions=[];result.stopReason="";
     result.agentNextSteps=[...new Set(strings(review.output?.agentNextSteps))];
     result.internalNextSteps=[...new Set([...remaining,...nextWorkers.map(value=>text(value.objective))])];
-    if(!result.agentNextSteps.length)result.agentNextSteps=[currentFailures?"代理复核未通过的验证，安排原负责人修复并再次检查验收条件":"代理继续核对完整验收条件并安排尚未完成的工作"];
+    if(!result.agentNextSteps.length)result.agentNextSteps=[isQuick(run)?"消息代理直接继续处理剩余工作及未通过的验证":currentFailures?"代理复核未通过的验证，安排原负责人修复并再次检查验收条件":"代理继续核对完整验收条件并安排尚未完成的工作"];
     if(!explicit&&reported==="blocked"&&!hasTaskActionGuidance({...result,status:"blocked",stopReason:text(review.output?.stopReason)})){
       if(review.purpose==="continuation_review")throw new Error("代理仍未提供可执行的持续推进决定，原结果已保留");
       this.saveMilestone(state,run,result);
@@ -456,24 +510,25 @@ export class TaskModeService extends EventEmitter {
       result.humanActions=[{action:"查看最近几次 Codex 执行记录，补充异常信息或调整执行设置后继续执行",reason:"相同方法连续未产生新的改动、验证结果或审查材料",unblocks:"代理将从最近结果继续诊断和完成验收"}];this.saveRunResult(state,run,result);return;
     }
     this.saveMilestone(state,run,result);run.iteration=(run.iteration??0)+1;
-    if(nextWorkers.length){this.acceptPlan(state,run,{...review,purpose:"continuation_plan",output:{understanding:result.summary,workers:nextWorkers}});}
+    if(isQuick(run)){run.jobs.push(this.directJob(state,run,result));state.phase="working";}
+    else if(nextWorkers.length){this.acceptPlan(state,run,{...review,purpose:"continuation_plan",output:{understanding:result.summary,workers:nextWorkers}});}
     else{
       const plan=this.job("plan","任务代理 · 继续安排剩余工作",`${this.planText(state,run)}\n最新阶段汇报：${JSON.stringify(result)}\n只安排仍未完成的工作，复用合适的原负责人。Worker 结果：${JSON.stringify(workers.map(worker=>({workerId:worker.id,name:worker.name,ownedPaths:worker.ownedPaths,result:worker.output})))}`,run.settings.agentModel);
       plan.purpose="continuation_plan";plan.cycle=run.iteration;plan.threadId=state.agentThreadId;run.jobs.push(plan);state.phase="planning";
     }
-    this.save(state,"阶段检查已完成，代理自动安排剩余工作，持续推进至可验收");this.syncTaskStatus(state);
+    this.save(state,isQuick(run)?"阶段结果已记录，消息代理直接继续剩余工作，持续推进至可验收":"阶段检查已完成，代理自动安排剩余工作，持续推进至可验收");this.syncTaskStatus(state);
   }
   private executionPhase(run:TaskExecutionRun):TaskModeState["phase"]{
     const unfinished=run.jobs.filter(job=>job.status!=="completed"||!job.processed);
     if(unfinished.some(job=>job.role==="review"))return "reviewing";
     if(unfinished.some(job=>job.role==="plan"))return "planning";
-    return run.jobs.some(job=>job.role==="worker")?"working":"planning";
+    return isQuick(run)||run.jobs.some(job=>job.role==="worker")?"working":"planning";
   }
   private latestWorkers(run:TaskExecutionRun):TaskExecutionJob[]{
     const latest=new Map<string,TaskExecutionJob>();for(const worker of run.jobs.filter(job=>job.role==="worker"))latest.set(worker.ownerId??worker.id,worker);return [...latest.values()];
   }
   private saveMilestone(state:TaskModeState,run:TaskExecutionRun,result:TaskRunResult):void{
-    for(const entry of state.instructions.filter(entry=>run.instructionIds.includes(entry.id))){entry.result=result;entry.status="worker_received";entry.completedAt=undefined;}
+    for(const entry of state.instructions.filter(entry=>run.instructionIds.includes(entry.id))){entry.result=result;entry.status=isQuick(run)?"agent_received":"worker_received";entry.completedAt=undefined;}
     this.conversations.store.addReport(state.taskId,{status:"progress",summary:result.summary||"代理正在继续完成剩余工作",changedFiles:result.changedFiles,verification:result.verification,risks:result.risks,nextStep:result.agentNextSteps?.join("\n"),taskStatus:"in_progress"});
     this.save(state,"阶段进展已记录，代理继续执行，尚未提交最终验收");
   }
@@ -490,7 +545,7 @@ export class TaskModeService extends EventEmitter {
     const nextStep=guidance?[result.humanActions!.length?`你需要做什么：\n${result.humanActions!.map((item,index)=>`${index+1}. ${item.action}\n原因：${item.reason}\n完成后：${item.unblocks}`).join("\n")}`:"你需要做什么：当前无需操作。",result.agentNextSteps!.length?`代理下一步：\n${result.agentNextSteps!.map((step,index)=>`${index+1}. ${step}`).join("\n")}`:""].filter(Boolean).join("\n\n"):"本轮汇报缺少具体行动说明，请点击‘补齐行动说明’；保留已有代码和产物，仅请代理补齐停下原因、用户行动和代理下一步。";
     this.conversations.store.addReport(state.taskId,{status:result.status==="blocked"?"blocked":"completed",summary:result.summary||"本轮执行结束",changedFiles:result.changedFiles,verification:result.verification,risks:result.risks,blockers:result.status==="blocked"?[result.stopReason||"汇报缺少具体停下原因",...(result.humanActions??[]).map(item=>item.reason)]:[],nextStep,taskStatus:result.status==="blocked"?"blocked":this.hasPendingReview(state)?"pending_manual_acceptance":"done"});
   }
-  private importArtifact(taskId:string,runId:string,filename:string,title:string):TaskAttachment|undefined {
+  private importArtifact(taskId:string,runId:string,filename:string,title:string,deduplicateContent=false):TaskAttachment|undefined {
     if(!filename)return;const task=this.requireTask(taskId),root=fs.realpathSync(task.repositoryPath||task.contextDirectory),candidate=fs.realpathSync(path.resolve(root,filename));
     const relative=path.relative(root,candidate);if(relative.startsWith("..")||path.isAbsolute(relative))throw new Error(`审查附件不在任务工作目录内：${filename}`);
     const stat=fs.statSync(candidate);if(!stat.isFile()||stat.size>10*1024*1024)throw new Error(`审查附件不是文件或超过 10 MB：${filename}`);
@@ -499,6 +554,7 @@ export class TaskModeService extends EventEmitter {
     const bytes=fs.readFileSync(candidate),contentHash=crypto.createHash("sha256").update(bytes).digest("hex");
     const importKey=crypto.createHash("sha256").update(candidate).update(bytes).digest("hex");
     if(this.conversations.store.feedbackImportDeleted(taskId,storageName,importKey,contentHash))return;
+    if(deduplicateContent){const imported=task.attachments.find(file=>file.source==="feedback"&&this.conversations.store.attachment(taskId,file.id)?.importKey===importKey);if(imported)return imported;}
     const existing=task.attachments.find(attachment=>path.basename(this.conversations.store.attachment(taskId,attachment.id)?.filePath??"")===storageName);if(existing)return existing;
     fs.copyFileSync(candidate,path.join(this.conversations.store.attachmentDirectory(taskId),storageName));
     // A report title is a label, not a filename. Keep the real basename (including suffix).
@@ -523,8 +579,8 @@ export class TaskModeService extends EventEmitter {
   private async validateExecution(task:TaskItem,settings:TaskModeSettings) {
     if(!task.repositoryPath||!fs.existsSync(task.repositoryPath)||!fs.statSync(task.repositoryPath).isDirectory())throw new TaskModeError(422,"请先为任务设置可访问的项目工作目录");
     const models=await this.conversations.manager.models();
-    for(const name of new Set([settings.agentModel,settings.workerModel])){const model=models.find(model=>model.id===name);if(!model)throw new TaskModeError(400,`当前 Codex 账号不可用模型 ${name}，请在代理设置中选择可用模型`);if(model.efforts.length&&!model.efforts.includes(settings.effort))throw new TaskModeError(400,`模型 ${name} 不支持所选推理强度`);}
-    const slots=(settings.workerPolicy==="single"?1:settings.maxWorkers)+1;
+    for(const name of new Set(settings.executionMode==="quick"?[settings.agentModel]:[settings.agentModel,settings.workerModel])){const model=models.find(model=>model.id===name);if(!model)throw new TaskModeError(400,`当前 Codex 账号不可用模型 ${name}，请在代理设置中选择可用模型`);if(model.efforts.length&&!model.efforts.includes(settings.effort))throw new TaskModeError(400,`模型 ${name} 不支持所选推理强度`);}
+    const slots=settings.executionMode==="quick"?1:(settings.workerPolicy==="single"?1:settings.maxWorkers)+1;
     if(task.maxConcurrency<slots)this.conversations.store.update(task.id,{maxConcurrency:slots});
   }
   private planText(state:TaskModeState,run:TaskExecutionRun) {return `${run.settings.agentPrompt}\n${AGENT_MANDATE}\n${TASK_AGENT_COMMUNICATION}\n可复用 Worker：${JSON.stringify(this.latestWorkers(run).map(worker=>({workerId:worker.id,name:worker.name,ownedPaths:worker.ownedPaths})))}\nworkerId 仅用于复用已有执行者；没有可复用 Worker 时填空字符串，新的标识由系统创建。\n协作策略：${run.settings.workerPolicy}。Worker 上限：${run.settings.workerPolicy==="single"?1:run.settings.maxWorkers}。请输出理解和可独立执行的 Worker 分工。ownedPaths 明确互不重叠的文件或目录；范围不能独立时安排一个 Worker。不要自行启动子代理或修改文件。\n${this.runText(state,run)}`;}
@@ -539,8 +595,9 @@ export class TaskModeService extends EventEmitter {
 
 export function validateSettings(input:unknown):TaskModeSettings {
   const value=object(input);const settings={...DEFAULT_TASK_MODE_SETTINGS,...value} as TaskModeSettings;
+  if(!["collaborative","quick"].includes(settings.executionMode??"collaborative"))throw new TaskModeError(400,"无效的执行模式");
   if(!["auto_review","user"].includes(settings.approvalsReviewer)||!["auto","parallel","single"].includes(settings.workerPolicy)||!["agent","artifacts","always"].includes(settings.reviewPolicy)||!["read_only","workspace_write","full_access"].includes(settings.permissionPreset)||!["minimal","low","medium","high","xhigh"].includes(settings.effort))throw new TaskModeError(400,"代理设置包含无效选项");
   if(!Number.isInteger(settings.maxWorkers)||settings.maxWorkers<1||settings.maxWorkers>8)throw new TaskModeError(400,"Worker 数量必须为 1–8");
   for(const key of ["agentModel","workerModel","agentPrompt","workerPrompt"] as const)if(typeof settings[key]!=="string"||!settings[key].trim()||settings[key].length>(key.endsWith("Prompt")?15000:150))throw new TaskModeError(400,`无效的 ${key}`);
-  return {agentModel:settings.agentModel.trim(),workerModel:settings.workerModel.trim(),effort:settings.effort,workerPolicy:settings.workerPolicy,maxWorkers:settings.maxWorkers,permissionPreset:settings.permissionPreset,approvalsReviewer:settings.approvalsReviewer,reviewPolicy:settings.reviewPolicy,agentPrompt:settings.agentPrompt,workerPrompt:settings.workerPrompt};
+  return {executionMode:settings.executionMode??"collaborative",agentModel:settings.agentModel.trim(),workerModel:settings.workerModel.trim(),effort:settings.effort,workerPolicy:settings.workerPolicy,maxWorkers:settings.maxWorkers,permissionPreset:settings.permissionPreset,approvalsReviewer:settings.approvalsReviewer,reviewPolicy:settings.reviewPolicy,agentPrompt:settings.agentPrompt,workerPrompt:settings.workerPrompt};
 }

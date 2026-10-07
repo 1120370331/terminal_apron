@@ -4,7 +4,7 @@ import { hasTaskActionGuidance } from "../../shared/taskActionGuidance.js";
 
 export class TaskOutputParseError extends Error {
   constructor(role: TaskExecutionJob["role"]) {
-    super(`${({ plan: "任务分工", worker: "Worker 汇报", review: "代理检查结论", steer: "追加指示转发" })[role]}缺少有效的结构化结果，原始消息已保留`);
+    super(`${({ plan: "任务分工", worker: "Worker 汇报", review: "代理检查结论", steer: "追加指示转发", execute: "代理直接执行汇报" })[role]}缺少有效的结构化结果，原始消息已保留`);
   }
 }
 
@@ -29,6 +29,10 @@ const list = (value: unknown, predicate: (item: unknown) => boolean): boolean =>
 
 function validOutput(value: unknown, role: TaskExecutionJob["role"]): value is Record<string, unknown> {
   if (!record(value)) return false;
+  if (role === "execute") return validOutput(value, "worker") && validOutput({...value, nextWorkers: []}, "review")
+    && typeof value.acceptanceReady === "boolean"
+    && value.nextWorkers === undefined && value.workers === undefined
+    && list(value.instructionReplies, reply => record(reply) && typeof reply.instructionId === "string" && typeof reply.replyOnly === "boolean" && typeof reply.userUpdate === "string" && (!reply.replyOnly || Boolean(reply.userUpdate.trim())));
   if (value.userUpdate !== undefined && (typeof value.userUpdate !== "string" || !value.userUpdate.trim())) return false;
   if (role === "plan") return typeof value.understanding === "string" && Array.isArray(value.workers) && value.workers.length > 0 && value.workers.every(worker => record(worker) && typeof worker.name === "string" && typeof worker.objective === "string" && strings(worker.ownedPaths));
   if (role === "steer") return typeof value.understanding === "string" && strings(value.workerIds) && typeof value.instructions === "string"

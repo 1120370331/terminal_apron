@@ -16,6 +16,7 @@ export interface TaskModeHeartbeat {
 }
 export type InstructionStatus = "queued" | "submitted" | "agent_received" | "worker_received" | "completed" | "blocked";
 export interface TaskModeSettings {
+  executionMode?: "collaborative" | "quick";
   agentModel: string;
   workerModel: string;
   effort: TaskReasoningEffort;
@@ -28,11 +29,13 @@ export interface TaskModeSettings {
   workerPrompt: string;
 }
 export const DEFAULT_TASK_MODE_SETTINGS: TaskModeSettings = {
+  executionMode: "collaborative",
   agentModel: "gpt-6.1-sol", workerModel: "gpt-6.1-sol", effort: "medium", workerPolicy: "auto", maxWorkers: 3,
   permissionPreset: "workspace_write", approvalsReviewer: "auto_review", reviewPolicy: "artifacts",
   agentPrompt: "你是向用户负责的任务负责人，先清楚汇报任务目标完成到哪里、实际效果、未完成原因和下一步，内部调度留在执行记录中。持续推动整个任务直到满足验收条件。保留用户原文、附件和引用。理解目标后拆分明确、互不重叠的工作交给 Worker；你不直接实现。及时处理追加指示。检查 Worker 的证据，发现可处理的剩余工作就继续安排原负责人修复并复查。只在真实阻塞、影响实现的需求不明确或异常时暂停，说明具体原因及所需条件。阶段汇报、预览材料、某个 Worker 完成均不是整个任务的完成标准。达到验收条件后再提交最终审查，不把工具调用成功或 Worker 自报完成等同于验收通过。",
   workerPrompt: "你是执行 Worker，按代理给出的范围完成工作。你不独占工作区，禁止覆盖或撤销其他人的修改。不要自行创建子代理。接到追加指示后纳入执行，发现冲突及时报告。返回真实的总结、代码改动、验证命令与结果，以及需要审查的文件路径；不能伪造完成或验证证据。"
 };
+export const QUICK_TASK_MODE_AGENT_PROMPT = "你是向用户负责的消息代理，直接完成代码更改、验证和汇报，全程不分配 Worker 或创建子代理。保留用户原文、附件和引用，及时处理追加指示，沿用已有成果。遵守本轮权限、审批及用户自定义限制。未完成时亲自继续执行；全部验收具备真实证据后才汇报完成。";
 export interface TaskModeDocument { id: string; title: string; markdown: string; revision: number; createdAt: string; updatedAt: string }
 export interface RequirementSnapshot {
   title: string; descriptionMd: string; acceptanceCriteriaMd: string; revision: number; repositoryPath: string;
@@ -61,7 +64,7 @@ export interface TaskRunResult {
   pauseCategory?: "blocked" | "unclear_requirement" | "exception";
 }
 export interface TaskExecutionJob {
-  id: string; role: "plan" | "worker" | "review" | "steer"; name: string; objective: string; ownedPaths: string[];
+  id: string; role: "plan" | "worker" | "review" | "steer" | "execute"; name: string; objective: string; ownedPaths: string[];
   threadId?: string; turnId?: string; status: "pending" | "active" | "completed" | "failed" | "interrupted";
   attempt: number; text: string; model: string; output?: Record<string, unknown>; items: TaskConversationItem[]; error?: string; processed?: boolean;
   errorCode?: "invalid_structured_output"; outputReadAttempts?: number;

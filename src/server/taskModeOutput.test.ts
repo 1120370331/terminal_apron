@@ -6,6 +6,12 @@ import type { TaskConversationItem } from "../shared/taskConversationTypes.js";
 const output = { summary: "候选已准备，等待代理检查后发布", changedFiles: ["client/package.json"], verification: [{ command: "git show --check", result: "passed", details: "通过" }], risks: [], blockers: ["等待代理检查"], artifacts: [] };
 const message = (id: string, text: string, phase: "final" | "commentary" = "final"): TaskConversationItem => ({ kind: "assistant", id, text, phase });
 
+test("direct execution requires actual work and acceptance fields and rejects Worker plans",()=>{
+  const direct={...output,blockers:[],status:"done",stopReason:"",humanActions:[],agentNextSteps:[],acceptanceReady:true,pauseCategory:"none",remainingWork:[],instructionReplies:[]};
+  assert.deepEqual(parseTaskJobOutput([message("direct",JSON.stringify(direct))],"execute"),direct);
+  for(const invalid of [{...direct,verification:undefined},{...direct,acceptanceReady:undefined},{...direct,nextWorkers:[]},{...direct,workers:[]},{...direct,instructionReplies:[{instructionId:"q",replyOnly:true,userUpdate:""}]}])assert.throws(()=>parseTaskJobOutput([message("bad",JSON.stringify(invalid))],"execute"),TaskOutputParseError);
+});
+
 test("progress-only replies cannot contain worker dispatch instructions and legacy steering remains readable",()=>{
   const reply={userUpdate:"已经实施局部优化，完整耗时仍待验证。",deliveryMode:"reply_only",understanding:"仅询问进度",workerIds:[],instructions:""};
   assert.deepEqual(parseTaskJobOutput([message("reply",JSON.stringify(reply))],"steer"),reply);

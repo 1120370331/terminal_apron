@@ -20,6 +20,7 @@ export function formatTaskRunReport(task: TaskItem, state: TaskModeState, run: T
   const paused = result.status === "in_progress" && run.id === state.activeRunId && state.phase === "paused";
   const parts = [`# ${line(title)}`, `任务：${task.key} · 第 ${state.runs.findIndex(item => item.id === run.id) + 1} 轮\n\n开始时间：${run.createdAt}${run.completedAt ? `\n\n本轮结束时间：${run.completedAt}` : ""}`, `## 结论\n\n${paused ? "阶段进展，任务已手动暂停" : statuses[result.status]}${result.status === "in_progress" ? "。此文档仅记录当前阶段，任务尚未完成。" : "。"}`];
   const initial=state.instructions.find(entry=>run.instructionIds.includes(entry.id));
+  parts.push(`执行方式：${run.settings.executionMode==="quick"?"快速模式 · 消息代理直接修改、验证并汇报，不分配 Worker":"协作模式 · 代理安排 Worker 实施"}`);
   if(initial?.snapshot.descriptionMd)parts.push(`## 任务目标\n\n${initial.snapshot.descriptionMd}`);
   if (result.stopReason) parts.push(`## 停下原因\n\n${result.stopReason}`);
   parts.push(/^\s*#{1,4}\s+/m.test(result.summary) ? result.summary : `## 进展说明\n\n${result.summary || "尚未提供进展说明。"}`);

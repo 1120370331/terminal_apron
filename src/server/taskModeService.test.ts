@@ -408,7 +408,7 @@ test("rereading one failed report preserves a different Worker that is still run
   }finally{f.close();}
 });
 
-test("uses native Codex auto-review by default and persists manual review for subsequent turns",async()=>{
+test("uses native Codex auto-review and freezes review settings until the next run",async()=>{
   const f=setup();
   try{
     await f.mode.submit(f.task.id,{clientMessageId:"approval-default-001",text:"测试执行审批策略",timing:"now"});
@@ -422,10 +422,11 @@ test("uses native Codex auto-review by default and persists manual review for su
     f.manager.complete(planner!,{understanding:"检查手动模式",workers:[{name:"实现",objective:"执行授权范围",ownedPaths:["src/a.ts"]}]});
     const worker=await waitFor(()=>activeJob(f.mode,f.task.id,"worker"),Boolean);
     const turn=f.manager.calls.find(call=>call.method==="turn/start"&&call.params.threadId===worker!.threadId);
-    assert.equal(turn?.params.approvalsReviewer,"user");
+    assert.equal(turn?.params.approvalsReviewer,"auto_review");
     assert.equal(turn?.params.approvalPolicy,"on-request");
     assert.equal(turn?.params.sandboxPolicy.type,"workspaceWrite");
-    assert.equal(f.mode.detail(f.task.id).state.runs.at(-1)?.settings.approvalsReviewer,"user");
+    assert.equal(f.mode.detail(f.task.id).state.runs.at(-1)?.settings.approvalsReviewer,"auto_review");
+    assert.equal(f.mode.detail(f.task.id).state.settings.approvalsReviewer,"user");
     assert.throws(()=>validateSettings({...f.mode.detail(f.task.id).state.settings,approvalsReviewer:"approve_all"}),/无效选项/);
   }finally{f.close();}
 });
