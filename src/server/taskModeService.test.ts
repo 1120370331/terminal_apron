@@ -42,6 +42,27 @@ class ControlledManager extends EventEmitter {
 }
 const workerOutput={summary:"实现完成",changedFiles:["src/a.ts"],verification:[{command:"node --test",result:"passed",details:"通过"}],risks:[],blockers:[],artifacts:[]};
 
+test("list and detail expose recovered historical lower bounds and the same persistent coverage contract", () => {
+  const f = setup();
+  try {
+    const state = f.mode.data.ensure(f.task.id); state.phase = "paused";
+    state.runs.push({ id: "legacy-timing", instructionIds: [], createdAt: "2020-01-01T00:00:00Z", settings: state.settings, reviewAttempt: 0, jobs: [
+      { id: "historical-worker", role: "worker", name: "Worker", objective: "", ownedPaths: [], status: "completed", attempt: 0, text: "", model: "", items: [
+        { kind: "command", id: "measured", command: "verify", cwd: f.directory, status: "completed", durationMs: 12_345 }
+      ] }
+    ] });
+    f.mode.data.save(state);
+    const db = new DatabaseSync(f.store.dbPath);
+    db.prepare("UPDATE task_mode_processing SET total_ms=NULL,coverage=NULL,recovered_ms=NULL WHERE task_id=?").run(f.task.id); db.prepare("DELETE FROM task_mode_processing_verified WHERE task_id=?").run(f.task.id); db.close();
+    const detail = f.mode.detail(f.task.id).state, summary = f.mode.list().states.find(entry => entry.taskId === f.task.id)!;
+    for (const value of [detail, summary]) {
+      assert.equal(value.processedVerifiedDurationMs, 12_345); assert.equal(value.processingStartedAt, null);
+      assert.equal(value.processedTimingCoverage, "partial"); assert.equal(value.processedRecoveredDurationMs, 12_345);
+    }
+    assert.equal(f.mode.detail(f.task.id).state.processedVerifiedDurationMs, 12_345);
+  } finally { f.close(); }
+});
+
 test("new artifact imports retain the actual basename and suffix instead of the report title", () => {
   const f = setup();
   try {

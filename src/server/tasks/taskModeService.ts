@@ -88,8 +88,8 @@ export class TaskModeService extends EventEmitter {
     super(); this.data=new TaskModeStore(conversations.store.dbPath, { isProcessing: state => this.isProcessing(state), recoverOrphanedProcessing: true });this.codexInfo=conversations.codexInfo;
     this.recoveryBaseMs=options.recoveryBaseMs??2000;
     this.maxRecoveryAttempts=options.maxRecoveryAttempts??3;
-    const states=this.data.all();for(const state of states){
-      this.observedTasks.add(state.taskId);
+    for(const taskId of this.data.taskIds())this.observedTasks.add(taskId);
+    const states=this.data.startupTaskIds().map(taskId=>this.data.get(taskId)).filter((state):state is TaskModeState=>state!==null);for(const state of states){
       const run=state.runs.find(run=>run.id===state.activeRunId);
       if(state.phase==="blocked"&&state.error==="后续分工引用了不可复用的 Worker，请代理重新明确负责人"&&run&&!run.result&&!run.jobs.some(job=>job.status==="active")&&run.jobs.some(job=>job.role==="plan"&&job.status==="completed"&&!job.processed&&job.output)&&!this.requireTask(state.taskId).archived){
         state.phase="planning";state.error=undefined;state.heartbeat.status="recovering";state.heartbeat.message="正在恢复已保存的任务分工，无需你操作";state.heartbeat.recoveryAttempts=0;state.heartbeat.nextRetryAt=undefined;
@@ -108,11 +108,11 @@ export class TaskModeService extends EventEmitter {
     }
     conversations.manager.on("event",this.onEvent);
     conversations.usage.on("change",this.onUsageChange);
-    this.timer=setInterval(()=>{for(const state of this.data.all())if(hasScheduledWork(state))this.schedule(state.taskId);},options.pollMs??2500);this.timer.unref();
+    this.timer=setInterval(()=>{for(const taskId of this.data.scheduledTaskIds())this.schedule(taskId);},options.pollMs??2500);this.timer.unref();
     for(const state of states)if(hasScheduledWork(state)||this.canRecoverOutput(state))this.schedule(state.taskId);
   }
   close() {if(this.closed)return;this.closed=true;clearInterval(this.timer);this.conversations.manager.off("event",this.onEvent);this.conversations.usage.off("change",this.onUsageChange);this.data.stopProcessing();this.data.close();}
-  list(archived=false) {const tasks=this.conversations.store.list({archived}).tasks;return {tasks,states:this.data.all().map(state=>({taskId:state.taskId,phase:state.phase,settings:state.settings,instructionCount:state.instructions.filter(entry=>!entry.deletedAt).length,heartbeat:state.heartbeat,updatedAt:state.updatedAt,processedDurationMs:state.processedDurationMs,processingStartedAt:state.processingStartedAt})),usage:Object.fromEntries(tasks.map(task=>{void this.conversations.usage.refreshTask(task.id).catch(()=>undefined);return[task.id,this.conversations.usage.summary(task.id)];}))};}
+  list(archived=false) {const tasks=this.conversations.store.list({archived}).tasks;return {tasks,states:this.data.summaries(),usage:Object.fromEntries(tasks.map(task=>{void this.conversations.usage.refreshTask(task.id).catch(()=>undefined);return[task.id,this.conversations.usage.summary(task.id)];}))};}
   private isProcessing(state: TaskModeState): boolean {
     if (!activePhases.has(state.phase) || this.conversations.store.get(state.taskId)?.archived) return false;
     const run = state.runs.find(run => run.id === state.activeRunId);

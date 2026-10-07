@@ -2,10 +2,11 @@ import { Clock3, Gauge } from "lucide-react";
 import type { TaskThreadUsage, TaskUsageSummary } from "../../shared/taskUsageTypes";
 import { windowLabel } from "./codexUsageView";
 import "./taskUsage.css";
-import { formatTaskProcessedTime, taskProcessedDuration, type TaskProcessingTime } from "./taskProcessedTime";
+import { taskProcessedTimeView, type TaskProcessingTime } from "./taskProcessedTime";
 
 export function TaskProcessedTimeBadge({ processing, now }: { processing?: TaskProcessingTime; now: number }) {
-  return <span className="task-usage-badge tp-processed-time" title="累计规划、执行和自动检查时间，不计暂停、阻塞及人工等待。"><Clock3 />已处理 <span>{formatTaskProcessedTime(taskProcessedDuration(processing, now))}</span></span>;
+  const view = taskProcessedTimeView(processing, now);
+  return <span className="task-usage-badge tp-processed-time" data-coverage={view.partial ? "partial" : "complete"} title={view.title}><Clock3 />{view.label}{view.value && <span>{view.value}</span>}{view.partial && <small>部分记录</small>}</span>;
 }
 
 type Usage = TaskThreadUsage | TaskUsageSummary;

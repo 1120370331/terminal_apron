@@ -85,13 +85,20 @@ export interface TaskModeState {
   taskId: string; phase: TaskModePhase; settings: TaskModeSettings; agentThreadId?: string;
   instructions: TaskInstruction[]; runs: TaskExecutionRun[]; activeRunId?: string;
   events: Array<{ id: string; at: string; text: string }>; heartbeat: TaskModeHeartbeat; error?: string; revision: number; updatedAt: string;
-  /** Closed processing intervals in milliseconds. null/absent means historical timing is unknown, including an unclosed interval from a crashed runtime. */
+  /** Legacy-safe complete total. Partial histories remain null for old clients. */
   processedDurationMs?: number | null;
+  /** Verified closed processing time; partial coverage denotes a conservative lower bound. */
+  processedVerifiedDurationMs?: number | null;
+  processedTimingCoverage?: "complete" | "partial";
+  /** Earliest start of the newly instrumented clock, independent of task creation. */
+  processedTimingSince?: string | null;
+  /** Conservative historical lower bound from a completed command's measured duration. */
+  processedRecoveredDurationMs?: number;
   /** Start of the single currently counted interval; null/absent when stopped. Never task.createdAt. */
   processingStartedAt?: string | null;
 }
 export interface TaskModeDetail { task: TaskItem; state: TaskModeState; approvals: TaskConversationApproval[]; usage?: TaskUsageSummary }
-export interface TaskModeList { tasks: TaskItem[]; states: Array<{ taskId: string; phase: TaskModePhase; settings: TaskModeSettings; instructionCount: number; heartbeat: TaskModeHeartbeat; updatedAt: string; processedDurationMs?: number | null; processingStartedAt?: string | null }>; usage?: Record<string,TaskUsageSummary> }
+export interface TaskModeList { tasks: TaskItem[]; states: Array<Pick<TaskModeState, "taskId" | "phase" | "settings" | "heartbeat" | "updatedAt" | "processedDurationMs" | "processedVerifiedDurationMs" | "processingStartedAt" | "processedTimingCoverage" | "processedTimingSince" | "processedRecoveredDurationMs"> & { instructionCount: number }>; usage?: Record<string,TaskUsageSummary> }
 export interface SubmitTaskInstruction { clientMessageId: string; text: string; timing: "now" | "after"; attachmentIds?: string[]; referenceTaskIds?: string[]; documentIds?: string[] }
 
 export interface TaskModeViewPreferences {

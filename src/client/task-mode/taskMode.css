@@ -421,6 +421,7 @@
 #tp-task-mode .tp-card-heading { display:grid; gap:8px; min-width:0; width:100%; }
 #tp-task-mode .tp-card-metrics { display:flex; align-items:center; flex-wrap:wrap; gap:6px 10px; min-width:0; max-width:100%; }
 #tp-task-mode .tp-processed-time { white-space:nowrap; font-variant-numeric:tabular-nums; }
+#tp-task-mode .tp-processed-time small { font-size:10px; opacity:.8; }
 #tp-task-mode .tp-card-project { display:flex; align-items:center; gap:6px; min-width:0; max-width:100%; padding:5px 8px; border:1px solid color-mix(in srgb,var(--tp-blue) 24%,var(--tp-line)); border-radius:6px; background:var(--tp-blue-bg); color:var(--tp-blue); font-size:12px; font-weight:650; text-align:left; }
 #tp-task-mode .tp-card-project-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #tp-task-mode .tp-card-project[data-unassigned="true"] { color:var(--tp-muted); background:var(--tp-bg); border-color:var(--tp-line); }
