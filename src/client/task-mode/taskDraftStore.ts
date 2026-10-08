@@ -14,6 +14,7 @@ export interface StoredRequirementAssistant {
 }
 
 export interface StoredTaskDraft {
+  authorizationType?: import("../../shared/taskModeTypes").TaskAuthorizationType;
   executionMode?: "collaborative" | "quick";
   publishRequestId?: string;
   savedAt?: number;

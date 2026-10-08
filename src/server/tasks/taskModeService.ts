@@ -3,7 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { TaskItem, TaskStatus, TaskAttachment, TaskVerification } from "../../shared/taskTypes.js";
-import { DEFAULT_TASK_MODE_SETTINGS, QUICK_TASK_MODE_AGENT_PROMPT, type RequirementSnapshot, type SubmitTaskInstruction, type TaskExecutionJob, type TaskExecutionRun, type TaskInstruction, type TaskModeAction, type TaskModeDetail, type TaskModeSettings, type TaskModeState, type TaskRunResult } from "../../shared/taskModeTypes.js";
+import { DEFAULT_TASK_MODE_SETTINGS, QUICK_TASK_MODE_AGENT_PROMPT, applyTaskAuthorization, taskAuthorizationPrompt, type RequirementSnapshot, type SubmitTaskInstruction, type TaskExecutionJob, type TaskExecutionRun, type TaskInstruction, type TaskModeAction, type TaskModeDetail, type TaskModeSettings, type TaskModeState, type TaskRunResult } from "../../shared/taskModeTypes.js";
 import type { TaskConversationEvent } from "../../shared/taskConversationTypes.js";
 import { TaskConversationService, TaskConversationServiceError } from "./taskConversationService.js";
 import { CodexRpcError } from "../codexAppServerClient.js";
@@ -24,7 +24,7 @@ const verificationSchema = { type: "array", items: objectSchema({ command:string
 const workerPlanSchema=objectSchema({workerId:stringSchema,name:stringSchema,objective:stringSchema,ownedPaths:stringsSchema});
 const PLAN_SCHEMA = objectSchema({ userUpdate:stringSchema, understanding:stringSchema, workers:{type:"array",minItems:1,maxItems:8,items:workerPlanSchema} });
 const WORK_SCHEMA = objectSchema({ summary:stringSchema, changedFiles:stringsSchema, verification:verificationSchema, risks:stringsSchema, blockers:stringsSchema, artifacts:{type:"array",items:objectSchema({path:stringSchema,title:stringSchema})} });
-const REVIEW_SCHEMA = objectSchema({status:{type:"string",enum:["done","continue","blocked","needs_confirmation"]},summary:stringSchema,risks:stringsSchema,stopReason:stringSchema,humanActions:{type:"array",items:objectSchema({action:stringSchema,reason:stringSchema,unblocks:stringSchema})},agentNextSteps:stringsSchema,acceptanceReady:{type:"boolean"},pauseCategory:{type:"string",enum:["none","blocked","unclear_requirement","exception"]},remainingWork:stringsSchema,nextWorkers:{type:"array",maxItems:8,items:workerPlanSchema}});
+const REVIEW_SCHEMA = objectSchema({status:{type:"string",enum:["done","continue","blocked","needs_confirmation"]},summary:stringSchema,risks:stringsSchema,stopReason:stringSchema,humanActions:{type:"array",items:objectSchema({action:stringSchema,reason:stringSchema,unblocks:stringSchema})},agentNextSteps:stringsSchema,acceptanceReady:{type:"boolean"},pauseCategory:{type:"string",enum:["none","blocked","unclear_requirement","exception","authorization"]},remainingWork:stringsSchema,nextWorkers:{type:"array",maxItems:8,items:workerPlanSchema}});
 const AGENT_MANDATE="你的责任是持续完成整个任务，直到全部约定验收条件具备真实证据。代码完成、某个 Worker 汇报、CI 成功、预览图和一次阶段汇报都不能作为提前停止的理由。阶段结束后检查剩余工作，优先交回原文件负责人修复或完成验证，然后再次检查。你不直接实现，实际写入、构建、安装或发布安排给具备当前已授权权限的 Worker。尊重用户明确的暂停和审批策略。只有真实阻塞、影响实施的需求不明确、或无法继续的异常才暂停；可独立完成的部分先完成，不把自己能解决的环境问题转交用户。";
 const REVIEW_DECISION="按整个任务的验收条件作出持续执行决定。acceptanceReady 只有全部目标已完成且必要验证真实通过才为 true；发现未完成项时为 false，remainingWork 列出每项剩余工作。能够继续处理就返回 status=continue、pauseCategory=none，nextWorkers 写本次后续分工，workerId 复用时填写可复用列表里的真实 ID；新执行者填空字符串，不要自拟编号。优先复用原负责人，不重做已通过的内容。确有外部阻塞、关键需求不明确或异常时返回 blocked，pauseCategory 必须分别为 blocked、unclear_requirement、exception，stopReason 和 humanActions 写具体所需条件。不得以‘需要主线程继续’‘待安装验收’‘阶段完成’或‘有预览待审查’为由停下可继续完成的工作。acceptanceReady=true 后才允许 done/needs_confirmation 和最终人工验收。";
 const DOCUMENT_GUIDANCE = "涉及实验、方案比较、较多实施结果或验证证据时，把完整内容整理为一个 Markdown 或自包含 HTML 文档，并在 artifacts 中返回实际 path 和清晰 title。文档按结论、目标与方法、实施或实验结果、验证与证据、未完成与风险、用户需要做什么、下一步分章节；用表格比较数据，区分已验证事实与推测。任务内保留简短结论，详细内容放文档。HTML 的样式、脚本和图表内嵌，图片内嵌或使用归档材料，不能依赖外部脚本或网络请求。文档只是审查材料，不能以产出文档为由提前停止未完成任务。";
@@ -91,6 +91,11 @@ export class TaskModeService extends EventEmitter {
     for(const taskId of this.data.taskIds())this.observedTasks.add(taskId);
     const states=this.data.startupTaskIds().map(taskId=>this.data.get(taskId)).filter((state):state is TaskModeState=>state!==null);for(const state of states){
       const run=state.runs.find(run=>run.id===state.activeRunId);
+      if(state.phase==="blocked"&&/already has an active writer/i.test(state.error??state.heartbeat.message??"")&&run&&!run.result&&run.jobs.some(job=>job.status==="pending")&&!run.jobs.some(job=>job.status==="active")&&!this.requireTask(state.taskId).archived){
+        state.phase=this.executionPhase(run);state.error=undefined;state.heartbeat.status="recovering";state.heartbeat.recoveryAttempts=0;state.heartbeat.nextRetryAt=undefined;state.heartbeat.message="正在恢复此前因会话写入占用而未发送的追加需求";
+        this.save(state,"恢复因旧会话写入占用而未发送的需求，保留原文和已完成结果");this.syncTaskStatus(state);
+      }
+      if(state.phase==="blocked"&&run?.result?.humanActions?.length&&run.result.humanActions.every(item=>/授权|审批|批准|permission|approval|authoriz/i.test(item.action+item.reason))&&!run.jobs.some(job=>job.status==="active")){run.result.status="awaiting_authorization";run.result.pauseCategory="authorization";state.phase="awaiting_authorization";this.save(state,"授权请求单独展示为待授权");this.syncTaskStatus(state);}
       if(state.phase==="blocked"&&state.error==="后续分工引用了不可复用的 Worker，请代理重新明确负责人"&&run&&!run.result&&!run.jobs.some(job=>job.status==="active")&&run.jobs.some(job=>job.role==="plan"&&job.status==="completed"&&!job.processed&&job.output)&&!this.requireTask(state.taskId).archived){
         state.phase="planning";state.error=undefined;state.heartbeat.status="recovering";state.heartbeat.message="正在恢复已保存的任务分工，无需你操作";state.heartbeat.recoveryAttempts=0;state.heartbeat.nextRetryAt=undefined;
         this.save(state,"自动恢复被执行者标识错误拦截的任务，沿用原需求和已保存的分工");this.syncTaskStatus(state);
@@ -112,7 +117,7 @@ export class TaskModeService extends EventEmitter {
     for(const state of states)if(hasScheduledWork(state)||this.canRecoverOutput(state))this.schedule(state.taskId);
   }
   close() {if(this.closed)return;this.closed=true;clearInterval(this.timer);this.conversations.manager.off("event",this.onEvent);this.conversations.usage.off("change",this.onUsageChange);this.data.stopProcessing();this.data.close();}
-  list(archived=false) {const tasks=this.conversations.store.list({archived}).tasks;return {tasks,states:this.data.summaries(),usage:Object.fromEntries(tasks.map(task=>{void this.conversations.usage.refreshTask(task.id).catch(()=>undefined);return[task.id,this.conversations.usage.summary(task.id)];}))};}
+  list(archived=false) {const tasks=this.conversations.store.list({archived}).tasks;return {tasks,states:this.data.summaries().map(state=>this.conversations.store.listConversationBindings(state.taskId).some(binding=>this.conversations.manager.pendingApprovals(state.taskId,binding.threadId).length)?{...state,phase:"awaiting_authorization" as const}:state),usage:Object.fromEntries(tasks.map(task=>{void this.conversations.usage.refreshTask(task.id).catch(()=>undefined);return[task.id,this.conversations.usage.summary(task.id)];}))};}
   private isProcessing(state: TaskModeState): boolean {
     if (!activePhases.has(state.phase) || this.conversations.store.get(state.taskId)?.archived) return false;
     const run = state.runs.find(run => run.id === state.activeRunId);
@@ -122,8 +127,11 @@ export class TaskModeService extends EventEmitter {
     if (state.heartbeat.nextRetryAt && Date.parse(state.heartbeat.nextRetryAt) > Date.now()) return false;
     return true;
   }
-  detail(taskId:string):TaskModeDetail {
-    const task=this.requireTask(taskId),state=this.data.ensure(taskId);
+  detail(taskId:string,workspace=false):TaskModeDetail {
+    const task=this.requireTask(taskId),state=(workspace?this.data.workspace(taskId):null)??this.data.ensure(taskId);
+    // Older authorization pauses stored separate copies in the instruction history.
+    // Project their current waiting status consistently, retaining the original evidence.
+    for(const run of state.runs.filter(run=>run.result?.status==="awaiting_authorization"))for(const entry of state.instructions.filter(entry=>entry.runId===run.id&&entry.result))entry.result=run.result;
     // Enrich historical replies for display without rewriting the saved execution evidence.
     for(const run of state.runs)for(const job of run.jobs.filter(job=>job.role==="steer"&&job.output)){
       let ids:unknown;try{ids=JSON.parse(job.objective);}catch{continue;}
@@ -137,7 +145,17 @@ export class TaskModeService extends EventEmitter {
     this.observedTasks.add(taskId);
     void this.conversations.usage.refreshTask(taskId).catch(()=>undefined);
     const threadIds=new Set(state.runs.flatMap(run=>run.jobs.map(job=>job.threadId)).filter((value):value is string=>Boolean(value)));
-    return {task,state,approvals:[...threadIds].flatMap(threadId=>this.conversations.manager.pendingApprovals(taskId,threadId)),usage:this.conversations.usage.summary(taskId)};
+    const approvals=[...threadIds].flatMap(threadId=>this.conversations.manager.pendingApprovals(taskId,threadId));
+    return {task,state:approvals.length?{...state,phase:"awaiting_authorization"}:state,approvals,usage:this.conversations.usage.summary(taskId)};
+  }
+  executionItems(taskId:string,runId:string,jobId:string) {
+    this.requireTask(taskId);const job=this.data.get(taskId)?.runs.find(run=>run.id===runId)?.jobs.find(job=>job.id===jobId);
+    if(!job)throw new TaskModeError(404,"执行记录不存在");return {items:job.items};
+  }
+  runChanges(taskId:string,runId:string) {
+    this.requireTask(taskId);const state=this.data.get(taskId),run=state?.runs.find(run=>run.id===runId);
+    const result=run?.result??[...(state?.instructions??[])].reverse().find(entry=>entry.runId===runId&&entry.result)?.result;
+    if(!run||!result)throw new TaskModeError(404,"本轮代码改动不存在");return {changes:result.changes};
   }
   runReport(taskId:string,runId:string) {
     const task=this.requireTask(taskId),state=this.data.get(taskId),run=state?.runs.find(item=>item.id===runId);
@@ -147,8 +165,8 @@ export class TaskModeService extends EventEmitter {
     return formatTaskRunReport(task,state,run,result);
   }
   async settings(input:unknown, taskId?:string) {
-    const normalized=validateSettings(input);
-    if(normalized.permissionPreset==="full_access"&&object(input).fullAccessConfirmed!==true)throw new TaskModeError(400,"请明确确认完全访问权限后保存");
+    const normalized=applyTaskAuthorization(validateSettings(input));
+    if(normalized.permissionPreset==="full_access"&&normalized.authorizationType!=="full_authorization"&&object(input).fullAccessConfirmed!==true)throw new TaskModeError(400,"请明确确认完全访问权限后保存");
     if(taskId)return this.serial(taskId,async()=>{this.requireTask(taskId);const state=this.data.ensure(taskId);state.settings=normalized;this.save(state,"任务设置已更新；全部设置用于下一轮执行，当前轮次保持发送时的配置");return normalized;});
     this.data.saveSettings(normalized);return normalized;
   }
@@ -159,8 +177,9 @@ export class TaskModeService extends EventEmitter {
       if(clientMessageId.length<8||clientMessageId.length>128||!instructionText.trim()||instructionText.length>50000)throw new TaskModeError(400,"指示需要包含有效内容和请求标识");
       const state=this.data.ensure(taskId);const duplicate=state.instructions.find(entry=>entry.clientMessageId===clientMessageId);
       this.observedTasks.add(taskId);
-      if(duplicate){if(duplicate.deletedAt)throw new TaskModeError(409,"该需求已删除，请使用新的请求标识创建需求");if(duplicate.text!==instructionText)throw new TaskModeError(409,"相同请求标识不能发送不同指示");return this.detail(taskId);}
-      const instruction:TaskInstruction={id:id(),clientMessageId,text:instructionText,timing:input.timing==="after"?"after":"now",status:"queued",createdAt:now(),snapshot:this.snapshot(task,input),deliveries:[]};
+      if(duplicate){if(duplicate.deletedAt)throw new TaskModeError(409,"该需求已删除，请使用新的请求标识创建需求");if(duplicate.text!==instructionText||duplicate.authorizationType!==input.authorizationType)throw new TaskModeError(409,"相同请求标识不能发送不同指示");return this.detail(taskId);}
+      if(input.authorizationType!==undefined&&!["pending_approval","full_authorization"].includes(input.authorizationType))throw new TaskModeError(400,"无效的授权类型");
+      const instruction:TaskInstruction={authorizationType:input.authorizationType,id:id(),clientMessageId,text:instructionText,timing:input.timing==="after"?"after":"now",status:"queued",createdAt:now(),snapshot:this.snapshot(task,input),deliveries:[]};
       state.instructions.push(instruction);
       if(state.phase==="blocked"&&!state.runs.some(run=>run.jobs.some(job=>job.status==="active"))){state.phase="idle";state.error=undefined;}
       this.save(state,`收到第 ${state.instructions.length} 条指示`);
@@ -180,9 +199,29 @@ export class TaskModeService extends EventEmitter {
       return this.detail(taskId);
     });
   }
-  action(taskId:string,action:TaskModeAction,runId?:string) {
+  action(taskId:string,action:TaskModeAction,runId?:string,expected?:{approvalTokens?:string[];authorizationRevision?:number}) {
     return this.serial(taskId,async()=>{
       const task=this.requireTask(taskId);if(task.archived&&action!=="pause")throw new TaskModeError(409,"请先恢复已归档任务再执行操作");const state=this.data.ensure(taskId),run=state.runs.find(item=>item.id===(runId??state.activeRunId));
+      if(action==="approve_authorization"){
+        const approvals=this.detail(taskId).approvals;
+        if(expected?.approvalTokens&&(expected.approvalTokens.length!==approvals.length||approvals.some(item=>!expected.approvalTokens!.includes(item.token))))throw new TaskModeError(409,"授权请求已变化，请刷新后查看最新内容再批准");
+        if(!approvals.length&&expected?.authorizationRevision!==undefined&&expected.authorizationRevision!==state.revision)throw new TaskModeError(409,"授权内容已更新，请刷新后再批准");
+        if(approvals.length){
+          if(approvals.some(item=>!item.decisions.includes("accept")||(item.kind==="file_change"&&!item.fileChange?.paths.length)))throw new TaskModeError(409,"授权请求缺少明确范围或不支持批准，请在 Codex 对话中查看");
+          for(const approval of approvals)this.conversations.resolveApproval(taskId,approval.threadId,approval.token,"accept");
+          this.save(state,"已批准页面列出的执行授权请求");this.schedule(taskId);return this.detail(taskId);
+        }
+        if(state.phase!=="awaiting_authorization"||!run?.result)throw new TaskModeError(409,"当前没有待批准的授权");
+        const approved=run.result.humanActions??[];
+        const grant=`用户已批准以下具体操作，仅在此范围内继续执行，不重复索取同一授权：${JSON.stringify(approved)}。${run.result.stopReason}`;
+        run.authorizationGrants??=[];run.authorizationGrants.push({at:now(),content:grant});
+        run.result=undefined;run.completedAt=undefined;
+        run.iteration=(run.iteration??0)+1;
+        const job=isQuick(run)?this.directJob(state,run):this.job("review","任务代理 · 继续已批准操作",`${agentPrompt(run.settings)}\n${AGENT_MANDATE}\n${REVIEW_DECISION}\n${this.runText(state,run)}\n${grant}\n已有执行结果：${JSON.stringify(this.latestWorkers(run).map(worker=>({workerId:worker.id,name:worker.name,ownedPaths:worker.ownedPaths,result:worker.output})))}`,run.settings.agentModel);
+        job.text+="\n"+grant;job.threadId=state.agentThreadId;job.cycle=run.iteration;run.jobs.push(job);
+        state.phase=isQuick(run)?"working":"reviewing";state.error=undefined;
+        this.save(state,"用户批准了列出的授权内容，沿用已有成果继续执行");this.syncTaskStatus(state);this.schedule(taskId);return this.detail(taskId);
+      }
       if(action==="clarify_report"){
         if(!run?.result||run.id!==state.activeRunId||activePhases.has(state.phase)||run.jobs.some(job=>["active","pending"].includes(job.status)))throw new TaskModeError(409,"请等待当前执行结束后补齐本轮行动说明");
         const review=this.job("review","任务代理 · 补齐行动说明",`${REPORT_GUIDANCE}\n这次仅补齐已有报告的行动说明，不重新执行任务，不创建 Worker，不安装、不发布、不改变候选。仅阅读现有需求、汇报和必要的证据。保持已有完成状态、代码改动和产物事实；没有新验收证据不得将未完成改成完成。\n本轮需求：\n${this.runText(state,run)}\n已有报告：\n${JSON.stringify(run.result)}\nWorker 原始汇报：\n${JSON.stringify(run.jobs.filter(job=>job.role==="worker").map(job=>({name:job.name,result:job.output})))}`,run.settings.agentModel);
@@ -233,7 +272,7 @@ export class TaskModeService extends EventEmitter {
     setImmediate(()=>{void this.serial(taskId,()=>this.advance(taskId)).catch(error=>{if(this.closed)return;this.handleAdvanceFailure(taskId,error);}).finally(()=>this.scheduled.delete(taskId));});
   }
   private async advance(taskId:string) {
-    const task=this.requireTask(taskId),state=this.data.ensure(taskId);if(task.archived||state.phase==="paused"){this.data.setProcessing(state,false);return;}
+    const task=this.requireTask(taskId),state=this.data.ensure(taskId);if(task.archived||state.phase==="paused"||state.phase==="awaiting_authorization"){this.data.setProcessing(state,false);return;}
     let run=state.runs.find(run=>run.id===state.activeRunId);
     if(state.phase==="blocked"){
       if(!this.canRecoverOutput(state)||!run)return;
@@ -245,9 +284,12 @@ export class TaskModeService extends EventEmitter {
     if(state.heartbeat.status==="recovering"&&state.heartbeat.nextRetryAt&&Date.parse(state.heartbeat.nextRetryAt)>Date.now())return;
     this.data.setProcessing(state, this.isProcessing(state));
     if(!activePhases.has(state.phase)){
-      const queued=state.instructions.filter(queuedInstruction);if(!queued.length)return;
-      await this.validateExecution(task,state.settings);
-      run={id:id(),instructionIds:queued.map(entry=>entry.id),createdAt:now(),settings:structuredClone(state.settings),jobs:[],reviewAttempt:0};
+      const pending=state.instructions.filter(queuedInstruction);if(!pending.length)return;
+      const authorization=pending[0].authorizationType;
+      const queued=pending.slice(0,pending.findIndex(entry=>entry.authorizationType!==authorization)<0?pending.length:pending.findIndex(entry=>entry.authorizationType!==authorization));
+      const executionSettings=applyTaskAuthorization(state.settings,authorization??state.settings.authorizationType);
+      await this.validateExecution(task,executionSettings);
+      run={id:id(),instructionIds:queued.map(entry=>entry.id),createdAt:now(),settings:structuredClone(executionSettings),jobs:[],reviewAttempt:0};
       state.runs.push(run);state.activeRunId=run.id;state.phase="planning";state.error=undefined;
       for(const entry of queued){entry.status="submitted";entry.runId=run.id;}
       const previous=state.runs.at(-2);
@@ -261,7 +303,7 @@ export class TaskModeService extends EventEmitter {
     // Read the authoritative turn before advancing the durable workflow.
     for(const job of run.jobs.filter(job=>job.status==="active")){
       if(!job.threadId||!job.turnId)continue;
-      const page=await this.conversations.readFresh(taskId,job.threadId,100);const turn=page.detail.turns.find(turn=>turn.id===job.turnId);
+      const turn=await this.conversations.readTurnFresh(taskId,job.threadId,job.turnId);
       if(!turn)throw new Error(`执行记录缺失：${job.name}。请检查 Codex 会话后重试。`);
       job.items=turn.items;
       state.heartbeat.checkedAt=now();state.heartbeat.lastEventAt=this.lastProgress.get(taskId)??state.heartbeat.lastEventAt;
@@ -288,7 +330,7 @@ export class TaskModeService extends EventEmitter {
       job.processed=true;this.data.save(state);
     }
     if(run.result&&!run.jobs.some(job=>job.purpose==="clarify_report"&&!job.processed)){state.heartbeat.status="idle";state.heartbeat.checkedAt=now();state.heartbeat.nextRetryAt=undefined;this.data.save(state);this.syncTaskStatus(state);if(state.instructions.some(queuedInstruction))setTimeout(()=>this.schedule(taskId),0);return;}
-    const additions=state.instructions.filter(entry=>queuedInstruction(entry)&&entry.timing==="now");
+    const additions=state.instructions.filter(entry=>queuedInstruction(entry)&&entry.timing==="now"&&(entry.authorizationType===undefined||entry.authorizationType===run!.settings.authorizationType));
     if(isQuick(run)){
       await this.deliverDirectAdditions(state,run,additions);
     }else if(additions.length&&state.phase==="planning"){
@@ -361,12 +403,36 @@ export class TaskModeService extends EventEmitter {
     const toolRoot=findTaskSkillProjectRoot([process.cwd(),path.resolve(import.meta.dirname,"../../.."),path.resolve(import.meta.dirname,"../../../..")]);
     const quote=(value:string)=>`'${value.replaceAll("'",process.platform==="win32"?"''":"'\\''")}'`;
     const tagTools=toolRoot?`\n任务标签工具（当前任务 ${task.id}）：可通过 exec 命令查询项目标签并按明确需求补充当前任务标签。\nnode ${quote(path.join(taskSkillSource(toolRoot),"scripts","task-monitor.mjs"))} tags --project ${quote(task.project)}\nnode ${quote(path.join(taskSkillSource(toolRoot),"scripts","task-monitor.mjs"))} tag ${quote(task.id)} --add '选择的标签名称'\n调用前将占位名称替换为当前任务对应的目录标签；按任务内容选择，不固定套用示例。使用 --remove 移除明确不再适用的标签。优先复用项目目录中的标签，单任务最多12个；保留无关和人工设置的标签，不用标签替代执行状态。CLI 私下加载认证，不读取或打印认证文件。标签变更无需重启任务。`:"";
-    const developerInstructions=(job.role==="worker"?run.settings.workerPrompt:`${agentPrompt(run.settings)}\n${isQuick(run)?QUICK_MANDATE:AGENT_MANDATE}\n${TASK_AGENT_COMMUNICATION}\n当前负责的任务：${task.title}`)+(job.purpose==="clarify_report"?"\n本回合仅只读补充已有报告，不执行代码更改、命令或重新验收。":"")+tagTools;
-    if(!job.threadId){let created;try{created=await this.conversations.create(task.id,{clientMessageId:`tm-create-${job.id}-${job.attempt}`,displayName:`${task.key} · ${job.name}`,model:job.model},{cwd,approvalsReviewer:run.settings.approvalsReviewer,developerInstructions,primary:job.role!=="worker"});}catch(error){if(error instanceof TaskConversationServiceError&&error.code==="CREATE_FAILED"){job.attempt++;this.data.save(state);return this.startJob(state,run,job);}throw error;}job.threadId=created.conversation.threadId;if(job.role!=="worker")state.agentThreadId=job.threadId;this.data.save(state);}
+    const developerInstructions=(job.role==="worker"?run.settings.workerPrompt:`${agentPrompt(run.settings)}\n${isQuick(run)?QUICK_MANDATE:AGENT_MANDATE}\n${TASK_AGENT_COMMUNICATION}\n当前负责的任务：${task.title}`)+(job.purpose==="clarify_report"?"\n本回合仅只读补充已有报告，不执行代码更改、命令或重新验收。":"")+"\n"+taskAuthorizationPrompt(run.settings)+"\n"+(run.authorizationGrants??[]).map(grant=>grant.content).join("\n")+tagTools;
+    if (job.writerRecovery) {
+      // Keep the fork idempotency key across timeouts and scheduler restarts.
+      await this.conversations.reconcile(task.id);
+      let recovered;
+      try {
+        recovered = await this.conversations.create(task.id, { clientMessageId: job.writerRecovery.clientMessageId, displayName: `${task.key} · ${job.name} · 续接`, model: job.model }, { cwd, approvalPolicy: run.settings.authorizationType === "full_authorization" ? "never" : "on-request", approvalsReviewer: run.settings.approvalsReviewer, developerInstructions, primary: job.role !== "worker", forkFromThreadId: job.writerRecovery.sourceThreadId });
+      } catch (error) {
+        if (!(error instanceof TaskConversationServiceError) || error.code !== "CREATE_FAILED") throw error;
+        job.attempt++;job.writerRecovery.clientMessageId=`tm-writer-recovery-${job.id}-${job.attempt}`;this.data.save(state);
+        return this.startJob(state, run, job);
+      }
+      job.recoveredFromThreadId=job.writerRecovery.sourceThreadId;job.threadId=recovered.conversation.threadId;job.writerRecovery=undefined;job.attempt++;
+      if(job.role!=="worker")state.agentThreadId=job.threadId;
+      state.error=undefined;state.heartbeat.recoveryAttempts=0;state.heartbeat.nextRetryAt=undefined;
+      this.save(state,"旧会话存在写入占用，已保留历史并续接执行；已完成的工作不会重新下发");
+      return this.startJob(state,run,job);
+    }
+    if(!job.threadId){let created;try{created=await this.conversations.create(task.id,{clientMessageId:`tm-create-${job.id}-${job.attempt}`,displayName:`${task.key} · ${job.name}`,model:job.model},{cwd,approvalPolicy:run.settings.authorizationType==="full_authorization"?"never":"on-request",approvalsReviewer:run.settings.approvalsReviewer,developerInstructions,primary:job.role!=="worker"});}catch(error){if(error instanceof TaskConversationServiceError&&error.code==="CREATE_FAILED"){job.attempt++;this.data.save(state);return this.startJob(state,run,job);}throw error;}job.threadId=created.conversation.threadId;if(job.role!=="worker")state.agentThreadId=job.threadId;this.data.save(state);}
     const outputSchema=job.role==="execute"?DIRECT_SCHEMA:job.role==="plan"?PLAN_SCHEMA:job.role==="worker"?WORK_SCHEMA:job.role==="steer"?STEER_SCHEMA:REVIEW_SCHEMA;
     const prepared=prepareTaskModeInput(task.contextDirectory,state,run,job);
     if(prepared.packet){const changed=job.contextPacket?.sha256!==prepared.packet.sha256;job.contextPacket=prepared.packet;if(changed)this.save(state,`大段任务材料已完整保存（${prepared.packet.originalCharacters} 字符），${job.name} 将按需读取证据；${isQuick(run)?"已有直接执行结果沿用":"已有 Worker 结果沿用"}`);}
-    const sent=await this.conversations.send(task.id,job.threadId,{clientMessageId:`tm-turn-${job.id}-${job.attempt}`,text:prepared.text,model:job.model,effort:run.settings.effort,permissionPreset:job.role==="worker"||job.role==="execute"?run.settings.permissionPreset:"read_only"},{cwd,outputSchema,approvalsReviewer:run.settings.approvalsReviewer,developerInstructions});
+    let sent;
+    try {
+      sent=await this.conversations.send(task.id,job.threadId,{clientMessageId:`tm-turn-${job.id}-${job.attempt}`,text:prepared.text,model:job.model,effort:run.settings.effort,permissionPreset:job.role==="worker"||job.role==="execute"?run.settings.permissionPreset:"read_only"},{cwd,outputSchema,approvalPolicy:run.settings.authorizationType==="full_authorization"?"never":"on-request",approvalsReviewer:run.settings.approvalsReviewer,developerInstructions});
+    } catch (error) {
+      if (!(error instanceof TaskConversationServiceError) || error.code !== "THREAD_WRITER_CONFLICT" || job.recoveredFromThreadId) throw error;
+      job.writerRecovery={sourceThreadId:job.threadId,clientMessageId:`tm-writer-recovery-${job.id}-${job.attempt}`};this.data.save(state);
+      return this.startJob(state, run, job);
+    }
     if(sent.operation.state==="failed"){job.attempt++;this.data.save(state);return this.startJob(state,run,job);}
     const turnId=sent.operation.turnId||text(object(sent.turn).id);if(!turnId)throw new Error("执行请求正在恢复，尚未得到确定的 turnId");
     job.turnId=turnId;job.status="active";job.error=undefined;job.errorCode=undefined;job.outputReadAttempts=undefined;
@@ -478,15 +544,20 @@ export class TaskModeService extends EventEmitter {
     const nextWorkers=array(review.output?.nextWorkers).map(object).filter(value=>text(value.objective).trim());
     const pause=text(review.output?.pauseCategory);
     const ready=(explicit?review.output!.acceptanceReady===true&&remaining.length===0&&pause==="none":reported==="done"||reported==="needs_confirmation")&&!currentFailures&&!artifactRisks.length;
-    const needsReview=run.settings.reviewPolicy==="always"||(run.settings.reviewPolicy==="artifacts"&&artifacts.length>0);
+    const needsReview=run.settings.authorizationType!=="full_authorization"&&(run.settings.reviewPolicy==="always"||(run.settings.reviewPolicy==="artifacts"&&artifacts.length>0));
     const result:TaskRunResult={status:"in_progress",summary:text(review.output?.summary),changedFiles:[...new Set(run.jobs.filter(job=>job.role===evidenceRole).flatMap(worker=>[...strings(worker.output?.changedFiles),...worker.items.flatMap(item=>item.kind==="file_change"?item.paths:[])]))],verification,risks:[...new Set([...strings(review.output?.risks),...cycleWorkers.flatMap(worker=>[...strings(worker.output?.risks),...strings(worker.output?.blockers)]),...artifactRisks])],artifacts,changes:run.jobs.filter(job=>job.role===evidenceRole).flatMap(worker=>worker.items.flatMap(item=>item.kind==="file_change"?item.changes??[]:[])),...this.actionGuidance(review),acceptanceReady:ready};
     const human=result.humanActions??[];
     if(ready&&pause!=="blocked"&&pause!=="unclear_requirement"&&pause!=="exception"){
-      result.status=reported==="needs_confirmation"||needsReview||human.length>0?"needs_confirmation":"done";
+      result.status=run.settings.authorizationType!=="full_authorization"&&(reported==="needs_confirmation"||needsReview||human.length>0)?"needs_confirmation":"done";
+      if(result.status==="done"&&run.settings.authorizationType==="full_authorization"){result.humanActions=[];result.stopReason="";}
       if(result.status==="needs_confirmation"&&!result.stopReason)result.stopReason="全部目标已达到验收条件，请审查最终结果和材料。";
       this.saveRunResult(state,run,result);return;
     }
-    if((explicit&&["blocked","unclear_requirement","exception"].includes(pause))||(!explicit&&human.length>0)){
+    if(pause==="authorization"||(reported==="blocked"&&human.length>0&&human.every(item=>/授权|审批|批准|permission|approval|authoriz/i.test(item.action+item.reason)))){
+      if(run.settings.authorizationType!=="full_authorization"){result.status="awaiting_authorization";result.pauseCategory="authorization";result.stopReason||=human.map(item=>item.reason).join("；")||"执行需要授权";this.saveRunResult(state,run,result);return;}
+      // Existing full authorization is authoritative; continue instead of asking again.
+      review.output={...review.output,remainingWork:remaining.length?remaining:["按本轮已有完全授权继续执行剩余工作"],agentNextSteps:["沿用用户的完全授权继续完成任务"]};
+    }else if((explicit&&["blocked","unclear_requirement","exception"].includes(pause))||(!explicit&&human.length>0)){
       result.status="blocked";result.pauseCategory=(pause||"blocked") as TaskRunResult["pauseCategory"];
       result.stopReason||=human.map(item=>item.reason).join("；");
       if(!result.stopReason)throw new Error("暂停任务必须提供具体阻塞、需求不明或异常原因");
@@ -538,12 +609,12 @@ export class TaskModeService extends EventEmitter {
   }
   private saveRunResult(state:TaskModeState,run:TaskExecutionRun,result:TaskRunResult):void {
     run.result=result;run.completedAt=now();
-    for(const entry of state.instructions.filter(entry=>run.instructionIds.includes(entry.id))){entry.result=result;entry.status=result.status==="blocked"?"blocked":"completed";entry.completedAt=now();}
-    state.phase=result.status==="blocked"?"blocked":this.hasPendingReview(state)?"needs_confirmation":"completed";
+    for(const entry of state.instructions.filter(entry=>run.instructionIds.includes(entry.id))){entry.result=result;entry.status=result.status==="blocked"?"blocked":result.status==="awaiting_authorization"?"agent_received":"completed";entry.completedAt=now();}
+    state.phase=result.status==="awaiting_authorization"?"awaiting_authorization":result.status==="blocked"?"blocked":this.hasPendingReview(state)?"needs_confirmation":"completed";
     this.save(state,result.summary||"代理已返回本轮结果");
     const guidance=hasTaskActionGuidance(result);
     const nextStep=guidance?[result.humanActions!.length?`你需要做什么：\n${result.humanActions!.map((item,index)=>`${index+1}. ${item.action}\n原因：${item.reason}\n完成后：${item.unblocks}`).join("\n")}`:"你需要做什么：当前无需操作。",result.agentNextSteps!.length?`代理下一步：\n${result.agentNextSteps!.map((step,index)=>`${index+1}. ${step}`).join("\n")}`:""].filter(Boolean).join("\n\n"):"本轮汇报缺少具体行动说明，请点击‘补齐行动说明’；保留已有代码和产物，仅请代理补齐停下原因、用户行动和代理下一步。";
-    this.conversations.store.addReport(state.taskId,{status:result.status==="blocked"?"blocked":"completed",summary:result.summary||"本轮执行结束",changedFiles:result.changedFiles,verification:result.verification,risks:result.risks,blockers:result.status==="blocked"?[result.stopReason||"汇报缺少具体停下原因",...(result.humanActions??[]).map(item=>item.reason)]:[],nextStep,taskStatus:result.status==="blocked"?"blocked":this.hasPendingReview(state)?"pending_manual_acceptance":"done"});
+    this.conversations.store.addReport(state.taskId,{status:result.status==="blocked"?"blocked":"completed",summary:result.summary||"本轮执行结束",changedFiles:result.changedFiles,verification:result.verification,risks:result.risks,blockers:result.status==="blocked"?[result.stopReason||"汇报缺少具体停下原因",...(result.humanActions??[]).map(item=>item.reason)]:[],nextStep,taskStatus:result.status==="awaiting_authorization"?"pending_manual_acceptance":result.status==="blocked"?"blocked":this.hasPendingReview(state)?"pending_manual_acceptance":"done"});
   }
   private importArtifact(taskId:string,runId:string,filename:string,title:string,deduplicateContent=false):TaskAttachment|undefined {
     if(!filename)return;const task=this.requireTask(taskId),root=fs.realpathSync(task.repositoryPath||task.contextDirectory),candidate=fs.realpathSync(path.resolve(root,filename));
@@ -590,14 +661,14 @@ export class TaskModeService extends EventEmitter {
   private hasPendingReview(state:TaskModeState) {return state.runs.some(run=>run.result?.status==="needs_confirmation");}
   private requireTask(taskId:string) {const task=this.conversations.store.get(taskId);if(!task)throw new TaskModeError(404,"任务不存在");return task;}
   private save(state:TaskModeState,message?:string) {if(message){state.events.push({id:id(),at:now(),text:message});state.events=state.events.slice(-1000);}this.data.save(state);this.emit("change",{taskId:state.taskId});}
-  private syncTaskStatus(state:TaskModeState) {const task=this.requireTask(state.taskId);const status:TaskStatus=activePhases.has(state.phase)?"in_progress":state.phase==="completed"?"done":state.phase==="needs_confirmation"?"pending_manual_acceptance":state.phase==="blocked"||state.phase==="paused"?"blocked":task.status;if(status!==task.status)this.conversations.store.update(task.id,{status});}
+  private syncTaskStatus(state:TaskModeState) {const task=this.requireTask(state.taskId);const status:TaskStatus=activePhases.has(state.phase)?"in_progress":state.phase==="completed"?"done":state.phase==="needs_confirmation"||state.phase==="awaiting_authorization"?"pending_manual_acceptance":state.phase==="blocked"||state.phase==="paused"?"blocked":task.status;if(status!==task.status)this.conversations.store.update(task.id,{status});}
 }
 
 export function validateSettings(input:unknown):TaskModeSettings {
-  const value=object(input);const settings={...DEFAULT_TASK_MODE_SETTINGS,...value} as TaskModeSettings;
+  const value=object(input);if(value.authorizationType!==undefined&&!["pending_approval","full_authorization"].includes(String(value.authorizationType)))throw new TaskModeError(400,"无效的授权类型");const settings={...DEFAULT_TASK_MODE_SETTINGS,...value} as TaskModeSettings;
   if(!["collaborative","quick"].includes(settings.executionMode??"collaborative"))throw new TaskModeError(400,"无效的执行模式");
   if(!["auto_review","user"].includes(settings.approvalsReviewer)||!["auto","parallel","single"].includes(settings.workerPolicy)||!["agent","artifacts","always"].includes(settings.reviewPolicy)||!["read_only","workspace_write","full_access"].includes(settings.permissionPreset)||!["minimal","low","medium","high","xhigh"].includes(settings.effort))throw new TaskModeError(400,"代理设置包含无效选项");
   if(!Number.isInteger(settings.maxWorkers)||settings.maxWorkers<1||settings.maxWorkers>8)throw new TaskModeError(400,"Worker 数量必须为 1–8");
   for(const key of ["agentModel","workerModel","agentPrompt","workerPrompt"] as const)if(typeof settings[key]!=="string"||!settings[key].trim()||settings[key].length>(key.endsWith("Prompt")?15000:150))throw new TaskModeError(400,`无效的 ${key}`);
-  return {executionMode:settings.executionMode??"collaborative",agentModel:settings.agentModel.trim(),workerModel:settings.workerModel.trim(),effort:settings.effort,workerPolicy:settings.workerPolicy,maxWorkers:settings.maxWorkers,permissionPreset:settings.permissionPreset,approvalsReviewer:settings.approvalsReviewer,reviewPolicy:settings.reviewPolicy,agentPrompt:settings.agentPrompt,workerPrompt:settings.workerPrompt};
+  return {...(settings.authorizationType?{authorizationType:settings.authorizationType}:{}),executionMode:settings.executionMode??"collaborative",agentModel:settings.agentModel.trim(),workerModel:settings.workerModel.trim(),effort:settings.effort,workerPolicy:settings.workerPolicy,maxWorkers:settings.maxWorkers,permissionPreset:settings.permissionPreset,approvalsReviewer:settings.approvalsReviewer,reviewPolicy:settings.reviewPolicy,agentPrompt:settings.agentPrompt,workerPrompt:settings.workerPrompt};
 }

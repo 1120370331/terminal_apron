@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import type { NextFunction, Request, Response } from "express";
 import type { AuthConfig, AuthUser } from "../shared/types.js";
 import { config, configuredUser } from "./config.js";
+import { createAuthSecretStore } from "./authSecret.js";
 
 interface Challenge {
   id: string;
@@ -19,19 +20,12 @@ const TOKEN_COOKIE = "twm_token";
 export const AUTH_TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 const challenges = new Map<string, Challenge>();
 
-function secretPath(): string {
-  return path.join(config.dataDir, "server-secret");
-}
+const authSecret = createAuthSecretStore(() => path.join(config.dataDir, "server-secret"));
+const getSecret = authSecret.get;
 
-async function getSecret(): Promise<string> {
-  await fsp.mkdir(config.dataDir, { recursive: true });
-  try {
-    return (await fsp.readFile(secretPath(), "utf8")).trim();
-  } catch {
-    const secret = crypto.randomBytes(48).toString("base64url");
-    await fsp.writeFile(secretPath(), `${secret}\n`, { mode: 0o600 });
-    return secret;
-  }
+/** Force a fresh read on the next token operation, including during an in-flight read. */
+export function reloadAuthSecret(): void {
+  authSecret.invalidate();
 }
 
 function base64url(input: string | Buffer): string {

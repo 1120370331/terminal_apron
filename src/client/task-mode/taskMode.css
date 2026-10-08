@@ -693,3 +693,9 @@
 .tm-managed-attachments{display:grid;gap:8px;max-height:18rem;overflow:auto;padding:2px}
 .tm-managed-attachment{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .tm-managed-attachment>a{flex:1;min-width:160px;overflow-wrap:anywhere}
+
+.tp-authorization-details { margin: 16px 0; padding: 16px; border: 1px solid var(--tp-border, #cbd5e1); border-radius: 12px; }
+.tp-authorization-details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+#tp-task-mode .tp-status[data-status="confirmation"] { background:var(--tp-amber-bg); color:var(--tp-amber); }
+#tp-task-mode .tp-status[data-status="acceptance"] { background:var(--tp-blue-bg); color:var(--tp-blue); }

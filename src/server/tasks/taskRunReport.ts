@@ -3,7 +3,7 @@ import type { TaskExecutionRun, TaskModeState, TaskRunResult } from "../../share
 import { taskArtifactLink, type TaskRunReportDocument } from "../../shared/taskArtifactTypes.js";
 import { hasTaskActionGuidance } from "../../shared/taskActionGuidance.js";
 
-const statuses = { done: "已完成", blocked: "尚未完成，已暂停", needs_confirmation: "已具备验收条件，等待人工确认", in_progress: "阶段进展，仍在继续执行" };
+const statuses = { awaiting_authorization: "待确认 · 等待批准执行授权", done: "已完成", blocked: "尚未完成，已暂停", needs_confirmation: "待验收 · 已具备验收条件，等待人工验收", in_progress: "阶段进展，仍在继续执行" };
 const checkLabels = { passed: "通过", failed: "未通过", not_run: "未执行" };
 const jobLabels = { pending: "待执行", active: "执行中", completed: "已完成", failed: "失败", interrupted: "已中断" };
 const line = (value: string) => value.replace(/\s+/g, " ").trim();
@@ -27,7 +27,7 @@ export function formatTaskRunReport(task: TaskItem, state: TaskModeState, run: T
   parts.push(`## 验证情况\n\n${result.verification.length ? result.verification.map((check, index) => `### ${index + 1}. ${checkLabels[check.result]}\n\n${check.details || "未提供验证说明。"}\n\n验证命令：\n\n${code(check.command)}`).join("\n\n") : "本轮尚未提供验证记录。"}`);
   parts.push(`## 未完成与风险\n\n${result.risks.length ? bullets([...new Set(result.risks)]) : "本轮汇报未列出风险。"}`);
   if (hasTaskActionGuidance(result)) {
-    parts.push(`## 你需要做什么\n\n${result.humanActions!.length ? result.humanActions!.map((item, index) => `${index + 1}. **${item.action}**\n\n   原因：${item.reason}\n\n   完成后：${item.unblocks}`).join("\n\n") : result.status === "needs_confirmation" ? "审查本轮结果和材料，在任务中确认通过或提出修改。" : "当前无需提供材料或决定。"}`);
+    parts.push(`## 你需要做什么\n\n${result.humanActions!.length ? result.humanActions!.map((item, index) => `${index + 1}. **${item.action}**\n\n   原因：${item.reason}\n\n   完成后：${item.unblocks}`).join("\n\n") : result.status === "needs_confirmation" ? "审查本轮结果和材料，在任务中验收通过或提出修改。" : "当前无需提供材料或决定。"}`);
     parts.push(`## 代理下一步\n\n${result.agentNextSteps!.length ? bullets(result.agentNextSteps!.filter(step=>step.length<=240).slice(0,3)) : result.status === "in_progress" ? "代理仍在继续推进，尚未给出下一步清单。" : "本轮未列出后续工作。"}`);
   } else parts.push("## 你需要做什么\n\n这份汇报缺少具体行动说明。请回到任务，要求代理补齐停下原因、所需条件和下一步。");
   if (result.artifacts.length) parts.push(`## 重要审查材料\n\n${bullets(result.artifacts.map(file => {

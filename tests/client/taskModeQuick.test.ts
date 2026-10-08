@@ -67,7 +67,7 @@ test("real publish UI retains quick draft on settings failure, then persists and
     const turnCall=manager.calls.find(call=>call.method==="turn/start")!;assert.equal(turnCall.params.sandboxPolicy.type,"workspaceWrite");assert.equal(turnCall.params.approvalsReviewer,"auto_review");
     const settingsIndex=apiRequests.findLastIndex(request=>request.path.endsWith("/settings")),instructionIndex=apiRequests.findIndex(request=>request.path.endsWith("/instructions"));assert.ok(settingsIndex<instructionIndex);assert.equal(manager.calls.filter(call=>call.method==="turn/start").length,1);
     await page.screenshot({path:path.join(evidence,"browser-quick.png"),fullPage:true});
-    await page.getByRole("button",{name:"确认通过",exact:true}).click();
+    await page.getByRole("button",{name:"验收通过",exact:true}).click();
     await page.getByText("本轮已完成，可继续追加",{exact:true}).waitFor();
     const final=mode.data.get(task.id)!;
     fs.writeFileSync(path.join(evidence,"browser-evidence.json"),JSON.stringify({result:"passed",port,temporaryProject:directory,taskId:task.id,settingsFailureRetainedDraft:true,restoredSelection:"quick",settingsBeforeSubmission:true,actualSource:fs.readFileSync(path.join(directory,"quick-result.cjs"),"utf8"),persistedState:final,bindings,rpcCalls:manager.calls,threads:[...manager.threads.values()],apiRequests,executorBoundary:"Real React production build + real routers + real scheduler + temporary SQLite. Auth fixture; deterministic app-server protocol fixture actually spawns node to write code and validate, not a real Codex model or OS sandbox."},null,2));

@@ -55,13 +55,13 @@ test("main task area loads independently and refreshes safely with delayed auxil
     if(gate==="500"||gate==="401"){res.status(Number(gate)).json({error:{message:`controlled ${gate} ${key}`}});return;}
     if(gate!=="hold"){next();return;}
     // Snapshot at receipt makes old list/detail responses genuinely stale when released.
-    const snapshot=key==="/api/tasks/projects"?store.projects():key==="/api/task-mode/documents"?{documents:mode.data.documents()}:key==="/api/task-mode/settings"?mode.data.settings():key==="/api/task-mode/view"?mode.data.view():key==="/api/task-mode"?mode.list(req.query.archived==="true"):key.startsWith("/api/task-mode/tasks/")?mode.detail(key.split("/").at(-1)!):undefined;
+    const snapshot=key==="/api/tasks/projects"?store.projects():key==="/api/task-mode/documents"?{documents:mode.data.documents()}:key==="/api/task-mode/settings"?mode.data.settings():key==="/api/task-mode/view"?mode.data.view():key==="/api/task-mode"?mode.list(req.query.archived==="true"):key.startsWith("/api/task-mode/tasks/")?mode.detail(key.split("/").at(-1)!,req.query.view==="workspace"):undefined;
     const requests=pending.get(key)??[];requests.push(()=>{if(!res.destroyed)res.json(snapshot);});pending.set(key,requests);
   });
   app.get("/api/me",(_req,res)=>res.json({name:"loading-isolated",method:"none"}));
   app.get("/api/auth/config",(_req,res)=>res.json({methods:["password"],user:"loading-isolated"}));
   app.use("/api/tasks",createTaskRouter(async()=>store));app.use("/api/task-mode",createTaskModeRouter(async()=>mode));
-  app.use("/task-monitor",express.static(build));app.get("/task-monitor/",(_req,res)=>res.sendFile(path.join(build,"task-monitor.html")));
+  app.use("/task-monitor",express.static(build,{dotfiles:"allow"}));app.get("/task-monitor/",(_req,res)=>res.sendFile(path.join(build,"task-monitor.html"),{dotfiles:"allow"}));
   let server:Server|undefined,browser:Awaited<ReturnType<typeof chromium.launch>>|undefined;
   try{
     server=await new Promise<Server>((resolve,reject)=>{const value=app.listen(0,"127.0.0.1",()=>resolve(value));value.once("error",reject);});
@@ -72,11 +72,12 @@ test("main task area loads independently and refreshes safely with delayed auxil
     const url=`http://127.0.0.1:${port}/task-monitor/?mode=task-mode&task=${first.id}`;
     const start=performance.now();await page.goto(url);
     await expect.poll(()=>count("/api/task-mode/view")).toBeGreaterThan(0);
-    await expect(page.getByRole("heading",{name:first.title,exact:true})).toHaveCount(0);
+    await expect(page.getByRole("heading",{name:first.title,exact:true})).toBeVisible();
+    await page.getByRole("textbox",{name:"下一步指示",exact:true}).fill("Task is interactive before settings and view respond");
     await expect(page.getByRole("button",{name:"工作台",exact:true})).toBeDisabled();
     assert.equal(writes.filter(entry=>entry.path.endsWith("/instructions")).length,0);
     release("/api/task-mode/settings");
-    await expect(page.getByRole("heading",{name:first.title,exact:true})).toHaveCount(0);
+    await expect(page.getByRole("heading",{name:first.title,exact:true})).toBeVisible();
     release("/api/task-mode/view");
     await expect(page.getByRole("heading",{name:first.title,exact:true})).toBeVisible();
     await page.getByRole("textbox",{name:"下一步指示",exact:true}).fill("Main area is interactive before auxiliary response");
@@ -112,7 +113,7 @@ test("main task area loads independently and refreshes safely with delayed auxil
     await page.getByRole("button",{name:"引用",exact:true}).click();
     await expect(page.getByRole("button",{name:`文档 · ${doc.title}`,exact:true})).toBeVisible();
     await page.getByRole("button",{name:`文档 · ${doc.title}`,exact:true}).click();
-    checks.push({scenario:"slow catalogs + necessary settings/view gate + editor/new/reference gate",result:"passed",details:{timings,pendingAuxiliaryRequestsAtInteractive:true,layout:"desk",executionMode:"quick"}});
+    checks.push({scenario:"slow catalogs and settings/view do not block task reads; editor/reference retain catalog gates",result:"passed",details:{timings,pendingAuxiliaryRequestsAtInteractive:true,layout:"desk",executionMode:"quick"}});
 
     // A real updated requirement reaches the current detail while list and projects are held.
     await expect.poll(()=>pending.get("/api/task-mode")?.length??0).toBe(0);
@@ -129,6 +130,8 @@ test("main task area loads independently and refreshes safely with delayed auxil
     gates.set(`/api/task-mode/tasks/${first.id}`,"hold");
     await page.locator(`[data-task-id="${first.id}"]`).click();
     await expect.poll(()=>pending.get(`/api/task-mode/tasks/${first.id}`)?.length??0).toBeGreaterThan(0);
+    await expect(page.getByRole("heading",{name:first.title,exact:true})).toBeVisible();
+    await page.getByRole("textbox",{name:"下一步指示",exact:true}).fill("Cached task remains interactive while validation is held");
     await page.locator(`[data-task-id="${second.id}"]`).click();
     await expect(page.getByRole("heading",{name:second.title,exact:true})).toBeVisible();
     release(`/api/task-mode/tasks/${first.id}`);

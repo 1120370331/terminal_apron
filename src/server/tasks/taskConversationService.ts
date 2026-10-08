@@ -11,6 +11,7 @@ import type {
   TaskConversationPage,
   TaskConversationPreferences,
   TaskConversationSummary,
+  TaskConversationTurn,
   TaskReasoningEffort,
   TaskApprovalsReviewer,
   UpdateTaskConversationPreferencesInput
@@ -35,7 +36,7 @@ interface TaskConversationServiceOptions {
 }
 
 // Internal orchestration options; the public conversation router never accepts these from request bodies.
-export interface TaskExecutionOverrides { cwd?: string; developerInstructions?: string; outputSchema?: Record<string, unknown>; primary?: boolean; approvalsReviewer?: TaskApprovalsReviewer }
+export interface TaskExecutionOverrides { cwd?: string; developerInstructions?: string; outputSchema?: Record<string, unknown>; primary?: boolean; approvalsReviewer?: TaskApprovalsReviewer; approvalPolicy?: "on-request" | "never"; forkFromThreadId?: string }
 
 export class TaskConversationService {
   readonly codexInfo: CodexInfoService;
@@ -48,6 +49,7 @@ export class TaskConversationService {
   private readonly convergencePollMs:number;
   private readonly retryAfterMs:number;
   private readonly staleGuardMs:number;
+  private turnPaginationSupported?: boolean;
   constructor(readonly store: TaskStore, readonly manager: CodexConversationManager, options:TaskConversationServiceOptions={}) {
     this.codexInfo = new CodexInfoService(manager);
     this.usage = new TaskUsageService(store, manager, this.codexInfo);
@@ -140,9 +142,33 @@ export class TaskConversationService {
     this.projections.invalidate(taskId, threadId);
     return this.read(taskId, threadId, limit);
   }
+  async readTurnFresh(taskId: string, threadId: string, turnId: string): Promise<TaskConversationTurn | undefined> {
+    const binding=this.requireBinding(taskId,threadId);this.manager.bindThread(taskId,threadId);
+    this.projections.invalidate(taskId,threadId);
+    if(this.turnPaginationSupported!==false){
+      try{
+        const page=object(await this.manager.request("thread/turns/list",{threadId,limit:1,sortDirection:"desc",itemsView:"full"}));
+        if(Array.isArray(page?.data)){
+          this.turnPaginationSupported=true;
+          const raw=page.data.find(value=>string(object(value)?.id)===turnId);
+          if(raw){
+            const turn=projectThread({thread:{id:threadId,turns:[raw]}},bindingBase(binding)).turns[0];
+            if(turn.status!=="in_progress")this.store.completeConversationTurn(threadId,turnId,turn.status==="failed");
+            return turn;
+          }
+        }else this.turnPaginationSupported=false;
+      }catch(error){
+        if(error instanceof CodexRpcError&&[-32601,-32602].includes(error.code??0))this.turnPaginationSupported=false;
+        else throw mapCodexError(error);
+      }
+    }
+    // Older app-servers and a requested turn outside the newest page retain the full-history fallback.
+    return (await this.readFresh(taskId,threadId,100)).detail.turns.find(turn=>turn.id===turnId);
+  }
 
   async create(taskId: string, input: CreateTaskConversationInput, execution: TaskExecutionOverrides = {}): Promise<{ conversation: TaskConversationSummary; operation: TaskConversationOperationReceipt }> {
     const task = this.requireTask(taskId); const clientMessageId = validateMessageId(input.clientMessageId);
+    if (execution.forkFromThreadId) this.requireBinding(taskId, execution.forkFromThreadId);
     const preferences = this.store.getConversationPreferences(taskId);
     const model = input.model ?? preferences.defaultModel;
     const requestHash = hash({ displayName: cleanName(input.displayName || `${task.key} · Codex`), model, execution });
@@ -153,7 +179,18 @@ export class TaskConversationService {
     let priorThreadIds:string[];try{priorThreadIds=await this.listAllThreadIds(resolvedCwd);}catch(error){this.store.failConversationRequest(reservation.receipt.operationId,false,"CREATE_SNAPSHOT_FAILED");const mapped=mapCodexError(error);if(mapped instanceof TaskConversationServiceError)throw mapped;throw new TaskConversationServiceError(503,"CODEX_UNAVAILABLE","Codex thread snapshot failed");}
     this.store.saveConversationCreateSnapshot(reservation.receipt.operationId,resolvedCwd,priorThreadIds);
     let result:Record<string,unknown>;
-    try{result = await this.manager.request<Record<string, unknown>>("thread/start", { cwd: resolvedCwd, model, approvalPolicy: "on-request", ...(execution.approvalsReviewer ? { approvalsReviewer: execution.approvalsReviewer } : {}), sandbox: "read-only", ephemeral: false, ...(execution.developerInstructions ? { developerInstructions: execution.developerInstructions, config: { "features.multi_agent": false } } : {}) });}catch(error){const uncertain=error instanceof CodexRpcError&&/timed out|exited/i.test(error.message);this.store.failConversationRequest(reservation.receipt.operationId,uncertain,uncertain?"CREATE_OUTCOME_UNKNOWN":"CREATE_START_FAILED");if(uncertain)throw new TaskConversationServiceError(503,"CREATE_OUTCOME_UNKNOWN","Conversation creation is being reconciled",{operationId:reservation.receipt.operationId});throw mapCodexError(error);}
+    try{
+      let fork: { threadId: string; lastTurnId?: string; excludeTurns: true } | undefined;
+      if (execution.forkFromThreadId) {
+        const source = await this.readFresh(taskId, execution.forkFromThreadId, 100);
+        if (source.detail.conversation.status === "active" || source.detail.turns.some(turn => turn.status === "in_progress") || source.approvals.length) {
+          throw new TaskConversationServiceError(409, "TURN_CONFLICT", "原会话仍有执行中的回合，请等待完成后继续，避免重复执行", { allowedActions: ["open_conversation"] });
+        }
+        fork = { threadId: execution.forkFromThreadId, lastTurnId: source.detail.turns.at(-1)?.id, excludeTurns: true };
+      }
+      // Fork uses the same durable create reservation and unknown-outcome reconciliation.
+      result = await this.manager.request<Record<string, unknown>>(fork ? "thread/fork" : "thread/start", { ...fork, cwd: resolvedCwd, model, approvalPolicy: execution.approvalPolicy ?? "on-request", ...(execution.approvalsReviewer ? { approvalsReviewer: execution.approvalsReviewer } : {}), sandbox: "read-only", ephemeral: false, ...(execution.developerInstructions ? { developerInstructions: execution.developerInstructions, config: { "features.multi_agent": false } } : {}) });
+    }catch(error){const uncertain=error instanceof CodexRpcError&&/timed out|exited/i.test(error.message);this.store.failConversationRequest(reservation.receipt.operationId,uncertain,uncertain?"CREATE_OUTCOME_UNKNOWN":"CREATE_START_FAILED");if(uncertain)throw new TaskConversationServiceError(503,"CREATE_OUTCOME_UNKNOWN","Conversation creation is being reconciled",{operationId:reservation.receipt.operationId});throw mapCodexError(error);}
     const thread = object(result.thread ?? result); const threadId = string(thread?.id);
     if (!threadId){this.store.failConversationRequest(reservation.receipt.operationId,false,"CREATE_PROTOCOL_ERROR");throw new TaskConversationServiceError(503, "CODEX_PROTOCOL_ERROR", "Codex did not return a thread id");}
     this.store.markConversationCreateSubmitted(reservation.receipt.operationId);
@@ -184,8 +221,14 @@ export class TaskConversationService {
     try {
       const refreshed = this.store.refreshContext(taskId); if (!refreshed) throw new TaskConversationServiceError(422, "TASK_CONTEXT_UNAVAILABLE", "Task context is unavailable");
       const cwd = path.resolve(execution.cwd ?? refreshed.contextDirectory);
-      await this.manager.request("thread/resume", { threadId, cwd, ...(execution.approvalsReviewer ? { approvalPolicy: "on-request", approvalsReviewer: execution.approvalsReviewer } : {}), ...(execution.developerInstructions ? { developerInstructions: execution.developerInstructions } : {}) });
-      const result = await this.manager.request<Record<string, unknown>>("turn/start", { threadId, clientUserMessageId: clientMessageId, input: [{ type: "text", text, text_elements: [] }], cwd, approvalPolicy: "on-request", ...(execution.approvalsReviewer ? { approvalsReviewer: execution.approvalsReviewer } : {}), sandboxPolicy: sandboxPolicy(permissionPreset, refreshed.contextDirectory, task.repositoryPath), model, effort, ...(execution.outputSchema ? { outputSchema: execution.outputSchema } : {}) });
+      try {
+        await this.manager.request("thread/resume", { threadId, cwd, ...((execution.approvalsReviewer || execution.approvalPolicy) ? { approvalPolicy: execution.approvalPolicy ?? "on-request", approvalsReviewer: execution.approvalsReviewer } : {}), ...(execution.developerInstructions ? { developerInstructions: execution.developerInstructions } : {}) });
+      } catch (error) {
+        // A rejected resume proves that turn/start was never submitted.
+        if (error instanceof CodexRpcError && /already has an active writer/i.test(error.message)) throw new TaskConversationServiceError(409, "THREAD_WRITER_CONFLICT", "旧 Codex 会话被另一写入进程占用，需要保留历史后续接执行", { threadId, allowedActions: ["retry", "open_conversation"] });
+        throw error;
+      }
+      const result = await this.manager.request<Record<string, unknown>>("turn/start", { threadId, clientUserMessageId: clientMessageId, input: [{ type: "text", text, text_elements: [] }], cwd, approvalPolicy: execution.approvalPolicy ?? "on-request", ...(execution.approvalsReviewer ? { approvalsReviewer: execution.approvalsReviewer } : {}), sandboxPolicy: sandboxPolicy(permissionPreset, refreshed.contextDirectory, task.repositoryPath), model, effort, ...(execution.outputSchema ? { outputSchema: execution.outputSchema } : {}) });
       const turn = object(result.turn ?? result); const turnId = string(turn?.id);
       if (!turnId) throw new TaskConversationServiceError(503, "CODEX_PROTOCOL_ERROR", "Codex did not return a turn id");
       return { operation: this.store.markConversationRequestSubmitted(reservation.receipt.operationId, turnId), threadId, turn };

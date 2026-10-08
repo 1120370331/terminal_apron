@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { projectTaskWorkspace } from "./taskModeWorkspace.js";
 import { DEFAULT_TASK_MODE_SETTINGS, DEFAULT_TASK_MODE_VIEW, type TaskModeDocument, type TaskModeList, type TaskModeSettings, type TaskModeState, type TaskModeViewPreferences } from "../../shared/taskModeTypes.js";
 
 // One epoch per Node process. Readers in the same process must not reset a live clock.
@@ -31,6 +32,8 @@ function historicalLowerBound(state: TaskModeState): number {
 /** Additive tables in the user's existing task database. No demo data or task migration. */
 export class TaskModeStore {
   private readonly db: DatabaseSync;
+  private readonly stateCache=new Map<string,{token:string;state:TaskModeState;bytes:number}>();
+  private cacheBytes=0;
   constructor(dbPath: string, private readonly processingOptions: { nowMs?: () => number; isProcessing?: (state: TaskModeState) => boolean; recoverOrphanedProcessing?: boolean } = {}) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
@@ -48,6 +51,21 @@ export class TaskModeStore {
     // Old writers also invalidate the projection. It is rebuilt only for changed
     // rows, under the same write lock as history/timing, never from a stale read.
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS task_mode_state_version (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, token TEXT NOT NULL);
+      INSERT OR IGNORE INTO task_mode_state_version(task_id,token) SELECT task_id,lower(hex(randomblob(16))) FROM task_mode_state;
+      CREATE TRIGGER IF NOT EXISTS task_mode_state_version_insert AFTER INSERT ON task_mode_state
+        BEGIN INSERT INTO task_mode_state_version(task_id,token) VALUES(NEW.task_id,lower(hex(randomblob(16))))
+          ON CONFLICT(task_id) DO UPDATE SET token=excluded.token; END;
+      CREATE TRIGGER IF NOT EXISTS task_mode_state_version_update AFTER UPDATE ON task_mode_state
+        BEGIN INSERT INTO task_mode_state_version(task_id,token) VALUES(NEW.task_id,lower(hex(randomblob(16))))
+          ON CONFLICT(task_id) DO UPDATE SET token=excluded.token; END;
+      CREATE TABLE IF NOT EXISTS task_mode_workspace (
+        task_id TEXT PRIMARY KEY REFERENCES task_mode_state(task_id) ON DELETE CASCADE, data TEXT NOT NULL);
+      CREATE TRIGGER IF NOT EXISTS task_mode_workspace_insert AFTER INSERT ON task_mode_state
+        BEGIN DELETE FROM task_mode_workspace WHERE task_id=NEW.task_id; END;
+      CREATE TRIGGER IF NOT EXISTS task_mode_workspace_update AFTER UPDATE ON task_mode_state
+        BEGIN DELETE FROM task_mode_workspace WHERE task_id=OLD.task_id OR task_id=NEW.task_id; END;
       CREATE TABLE IF NOT EXISTS task_mode_summary (
         task_id TEXT PRIMARY KEY REFERENCES task_mode_state(task_id) ON DELETE CASCADE,
         data TEXT NOT NULL, scheduled INTEGER NOT NULL, startup INTEGER NOT NULL);
@@ -70,12 +88,31 @@ export class TaskModeStore {
       } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     }
   }
-  close() { this.db.close(); }
+  close() { this.stateCache.clear();this.cacheBytes=0;this.db.close(); }
   get(taskId: string): TaskModeState | null {
-    const row = this.db.prepare("SELECT data FROM task_mode_state WHERE task_id=?").get(taskId) as { data: string } | undefined;
-    return row ? this.withProcessing(this.hydrate(JSON.parse(row.data) as TaskModeState)) : null;
+    const cached=this.stateCache.get(taskId);
+    if(cached){
+      const version=this.db.prepare("SELECT version.token FROM task_mode_state_version version JOIN task_mode_state state ON state.task_id=version.task_id WHERE version.task_id=?").get(taskId) as {token:string}|undefined;
+      if(version?.token===cached.token){this.stateCache.delete(taskId);this.stateCache.set(taskId,cached);return this.withProcessing(copyJson(cached.state));}
+      this.stateCache.delete(taskId);this.cacheBytes-=cached.bytes;
+    }
+    // The payload and its generation must share one SQLite statement snapshot.
+    // Processing may yield the write lock to another connection before caching.
+    const row = this.db.prepare(`SELECT state.data, version.token FROM task_mode_state state
+      LEFT JOIN task_mode_state_version version ON version.task_id=state.task_id WHERE state.task_id=?`).get(taskId) as { data: string; token?: string } | undefined;
+    if(!row)return null;
+    const state=this.withProcessing(this.hydrate(JSON.parse(row.data) as TaskModeState));this.rememberState(state,row.data.length*2,row.token);return state;
   }
   all(): TaskModeState[] { return (this.db.prepare("SELECT data FROM task_mode_state").all() as unknown as Array<{ data: string }>).map(row => this.withProcessing(this.hydrate(JSON.parse(row.data) as TaskModeState))); }
+  workspace(taskId: string): TaskModeState | null {
+    return this.readProjection(() => {
+      const row = this.db.prepare(`SELECT workspace.data, processing.* FROM task_mode_workspace workspace
+        JOIN task_mode_processing_verified processing ON processing.task_id=workspace.task_id WHERE workspace.task_id=?`).get(taskId) as (ProcessingRow & { data: string }) | undefined;
+      if (!row) return null;
+      const state = this.hydrate(JSON.parse(row.data) as TaskModeState);
+      this.applyProcessing(state, row);return state;
+    }, taskId);
+  }
   /** Same public list fields; live timing is always joined from its authority. */
   summaries(): ListSummary[] {
     return this.readProjection(() => {
@@ -111,6 +148,11 @@ export class TaskModeStore {
     const scheduled = activePhases.has(state.phase) || readyPhases.has(state.phase) && queued;
     this.db.prepare("INSERT INTO task_mode_summary(task_id,data,scheduled,startup) VALUES(?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET data=excluded.data,scheduled=excluded.scheduled,startup=excluded.startup")
       .run(state.taskId, JSON.stringify(summary), Number(scheduled), Number(state.phase === "blocked"));
+    this.writeWorkspace(state);
+  }
+  private writeWorkspace(state: TaskModeState): void {
+    this.db.prepare("INSERT INTO task_mode_workspace(task_id,data) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET data=excluded.data")
+      .run(state.taskId, JSON.stringify(projectTaskWorkspace(state)));
   }
   private missingSummaryIds(): Array<{ task_id: string }> {
     return this.db.prepare(`SELECT state.task_id FROM task_mode_state state
@@ -118,16 +160,20 @@ export class TaskModeStore {
       LEFT JOIN task_mode_processing_verified processing ON processing.task_id=state.task_id
       WHERE summary.task_id IS NULL OR processing.coverage IS NULL OR processing.recovered_ms IS NULL ORDER BY state.rowid`).all() as Array<{ task_id: string }>;
   }
-  private readProjection<T>(read: () => T): T {
+  private readProjection<T>(read: () => T, workspaceTaskId?: string): T {
     // Discovery and result share a snapshot, so an old writer cannot invalidate
     // a row between them and make it disappear from the returned list.
     this.db.exec("BEGIN"); let transaction = true;
     try {
-      if (this.missingSummaryIds().length) {
+      if (this.missingSummaryIds().length || workspaceTaskId && !this.db.prepare("SELECT 1 FROM task_mode_workspace WHERE task_id=?").get(workspaceTaskId)) {
         this.db.exec("ROLLBACK"); transaction = false;
         this.db.exec("BEGIN IMMEDIATE"); transaction = true;
         // Recheck under the write lock; do not upgrade a stale read transaction.
         this.backfillSummaries();
+        if (workspaceTaskId && !this.db.prepare("SELECT 1 FROM task_mode_workspace WHERE task_id=?").get(workspaceTaskId)) {
+          const row = this.db.prepare("SELECT data FROM task_mode_state WHERE task_id=?").get(workspaceTaskId) as { data: string } | undefined;
+          if (row) { const state=this.hydrate(JSON.parse(row.data) as TaskModeState);this.applyProcessing(state,this.processingRow(state));this.writeWorkspace(state); }
+        }
       }
       const result = read(); this.db.exec("COMMIT"); transaction = false; return result;
     } catch (error) { if (transaction) this.db.exec("ROLLBACK"); throw error; }
@@ -147,14 +193,28 @@ export class TaskModeStore {
   }
   save(state: TaskModeState): void {
     this.hydrate(state);
+    let bytes=0,token:string|undefined;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.updateProcessingInside(state, this.processingOptions.isProcessing?.(state) ?? (["planning", "working", "reviewing"].includes(state.phase) && !state.heartbeat.nextRetryAt));
       state.revision += 1; state.updatedAt = new Date().toISOString();
-      this.db.prepare("INSERT INTO task_mode_state(task_id,data) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET data=excluded.data").run(state.taskId, JSON.stringify(state));
+      const serialized=JSON.stringify(state);
+      this.db.prepare("INSERT INTO task_mode_state(task_id,data) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET data=excluded.data").run(state.taskId, serialized);
       this.writeSummary(state);
+      // Capture our trigger's token while the write transaction still owns it.
+      token=(this.db.prepare("SELECT token FROM task_mode_state_version WHERE task_id=?").get(state.taskId) as {token:string}|undefined)?.token;
+      bytes=serialized.length*2;
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    // Failed commits leave the previous cache untouched. A later writer can now
+    // commit, but cannot make this old payload adopt that writer's new token.
+    this.rememberState(state,bytes,token);
+  }
+  private rememberState(state:TaskModeState,bytes:number,token:string|undefined):void {
+    const previous=this.stateCache.get(state.taskId);if(previous){this.cacheBytes-=previous.bytes;this.stateCache.delete(state.taskId);}
+    if(!token||bytes>512*1024*1024)return;
+    this.stateCache.set(state.taskId,{token,state:copyJson(state),bytes});this.cacheBytes+=bytes;
+    while(this.cacheBytes>512*1024*1024||this.stateCache.size>12){const id=this.stateCache.keys().next().value!;this.cacheBytes-=this.stateCache.get(id)!.bytes;this.stateCache.delete(id);}
   }
   /** Approval events can close/open the clock immediately without overwriting workflow state. */
   setProcessing(state: TaskModeState, counting: boolean): void {
@@ -238,4 +298,12 @@ export class TaskModeStore {
     state.heartbeat ??= { status: ["planning", "working", "reviewing"].includes(state.phase) ? "recovering" : "idle", recoveryAttempts: 0 };
     return state;
   }
+}
+
+// JSON records contain only arrays, plain objects and immutable primitives.
+// Copy mutable containers while sharing large evidence strings between isolated readers.
+function copyJson<T>(value:T):T {
+  if(Array.isArray(value))return value.map(item=>copyJson(item)) as T;
+  if(value&&typeof value==="object")return Object.fromEntries(Object.entries(value).filter(([,item])=>item!==undefined).map(([key,item])=>[key,copyJson(item)])) as T;
+  return value;
 }

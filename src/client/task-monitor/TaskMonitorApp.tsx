@@ -12,7 +12,7 @@ import {
 import { lazy, Suspense, useEffect, useMemo, useState, type FormEvent } from "react";
 import type { AuthConfig, AuthUser } from "../../shared/types";
 import { taskAuthApi } from "../taskApi";
-import { TaskMonitorPage } from "./TaskMonitorPage";
+const TaskMonitorPage = lazy(() => import("./TaskMonitorPage").then(module => ({ default: module.TaskMonitorPage })));
 
 type ThemeMode = "light" | "dark";
 
@@ -101,7 +101,7 @@ function TaskMonitorContents() {
           </button>
         </div>
       </header>
-      <TaskMonitorPage userName={user.name} onUnauthorized={() => setUser(null)} />
+      <Suspense fallback={<main className="task-monitor-boot">正在打开任务工作台…</main>}><TaskMonitorPage userName={user.name} onUnauthorized={() => setUser(null)} /></Suspense>
     </main>
   );
 }

@@ -10,6 +10,8 @@ import { TaskConversationServiceError } from "./taskConversationService.js";
 import { attachmentDelivery, validateScreenshot } from "./taskRouter.js";
 import { config } from "../config.js";
 import { CodexInfoError } from "../codexInfoService.js";
+import { projectTaskWorkspace } from "./taskModeWorkspace.js";
+import type { TaskModeDetail } from "../../shared/taskModeTypes.js";
 
 type Provider=(user:AuthUser)=>Promise<TaskModeService>;
 const upload=multer({storage:multer.memoryStorage(),limits:{files:8,fileSize:10*1024*1024}}).array("files",8);
@@ -36,7 +38,10 @@ export function createTaskModeRouter(provider:Provider) {
     const listener=(event:unknown)=>{if(!res.writableEnded)res.write(`data: ${JSON.stringify(event)}\n\n`);};service.on("change",listener);
     const unsubscribe=service.conversations.store.subscribe(listener);const timer=setInterval(()=>res.write(": heartbeat\n\n"),15000);timer.unref();res.once("close",()=>{clearInterval(timer);unsubscribe();service.off("change",listener);});
   }));
-  router.get("/tasks/:taskId",route((req,res,service)=>res.json(service.detail(param(req,"taskId")))));
+  const sendDetail=(req:Request,res:Response,detail:TaskModeDetail)=>res.json(req.query.view==="workspace"?{...detail,state:projectTaskWorkspace(detail.state)}:detail);
+  router.get("/tasks/:taskId",route((req,res,service)=>res.json(service.detail(param(req,"taskId"),req.query.view==="workspace"))));
+  router.get("/tasks/:taskId/runs/:runId/changes",route((req,res,service)=>res.json(service.runChanges(param(req,"taskId"),param(req,"runId")))));
+  router.get("/tasks/:taskId/runs/:runId/jobs/:jobId/items",route((req,res,service)=>res.json(service.executionItems(param(req,"taskId"),param(req,"runId"),param(req,"jobId")))));
   router.get("/tasks/:taskId/runs/:runId/report",route((req,res,service)=>{
     const report=service.runReport(param(req,"taskId"),param(req,"runId"));res.set("Cache-Control","private, no-store");
     if(req.query.download==="1")return res.type("text/markdown; charset=utf-8").set("Content-Disposition",`attachment; filename="${report.taskKey}-result-${report.runId.slice(0,8)}.md"`).send(report.markdown);
@@ -57,14 +62,14 @@ export function createTaskModeRouter(provider:Provider) {
   router.post("/tasks/:taskId/instructions",route(async(req,res,service)=>{
     const input=req.body as SubmitTaskInstruction;
     for(const key of ["attachmentIds","referenceTaskIds","documentIds"] as const)if(input[key]!==undefined&&(!Array.isArray(input[key])||(key!=="attachmentIds"&&input[key]!.length>32)||input[key]!.some(value=>typeof value!=="string"||value.length>100)))throw new TaskModeError(400,"引用列表无效");
-    res.status(202).json(await service.submit(param(req,"taskId"),input));
+    sendDetail(req,res.status(202),await service.submit(param(req,"taskId"),input));
   }));
   router.post("/tasks/:taskId/instructions/:instructionId/:action",route(async(req,res,service)=>{
     const action=param(req,"action");if(!["archive","restore"].includes(action))throw new TaskModeError(400,"无效需求操作");
-    res.json(await service.instructionAction(param(req,"taskId"),param(req,"instructionId"),action as "archive"|"restore"));
+    sendDetail(req,res,await service.instructionAction(param(req,"taskId"),param(req,"instructionId"),action as "archive"|"restore"));
   }));
-  router.delete("/tasks/:taskId/instructions/:instructionId",route(async(req,res,service)=>res.json(await service.instructionAction(param(req,"taskId"),param(req,"instructionId"),"delete"))));
-  router.post("/tasks/:taskId/actions",route(async(req,res,service)=>{const action=req.body?.action;if(!["pause","resume","retry","approve","reread_output","clarify_report"].includes(action))throw new TaskModeError(400,"无效操作");res.json(await service.action(param(req,"taskId"),action,req.body.runId));}));
+  router.delete("/tasks/:taskId/instructions/:instructionId",route(async(req,res,service)=>sendDetail(req,res,await service.instructionAction(param(req,"taskId"),param(req,"instructionId"),"delete"))));
+  router.post("/tasks/:taskId/actions",route(async(req,res,service)=>{const action=req.body?.action;if(!["pause","resume","retry","approve","approve_authorization","reread_output","clarify_report"].includes(action))throw new TaskModeError(400,"无效操作");sendDetail(req,res,await service.action(param(req,"taskId"),action,req.body.runId,req.body));}));
   router.post("/tasks/:taskId/attachments",upload,route((req,res,service)=>{
     const taskId=param(req,"taskId");let task=service.detail(taskId).task;const files=Array.isArray(req.files)?req.files:[];if(!files.length)throw new TaskModeError(400,"请提供附件");
     // Validate the complete batch before writing anything. Active formats download as files.

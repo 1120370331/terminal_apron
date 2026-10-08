@@ -105,7 +105,7 @@ test("timing stays authoritative across connections, recover missing lower bound
     const idle = f.tasks.create({ title: "No clock" }); a.ensure(idle.id);
     const active = a.get(task.id)!; active.phase = "working"; a.save(active); assert.notEqual(active.processingStartedAt, start);
     now += 3000;
-    assert.equal(historyParses(() => a.stopProcessing()), 1);
+    assert.equal(historyParses(() => a.stopProcessing()), 0);
     assert.equal(b.summaries().find(x => x.taskId === task.id)!.processedDurationMs, null);
     assert.equal(b.summaries().find(x => x.taskId === task.id)!.processedVerifiedDurationMs, 11000);
     assert.equal(b.summaries().find(x => x.taskId === task.id)!.processedRecoveredDurationMs, 8000);

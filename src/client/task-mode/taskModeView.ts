@@ -1,13 +1,16 @@
 import type { TaskItem } from "../../shared/taskTypes";
 import type { TaskModeList, TaskModeViewPreferences } from "../../shared/taskModeTypes";
-export const MODE_STATUSES = ["not_started","in_progress","recovering","pending_manual_acceptance","blocked","paused","done"] as const;
-export const STATUS_NAMES:Record<string,string>={not_started:"未开始",in_progress:"进行中",recovering:"自动恢复中",pending_manual_acceptance:"待人工确认",pending_auto_acceptance:"代理检查中",blocked:"阻塞",paused:"已暂停",done:"已完成"};
+export const MODE_STATUSES = ["not_started","in_progress","recovering","pending_manual_acceptance","awaiting_authorization","blocked","paused","done"] as const;
+export const STATUS_NAMES:Record<string,string>={not_started:"未开始",in_progress:"进行中",recovering:"自动恢复中",pending_manual_acceptance:"待验收",pending_auto_acceptance:"代理检查中",awaiting_authorization:"待确认",blocked:"阻塞",paused:"已暂停",done:"已完成"};
+export const STATUS_DESCRIPTIONS:Record<string,string>={awaiting_authorization:"等待你确认授权或执行操作，批准后继续任务",pending_manual_acceptance:"本轮已达到验收条件，等待你验收结果和材料"};
+export const statusColumn=(status:string)=>status==="awaiting_authorization"?"pending_manual_acceptance":status;
+export const columnLabel=(status:string)=>status==="pending_manual_acceptance"?"待确认 / 待验收":STATUS_NAMES[status]??status;
 export const POLICY_NAMES:Record<string,string>={auto:"自动拆分",parallel:"偏好多 Worker",single:"单 Worker"};
 export type ModeSummary=TaskModeList["states"][number];
 export function visibleStatus(task:TaskItem,state?:Pick<ModeSummary,"phase"|"instructionCount"|"heartbeat">):string {
   if(!state?.instructionCount)return task.status==="pending_auto_acceptance"?"in_progress":task.status;
   if(state.heartbeat?.status==="recovering"&&["planning","working","reviewing"].includes(state.phase))return "recovering";
-  return ({idle:task.status,planning:"in_progress",working:"in_progress",reviewing:"in_progress",paused:"paused",blocked:"blocked",needs_confirmation:"pending_manual_acceptance",completed:"done"} as Record<string,string>)[state.phase]??task.status;
+  return ({idle:task.status,planning:"in_progress",working:"in_progress",reviewing:"in_progress",paused:"paused",awaiting_authorization:"awaiting_authorization",blocked:"blocked",needs_confirmation:"pending_manual_acceptance",completed:"done"} as Record<string,string>)[state.phase]??task.status;
 }
 export function localDay(value:string|Date|undefined):string {if(!value)return "";const date=new Date(value);if(Number.isNaN(date.getTime()))return "";return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;}
 export function filterTasks(tasks:TaskItem[],states:Map<string,ModeSummary>,view:TaskModeViewPreferences,today=new Date()) {
@@ -15,7 +18,7 @@ export function filterTasks(tasks:TaskItem[],states:Map<string,ModeSummary>,view
   if(f.period==="custom"){start=f.start;end=f.end;}else if(f.period!=="all"){const date=new Date(today);date.setDate(date.getDate()-(f.period==="yesterday"?1:f.period==="7"?6:f.period==="30"?29:0));start=localDay(date);end=f.period==="yesterday"?start:day;}
   const positions=new Map(view.taskOrder.map((id,index)=>[id,index]));const manual=(a:TaskItem,b:TaskItem)=>(positions.get(a.id)??1e9)-(positions.get(b.id)??1e9)||b.createdAt.localeCompare(a.createdAt);
   return tasks.filter(task=>{const state=states.get(task.id),status=visibleStatus(task,state);if(f.query&&!`${task.title} ${task.key} ${task.descriptionMd} ${task.tags.join(" ")}`.toLowerCase().includes(f.query.toLowerCase()))return false;
-    if(f.status!=="all"&&(f.status==="unfinished"?status==="done":f.status==="attention"?!["pending_manual_acceptance","blocked"].includes(status):status!==f.status))return false;
+    if(f.status!=="all"&&(f.status==="unfinished"?status==="done":f.status==="attention"?!["pending_manual_acceptance","awaiting_authorization","blocked"].includes(status):status!==f.status))return false;
     if(f.project!=="all"&&task.project!==f.project)return false;if(f.tag&&!task.tags.some(tag=>tag.toLocaleLowerCase()===f.tag.toLocaleLowerCase()))return false;if(f.policy!=="all"&&(state?.settings.workerPolicy??"auto")!==f.policy)return false;
     if(f.material==="attachments"&&!task.attachments.length)return false;if(f.material==="review"&&status!=="pending_manual_acceptance")return false;if(f.material==="code"&&!task.latestReport?.changedFiles.length)return false;
     if(start&&end&&start>end)return false;

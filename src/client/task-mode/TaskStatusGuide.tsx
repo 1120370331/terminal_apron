@@ -14,8 +14,10 @@ export function TaskStatusGuide({ state, latestReport, approvalCount }: Props) {
   const cause = (state.phase === "blocked" ? currentBlock?.stopReason || state.error : previousBlock?.stopReason)?.split(/[；。]/)[0];
   const guidance = currentBlock && hasTaskActionGuidance(currentBlock);
 
+  if (state.phase === "awaiting_authorization") return <section className="tm-status-guide" data-state="review"><CircleAlert/><div><strong>待确认 · 授权请求</strong><p>左侧列出具体请求，点击顶部“批准授权”后继续执行。</p></div></section>;
+
   if (approvalCount > 0) return <section className="tm-status-guide" data-state="review" aria-label="当前任务需要你的确认">
-    <CircleAlert /><div><strong>需要你处理 {approvalCount} 项 Codex 请求</strong><p>请查看下方的权限请求，选择允许或拒绝；处理后任务会继续。</p></div>
+    <CircleAlert /><div><strong>需要你处理 {approvalCount} 项 Codex 请求</strong><p>请查看左侧的具体授权内容，点击顶部“批准授权”后任务会继续。</p></div>
   </section>;
 
   if (active) return <section className="tm-status-guide" data-state="working" aria-label="当前任务需要你做什么">
@@ -33,8 +35,8 @@ export function TaskStatusGuide({ state, latestReport, approvalCount }: Props) {
     </div>
   </section>;
 
-  if (state.phase === "needs_confirmation") return <section className="tm-status-guide" data-state="review" aria-label="任务等待确认">
-    <CircleAlert /><div><strong>需要你确认本轮结果</strong><p>请查看下方汇报和审查材料，然后选择“确认通过”或“提出修改”。</p></div>
+  if (state.phase === "needs_confirmation") return <section className="tm-status-guide" data-state="review" aria-label="任务等待验收">
+    <CircleAlert /><div><strong>待验收 · 本轮已达到验收条件</strong><p>请查看下方汇报和审查材料，然后选择“验收通过”或“提出修改”。</p></div>
   </section>;
 
   if (state.phase === "completed") return <section className="tm-status-guide" data-state="done" aria-label="任务完成状态">

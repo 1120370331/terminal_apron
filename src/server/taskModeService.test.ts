@@ -22,11 +22,19 @@ import type { TaskExecutionJob } from "../shared/taskModeTypes.js";
 
 class ControlledManager extends EventEmitter {
   threads=new Map<string,any>();calls:Array<{method:string;params:any}>=[];sequence=0;
+  writerLocks=new Set<string>();
+  uncertainFork=false;
   failReads=0;
   bindThread(){} unbindThread(){} close(){} pendingApprovals(){return [];}
   async models(){return [{id:"gpt-6.1-sol",displayName:"GPT-6.1 Sol",isDefault:true,efforts:["medium"],defaultEffort:"medium"}];}
   async request(method:string,params:any):Promise<any>{
     this.calls.push({method,params});
+    if(method==="thread/resume"&&this.writerLocks.has(params.threadId))throw new CodexRpcError(`thread ${params.threadId} already has an active writer`);
+    if(method==="thread/fork"){
+      const original=this.threads.get(params.threadId),boundary=params.lastTurnId?original.turns.findIndex((turn:any)=>turn.id===params.lastTurnId)+1:original.turns.length;
+      const thread={...structuredClone(original),id:`thread-${++this.sequence}`,cwd:params.cwd,status:{type:"idle"},turns:structuredClone(original.turns.slice(0,boundary))};this.threads.set(thread.id,thread);
+      if(this.uncertainFork){this.uncertainFork=false;throw new CodexRpcError("Codex request timed out: thread/fork");}return {thread};
+    }
     if(method==="thread/list")return {data:[...this.threads.values()].filter(thread=>thread.cwd===params.cwd).map(thread=>({id:thread.id})),nextCursor:null};
     if(method==="thread/start"){const thread={id:`thread-${++this.sequence}`,cwd:params.cwd,status:{type:"idle"},turns:[]};this.threads.set(thread.id,thread);return {thread};}
     if(method==="thread/read"){
@@ -688,4 +696,193 @@ test("worker artifact imports are feedback and deleting them suppresses repeated
     assert.equal((f.mode as any).importArtifact(f.task.id,"new-legacy-run","legacy-review.md","旧材料"),undefined);
     const disk=new DatabaseSync(f.store.dbPath);try{assert.equal(disk.prepare("SELECT source FROM task_attachments").all().length,0);assert.equal(disk.prepare("SELECT COUNT(*) AS n FROM task_attachment_tombstones").get()!.n,2);}finally{disk.close();}
   } finally {f.close();}
+});
+
+
+function directAuthorizationOutput(overrides:Record<string,unknown>){const {nextWorkers,...output}=decision(overrides);return {...workerOutput,...output,instructionReplies:[]};}
+
+test("full authorization reaches real create/resume/turn RPCs and does not wait for artifact approval",async()=>{
+  const f=setup();try{
+    const settings=await f.mode.settings({...f.mode.data.settings(),authorizationType:"full_authorization",executionMode:"quick",reviewPolicy:"always"},f.task.id);
+    assert.equal(settings.permissionPreset,"full_access");
+    await f.mode.submit(f.task.id,{clientMessageId:"full-authorized-request",text:"完成已授权任务",timing:"now"});
+    const job=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),Boolean);
+    for(const call of f.manager.calls.filter(call=>["thread/start","thread/resume","turn/start"].includes(call.method)))assert.equal(call.params.approvalPolicy,"never",call.method);
+    const turn=f.manager.calls.find(call=>call.method==="turn/start")!;
+    assert.equal(turn.params.sandboxPolicy.type,"dangerFullAccess");
+    assert.match(turn.params.input[0].text, /完成已授权任务/);
+    assert.match(f.manager.calls.find(call=>call.method==="thread/start")!.params.developerInstructions,/完全授权/);
+    f.manager.complete(job!,directAuthorizationOutput({status:"needs_confirmation",acceptanceReady:true,remainingWork:[],agentNextSteps:[],humanActions:[{action:"确认最终材料",reason:"一般结果确认",unblocks:"完成"}]}));
+    const done=await waitFor(()=>f.mode.detail(f.task.id),detail=>detail.state.phase==="completed");
+    assert.equal(done.state.runs.at(-1)!.result!.status,"done");
+    assert.deepEqual(done.state.runs.at(-1)!.result!.humanActions,[]);
+  }finally{f.close();}
+});
+
+test("authorization-only pause is not blocked and approving continues existing run with exact grant",async()=>{
+  const f=setup();try{
+    await f.mode.settings({...f.mode.data.settings(),authorizationType:"pending_approval",executionMode:"quick"},f.task.id);
+    await f.mode.submit(f.task.id,{clientMessageId:"pending-authorization-request",text:"继续实现",timing:"now"});
+    const job=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),Boolean);
+    f.manager.complete(job!,directAuthorizationOutput({status:"blocked",acceptanceReady:false,pauseCategory:"authorization",humanActions:[{action:"批准修改指定配置",reason:"修改该配置需要授权",unblocks:"继续验证配置"}],stopReason:"等待配置修改授权"}));
+    const waiting=await waitFor(()=>f.mode.detail(f.task.id),detail=>detail.state.phase==="awaiting_authorization");
+    const runId=waiting.state.activeRunId;
+    assert.notEqual(waiting.task.status,"blocked");
+    assert.equal(f.mode.list().states.find(state=>state.taskId===f.task.id)!.phase,"awaiting_authorization");
+    await f.mode.action(f.task.id,"approve_authorization");
+    const next=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),Boolean);
+    assert.equal(f.mode.detail(f.task.id).state.activeRunId,runId);
+    assert.match(next!.text,/批准修改指定配置/);
+    assert.match(next!.text,/仅在此范围内/);
+    assert.match(f.manager.calls.filter(call=>call.method==="thread/resume").at(-1)!.params.developerInstructions,/批准修改指定配置/);
+    f.manager.complete(next!,directAuthorizationOutput({status:"done",acceptanceReady:true,remainingWork:[],agentNextSteps:[]}));
+    await waitFor(()=>f.mode.detail(f.task.id).state.phase,phase=>phase==="completed");
+    await assert.rejects(f.mode.action(f.task.id,"approve_authorization"),/当前没有待批准/);
+  }finally{f.close();}
+});
+
+test("authorization supplied with submission is durable and overrides the task default for that run",async()=>{
+  const f=setup();try{
+    await f.mode.settings({...f.mode.data.settings(),executionMode:"quick"},f.task.id);
+    await f.mode.submit(f.task.id,{clientMessageId:"submit-full-authorization",text:"按本次授权执行",timing:"now",authorizationType:"full_authorization"});
+    await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),Boolean);
+    const detail=f.mode.detail(f.task.id);
+    assert.equal(detail.state.instructions[0].authorizationType,"full_authorization");
+    assert.equal(detail.state.runs[0].settings.authorizationType,"full_authorization");
+    assert.equal(f.manager.calls.find(call=>call.method==="turn/start")!.params.approvalPolicy,"never");
+    await assert.rejects(f.mode.submit(f.task.id,{clientMessageId:"invalid-auth-type-request",text:"test",timing:"now",authorizationType:"invalid" as any}),/无效的授权类型/);
+    await assert.rejects(f.mode.submit(f.task.id,{clientMessageId:"submit-full-authorization",text:"按本次授权执行",timing:"now",authorizationType:"pending_approval"}),/相同请求标识/);
+  }finally{f.close();}
+});
+
+
+test("native authorization is projected as waiting and stale request sets cannot be approved",async()=>{
+  const f=setup();try{
+    await f.mode.settings({...f.mode.data.settings(),executionMode:"quick",authorizationType:"pending_approval"},f.task.id);
+    await f.mode.submit(f.task.id,{clientMessageId:"native-authorization-request",text:"执行配置验证",timing:"now"});
+    const job=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),Boolean);
+    let pending:any[]=[{token:"native-one",taskId:f.task.id,threadId:job!.threadId,turnId:job!.turnId,itemId:"command",kind:"command",decisions:["accept","decline"],command:{argv:["node","verify.js"],display:"node verify.js",cwd:f.directory,reason:"执行验证需要授权"}}];
+    f.manager.pendingApprovals=((_taskId:string,threadId:string)=>pending.filter(item=>item.threadId===threadId)) as any;
+    (f.manager as any).resolveApproval=(token:string)=>{pending=pending.filter(item=>item.token!==token);};
+    assert.equal(f.mode.detail(f.task.id).state.phase,"awaiting_authorization");
+    assert.equal(f.mode.list().states.find(state=>state.taskId===f.task.id)!.phase,"awaiting_authorization");
+    await assert.rejects(f.mode.action(f.task.id,"approve_authorization",undefined,{approvalTokens:["older-token"]}),/授权请求已变化/);
+    assert.equal(pending.length,1);
+    await f.mode.action(f.task.id,"approve_authorization",undefined,{approvalTokens:["native-one"]});
+    assert.equal(pending.length,0);
+    assert.equal(f.mode.detail(f.task.id).state.phase,"working");
+    assert.equal(f.mode.detail(f.task.id).state.runs.length,1);
+  }finally{f.close();}
+});
+
+
+test("legacy authorization pauses display waiting consistently in the current state and instruction history",async()=>{
+  const f=setup();let restarted:TaskModeService|undefined;try{
+    await f.mode.settings({...f.mode.data.settings(),executionMode:"quick"},f.task.id);
+    await f.mode.submit(f.task.id,{clientMessageId:"legacy-authorize-request",text:"验证配置",timing:"now"});
+    const job=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),Boolean);
+    f.manager.complete(job!,directAuthorizationOutput({status:"blocked",acceptanceReady:false,pauseCategory:"authorization",stopReason:"配置修改等待授权",humanActions:[{action:"批准配置修改",reason:"需要授权",unblocks:"继续验证配置"}]}));
+    await waitFor(()=>f.mode.detail(f.task.id).state.phase,value=>value==="awaiting_authorization");
+    const state=f.mode.data.get(f.task.id)!;state.phase="blocked";
+    state.runs[0].result={...state.runs[0].result!,status:"blocked"};
+    state.instructions[0].result={...state.runs[0].result,status:"blocked"};
+    f.mode.data.save(state);f.mode.close();
+    restarted=new TaskModeService(f.conversations,{pollMs:10000});
+    const detail=restarted.detail(f.task.id);
+    assert.equal(detail.state.phase,"awaiting_authorization");
+    assert.equal(detail.state.instructions[0].result!.status,"awaiting_authorization");
+    assert.notEqual(detail.task.status,"blocked");
+  }finally{restarted?.close();f.close();}
+});
+
+
+test("a completed task accepts follow-up through one history-preserving fork when its old writer is occupied",async()=>{
+  const f=setup();try{
+    await f.mode.settings({...f.mode.data.settings(),executionMode:"quick",reviewPolicy:"agent"},f.task.id);
+    await f.mode.submit(f.task.id,{clientMessageId:"writer-original-request",text:"完成原需求",timing:"now"});
+    const original=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),Boolean);
+    f.manager.complete(original!,directAuthorizationOutput({status:"done",acceptanceReady:true,remainingWork:[],agentNextSteps:[]}));
+    await waitFor(()=>f.mode.detail(f.task.id).state.phase,value=>value==="completed");
+    const oldRunId=f.mode.detail(f.task.id).state.activeRunId;
+    f.manager.writerLocks.add(original!.threadId!);
+    await f.mode.submit(f.task.id,{clientMessageId:"writer-followup-request",text:"只补充新的验收要求，保留已有成果",timing:"now",authorizationType:"full_authorization"});
+    const next=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),job=>Boolean(job&&job.id!==original!.id));
+    assert.notEqual(next!.threadId,original!.threadId);
+    assert.equal(next!.recoveredFromThreadId,original!.threadId);
+    assert.equal(f.manager.calls.filter(call=>call.method==="thread/fork").length,1);
+    const fork=f.manager.calls.find(call=>call.method==="thread/fork")!;
+    assert.equal(fork.params.lastTurnId,original!.turnId);
+    assert.equal(f.manager.threads.get(next!.threadId!)!.turns[0].id,original!.turnId);
+    assert.equal(f.manager.threads.get(original!.threadId!)!.turns.length,1);
+    const turnCalls=f.manager.calls.filter(call=>call.method==="turn/start");assert.equal(turnCalls.length,2);
+    assert.equal(turnCalls[1].params.approvalPolicy,"never");assert.equal(turnCalls[1].params.sandboxPolicy.type,"dangerFullAccess");
+    assert.match(turnCalls[1].params.input[0].text,/只补充新的验收要求/);
+    assert.ok(f.store.getConversationBinding(f.task.id,original!.threadId!));
+    assert.equal(f.store.listConversationBindings(f.task.id).find(binding=>binding.isPrimary)!.threadId,next!.threadId);
+    assert.equal(f.mode.detail(f.task.id).state.runs.find(run=>run.id===oldRunId)!.result!.status,"done");
+    f.manager.complete(next!,directAuthorizationOutput({status:"done",acceptanceReady:true,remainingWork:[],agentNextSteps:[]}));
+    await waitFor(()=>f.mode.detail(f.task.id).state.phase,value=>value==="completed");
+    assert.deepEqual(f.mode.detail(f.task.id).state.instructions.map(entry=>entry.status),["completed","completed"]);
+  }finally{f.close();}
+});
+
+test("startup repairs a previously exhausted writer conflict without enqueueing duplicate instructions",async()=>{
+  const f=setup();let restarted:TaskModeService|undefined;try{
+    await f.mode.settings({...f.mode.data.settings(),executionMode:"quick",reviewPolicy:"agent"},f.task.id);
+    await f.mode.submit(f.task.id,{clientMessageId:"writer-startup-original",text:"原需求",timing:"now"});
+    const first=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),Boolean);
+    f.manager.complete(first!,directAuthorizationOutput({status:"done",acceptanceReady:true,remainingWork:[],agentNextSteps:[]}));
+    await waitFor(()=>f.mode.detail(f.task.id).state.phase,value=>value==="completed");
+    await f.mode.submit(f.task.id,{clientMessageId:"writer-startup-followup",text:"补充需求",timing:"now"});
+    const job=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),value=>!!value&&value.id!==first!.id);
+    const state=f.mode.data.get(f.task.id)!;
+    f.store.completeConversationTurn(job!.threadId!,job!.turnId!);
+    f.manager.threads.get(job!.threadId!)!.turns.pop();
+    const pending=state.runs.at(-1)!.jobs.find(value=>value.id===job!.id)!;pending.status="pending";pending.turnId=undefined;pending.attempt++;
+    state.phase="blocked";state.error=`thread ${job!.threadId} already has an active writer`;state.heartbeat.status="needs_attention";state.heartbeat.recoveryAttempts=4;
+    f.mode.data.save(state);f.mode.close();f.manager.writerLocks.add(job!.threadId!);
+    restarted=new TaskModeService(f.conversations,{pollMs:20});
+    const recovered=await waitFor(()=>restarted!.detail(f.task.id).state,value=>value.runs.at(-1)?.jobs.some(entry=>entry.status==="active")===true);
+    assert.equal(recovered.instructions.length,2);assert.equal(recovered.runs.length,2);
+    assert.equal(recovered.runs[0].result!.status,"done");
+    assert.equal(recovered.runs[1].jobs[0].recoveredFromThreadId,job!.threadId);
+    assert.equal(recovered.error,undefined);assert.notEqual(recovered.heartbeat.status,"needs_attention");
+    assert.equal(f.manager.calls.filter(call=>call.method==="thread/fork").length,1);
+  }finally{restarted?.close();f.close();}
+});
+
+
+test("scheduler reconciles an uncertain writer-recovery fork without forking or sending twice",async()=>{
+  const f=setup({recoveryBaseMs:5});try{
+    await f.mode.settings({...f.mode.data.settings(),executionMode:"quick",reviewPolicy:"agent"},f.task.id);
+    await f.mode.submit(f.task.id,{clientMessageId:"uncertain-writer-original",text:"原需求",timing:"now"});
+    const original=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),Boolean);
+    f.manager.complete(original!,directAuthorizationOutput({status:"done",acceptanceReady:true,remainingWork:[],agentNextSteps:[]}));
+    await waitFor(()=>f.mode.detail(f.task.id).state.phase,value=>value==="completed");
+    f.manager.writerLocks.add(original!.threadId!);f.manager.uncertainFork=true;
+    await f.mode.submit(f.task.id,{clientMessageId:"uncertain-writer-followup",text:"仅追加需求",timing:"now"});
+    const recovered=await waitFor(()=>activeJob(f.mode,f.task.id,"execute"),job=>!!job&&job.id!==original!.id);
+    assert.equal(f.manager.calls.filter(call=>call.method==="thread/fork").length,1);
+    assert.equal(f.manager.calls.filter(call=>call.method==="turn/start").length,2);
+    assert.equal(recovered!.writerRecovery,undefined);
+    assert.equal(recovered!.recoveredFromThreadId,original!.threadId);
+    assert.equal(f.mode.detail(f.task.id).state.instructions.length,2);
+    assert.equal(f.store.listConversationBindings(f.task.id).length,2);
+  }finally{f.close();}
+});
+
+
+test("workspace detail defers heavy evidence while scoped evidence endpoints return complete data",()=>{
+  const f=setup();try{
+    const state=f.mode.data.ensure(f.task.id),large="complete-evidence-marker".repeat(10000);
+    const result={status:"done" as const,summary:"Verified workspace",changedFiles:["a.ts"],verification:[],risks:[],artifacts:[],changes:[{path:"a.ts",diff:large}]};
+    state.phase="completed";state.runs.push({id:"workspace-run",instructionIds:[],createdAt:state.updatedAt,settings:state.settings,reviewAttempt:0,result,jobs:[{id:"workspace-job",role:"execute",name:"Execution",objective:"",ownedPaths:[],status:"completed",attempt:0,text:large,model:"model",items:[{id:"output",kind:"command",command:"verify",cwd:f.directory,status:"completed",output:large}],output:{summary:result.summary,rawEvidence:large},processed:true}]});f.mode.data.save(state);
+    const view=f.mode.detail(f.task.id,true);assert.equal(view.state.runs[0].result!.changesDeferred,true);assert.deepEqual(view.state.runs[0].jobs[0].items,[]);
+    assert.equal(f.mode.runChanges(f.task.id,"workspace-run").changes[0].diff,large);
+    const items=f.mode.executionItems(f.task.id,"workspace-run","workspace-job").items;assert.equal(items[0].kind,"command");if(items[0].kind==="command")assert.equal(items[0].output,large);
+    assert.equal(f.mode.detail(f.task.id).state.runs[0].jobs[0].text,large);
+    const other=f.store.create({title:"Other task",repositoryPath:f.directory});
+    assert.throws(()=>f.mode.executionItems(other.id,"workspace-run","workspace-job"),/执行记录不存在/);
+    assert.throws(()=>f.mode.runChanges(other.id,"workspace-run"),/代码改动不存在/);
+  }finally{f.close();}
 });

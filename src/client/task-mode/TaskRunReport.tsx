@@ -3,6 +3,8 @@ import type { TaskRunResult } from "../../shared/taskModeTypes";
 import { MarkdownContent } from "../task-monitor/MarkdownContent";
 import { hasTaskActionGuidance } from "../../shared/taskActionGuidance";
 import { taskArtifactLink } from "../../shared/taskArtifactTypes";
+import { useEffect, useState } from "react";
+import { taskModeApi } from "./taskModeApi";
 
 interface Props {
   result: TaskRunResult;
@@ -29,6 +31,12 @@ function readableCheck(value: string) {
 }
 
 export function TaskRunReport({ result, taskId, runId, readOnly=false, busy, canResume, canClarify, followUpActive, approvalCount, onApprove, onRevise, onResume, onClarify }: Props) {
+  const [changesOpen,setChangesOpen]=useState(false),[changes,setChanges]=useState<TaskRunResult["changes"]>(),[changesLoading,setChangesLoading]=useState(false),[changesError,setChangesError]=useState(""),[refreshChanges,setRefreshChanges]=useState(0);
+  useEffect(()=>{
+    if(!changesOpen||!result.changesDeferred||!runId)return;let alive=true;setChangesLoading(true);setChangesError("");
+    void taskModeApi.runChanges(taskId,runId).then(value=>{if(alive)setChanges(value.changes);}).catch(error=>{if(alive)setChangesError(error instanceof Error?error.message:"代码改动读取失败");}).finally(()=>{if(alive)setChangesLoading(false);});
+    return()=>{alive=false;};
+  },[changesOpen,result.changesDeferred,taskId,runId,result.summary,refreshChanges]);
   const guidance = hasTaskActionGuidance(result);
   const summary = result.summary.trim();
   const hasMarkdownSections = /^\s*#{1,4}\s+/m.test(summary);
@@ -44,9 +52,9 @@ export function TaskRunReport({ result, taskId, runId, readOnly=false, busy, can
   const nextSteps=result.agentNextSteps??[];
   const publicNextSteps=nextSteps.filter(step=>step.length<=240).slice(0,3);
   const internalNextSteps=[...new Set([...nextSteps.filter(step=>!publicNextSteps.includes(step)),...(result.internalNextSteps??[])])];
-  const status = continuing ? "running" : result.status === "done" ? "done" : result.status === "blocked" ? "blocked" : "review";
-  const statusLabel = continuing ? "推进中" : result.status === "done" ? "已完成" : result.status === "blocked" ? result.pauseCategory==="unclear_requirement"?"需求待澄清":result.pauseCategory==="exception"?"异常":"阻塞" : "待确认";
-  const statusTitle = continuing ? "阶段进展已记录，代理正在继续完成剩余工作" : result.status === "done" ? "本轮目标已完成" : result.status === "blocked" ? "本轮有进展，任务尚未完成" : "执行已结束，等待你的确认";
+  const status = result.status === "awaiting_authorization" ? "confirmation" : result.status === "needs_confirmation" ? "acceptance" : continuing ? "running" : result.status === "done" ? "done" : result.status === "blocked" ? "blocked" : "review";
+  const statusLabel = result.status === "awaiting_authorization" ? "待确认" : continuing ? "推进中" : result.status === "done" ? "已完成" : result.status === "blocked" ? result.pauseCategory==="unclear_requirement"?"需求待澄清":result.pauseCategory==="exception"?"异常":"阻塞" : "待验收";
+  const statusTitle = result.status === "awaiting_authorization" ? "等待批准具体执行操作" : continuing ? "阶段进展已记录，代理正在继续完成剩余工作" : result.status === "done" ? "本轮目标已完成" : result.status === "blocked" ? "本轮有进展，任务尚未完成" : "本轮已达到验收条件，等待你验收";
 
   return <article className="tp-result tm-report">
     <header className="tm-report-header">
@@ -68,7 +76,7 @@ export function TaskRunReport({ result, taskId, runId, readOnly=false, busy, can
     {result.status !== "done" && <section className="tm-report-section tm-report-next">
       <h4>你需要做什么</h4>
       {approvalCount > 0 && <p>当前有 {approvalCount} 项 Codex 请求等待确认，请查看页首的确认卡。</p>}
-      {guidance ? result.humanActions!.length > 0 ? <ol className="tm-report-human-actions">{result.humanActions!.map((item,index) => <li key={index}><strong>{item.action}</strong><p>为什么需要你：{item.reason}</p><p>完成后：{item.unblocks}</p></li>)}</ol> : <p>{continuing ? "当前无需操作，代理正按下方步骤继续推进到可验收。" : "本轮无需你提供材料或决定。"}{canResume ? "请点击‘继续执行剩余工作’，代理将按下方清单推进。" : ""}{continuing ? "" : followUpActive ? "代理正在处理下一轮。" : result.status === "needs_confirmation" ? "请审查本轮结果，确认通过或提出修改。" : "下方列出了代理负责的剩余工作。"}</p> : <><p>这份汇报缺少具体行动说明，无法判断需要你提供什么。请点击“补齐行动说明”，代理会列出所需条件、提交方式及后续工作。</p><small>该操作保留已有代码、产物和发布候选，只补充报告。</small>{!readOnly && canClarify && <button className="tp-button tp-primary" disabled={busy} onClick={onClarify}>补齐行动说明</button>}</>}
+      {guidance ? result.humanActions!.length > 0 ? <ol className="tm-report-human-actions">{result.humanActions!.map((item,index) => <li key={index}><strong>{item.action}</strong><p>为什么需要你：{item.reason}</p><p>完成后：{item.unblocks}</p></li>)}</ol> : <p>{continuing ? "当前无需操作，代理正按下方步骤继续推进到可验收。" : "本轮无需你提供材料或决定。"}{canResume ? "请点击‘继续执行剩余工作’，代理将按下方清单推进。" : ""}{continuing ? "" : followUpActive ? "代理正在处理下一轮。" : result.status === "needs_confirmation" ? "请审查本轮结果，验收通过或提出修改。" : "下方列出了代理负责的剩余工作。"}</p> : <><p>这份汇报缺少具体行动说明，无法判断需要你提供什么。请点击“补齐行动说明”，代理会列出所需条件、提交方式及后续工作。</p><small>该操作保留已有代码、产物和发布候选，只补充报告。</small>{!readOnly && canClarify && <button className="tp-button tp-primary" disabled={busy} onClick={onClarify}>补齐行动说明</button>}</>}
       {guidance && publicNextSteps.length > 0 && <><h4>接下来完成什么</h4><ol>{publicNextSteps.map((step,index) => <li key={index}>{step}</li>)}</ol></>}
       {guidance && internalNextSteps.length > 0 && <details className="tm-report-internal"><summary>执行安排与技术细节</summary><ol>{internalNextSteps.map((step,index)=><li key={index}>{step}</li>)}</ol></details>}
       {!readOnly && canResume && guidance && <button className="tp-button tp-primary" disabled={busy} onClick={onResume}><Play />{result.humanActions!.length > 0 ? "已补充条件，继续执行" : "继续执行剩余工作"}</button>}
@@ -93,8 +101,9 @@ export function TaskRunReport({ result, taskId, runId, readOnly=false, busy, can
       {risks.length > 3 && <details className="tm-report-more"><summary>查看其余 {risks.length - 3} 项</summary><ul className="tm-report-risks">{risks.slice(3).map((risk, index) => <li key={index + 3}>{risk}</li>)}</ul></details>}
     </section>}
     {result.changedFiles.length > 0 && <section className="tm-report-section">
-      <details className="tm-report-changes"><summary><GitBranch /> 代码改动 · {result.changedFiles.length} 个文件</summary>
-        {result.changes.length ? result.changes.map((change, index) => <div key={`${change.path}-${index}`}><strong>{change.path}</strong><pre className="tp-diff">{change.diff || "本次工具记录没有提供 Diff"}</pre></div>) : <ul>{result.changedFiles.map(file => <li key={file}>{file}</li>)}</ul>}
+      <details className="tm-report-changes" onToggle={event=>setChangesOpen(event.currentTarget.open)}><summary><GitBranch /> 代码改动 · {result.changedFiles.length} 个文件</summary>
+        {changesOpen&&<>{changesLoading&&<p role="status">正在读取代码改动…</p>}{changesError&&<p className="tm-error" role="alert">{changesError}</p>}{result.changesDeferred&&<button className="tp-button tp-small" disabled={changesLoading} onClick={()=>setRefreshChanges(value=>value+1)}>刷新代码改动</button>}
+        {(result.changesDeferred?changes??[]:result.changes).length ? (result.changesDeferred?changes??[]:result.changes).map((change, index) => <div key={`${change.path}-${index}`}><strong>{change.path}</strong><pre className="tp-diff">{change.diff || "本次工具记录没有提供 Diff"}</pre></div>) : !changesLoading&&<ul>{result.changedFiles.map(file => <li key={file}>{file}</li>)}</ul>}</>}
       </details>
     </section>}
     {result.artifacts.length > 0 && <section className="tm-report-section tp-review-artifact">
@@ -107,7 +116,7 @@ export function TaskRunReport({ result, taskId, runId, readOnly=false, busy, can
         return <a href={href} target={preview ? "_blank" : undefined} rel={preview ? "noreferrer" : undefined} download={preview ? undefined : true} key={file.id}>{image && <img className="tp-art-image" src={file.url} alt={file.name} />}<span>{preview ? "预览" : "下载"} · {file.name}{file.previewFormat ? ` · ${file.previewFormat === "html" ? "HTML" : "Markdown"}` : ""}{preview ? " ↗" : ""}</span></a>;
       })}
     </section>}
-    {!readOnly && result.status === "needs_confirmation" && <div className="tp-row tm-report-actions"><button className="tp-button tp-primary" disabled={busy} onClick={onApprove}><Check /> 确认通过</button><button className="tp-button" onClick={onRevise}>提出修改</button></div>}
-    {result.reviewedAt && <p className="tp-small tp-muted tm-report-reviewed">人工确认于 {new Date(result.reviewedAt).toLocaleString()}</p>}
+    {!readOnly && result.status === "needs_confirmation" && <div className="tp-row tm-report-actions"><button className="tp-button tp-primary" disabled={busy} onClick={onApprove}><Check /> 验收通过</button><button className="tp-button" onClick={onRevise}>提出修改</button></div>}
+    {result.reviewedAt && <p className="tp-small tp-muted tm-report-reviewed">人工验收于 {new Date(result.reviewedAt).toLocaleString()}</p>}
   </article>;
 }

@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import type { Server } from "node:http";
 import express from "express";
 import { TaskConversationService, TaskConversationServiceError } from "./tasks/taskConversationService.js";
+import { CodexRpcError } from "./codexAppServerClient.js";
 import { TaskConversationConflictError, TaskStore } from "./tasks/taskStore.js";
 import { createTaskConversationRouter } from "./tasks/taskConversationRouter.js";
 
@@ -150,3 +151,93 @@ test("overlays durable active lease and pending approvals on a warm projection",
 test("releases a stale active lease when canonical history says the turn was interrupted",async()=>{const directory=fs.mkdtempSync(path.join(os.tmpdir(),"task-conversation-interrupted-"));const store=new TaskStore(directory);const manager=new InterruptedTurnManager();const service=new TaskConversationService(store,manager as any);try{const task=store.create({title:"Interrupted continuation",repositoryPath:directory});store.bindConversation(task.id,"thread-interrupted","Interrupted",true);const reservation=store.reserveConversationRequestAndLease({taskId:task.id,threadId:"thread-interrupted",operation:"send",clientMessageId:"interrupted-send-0001",requestHash:"hash",ownerInstanceId:service.instanceId});store.markConversationRequestSubmitted(reservation.receipt.operationId,"turn-interrupted");const page=await service.read(task.id,"thread-interrupted",50);assert.equal(page.detail.turns[0]?.status,"interrupted");assert.equal(page.detail.conversation.status,"idle");assert.equal(page.detail.conversation.activeTurnId,undefined);assert.equal(store.getActiveConversationLease(task.id,"thread-interrupted"),null);await service.send(task.id,"thread-interrupted",{clientMessageId:"interrupted-send-0002",text:"继续"});assert.equal(manager.calls.filter((entry)=>entry.method==="turn/start").length,1);}finally{store.close();fs.rmSync(directory,{recursive:true,force:true});}});
 
 for(const failure of ["malformed","deterministic"] as const)test(`releases the create guard after a ${failure} thread-start failure`,async()=>{const directory=fs.mkdtempSync(path.join(os.tmpdir(),`task-conversation-${failure}-`));const store=new TaskStore(directory);const manager=new FailingStartManager(failure);const service=new TaskConversationService(store,manager as any);try{const task=store.create({title:"Fail closed",repositoryPath:directory});await assert.rejects(()=>service.create(task.id,{clientMessageId:`${failure}-key-0001`}),failure==="malformed"?/thread id/:/authentication rejected/);assert.doesNotThrow(()=>store.beginConversationCreate({taskId:task.id,clientMessageId:`${failure}-key-0002`,requestHash:"new",resolvedCwd:task.contextDirectory}));}finally{store.close();fs.rmSync(directory,{recursive:true,force:true});}});
+
+
+class ForkManager extends FakeManager {
+  histories=new Map<string,any>();forks=0;uncertainFork=false;writerConflict=false;
+  override async request(method:string,params:any):Promise<any>{
+    if(method==="thread/resume"&&this.writerConflict){this.calls.push({method,params});throw new CodexRpcError(`thread ${params.threadId} already has an active writer`);}
+    if(method==="thread/read"&&this.histories.has(params.threadId)){this.calls.push({method,params});return {thread:structuredClone(this.histories.get(params.threadId))};}
+    if(method==="thread/fork"){
+      this.calls.push({method,params});this.forks++;const source=this.histories.get(params.threadId);
+      const thread={...structuredClone(source),id:`fork-${this.forks}`,cwd:params.cwd,status:{type:"idle"}};this.histories.set(thread.id,thread);this.threads.push({id:thread.id,cwd:params.cwd});
+      if(this.uncertainFork){this.uncertainFork=false;throw new CodexRpcError("Codex request timed out: thread/fork");}
+      return {thread};
+    }
+    return super.request(method,params);
+  }
+}
+function forkSetup(active=false){
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),"apron-fork-contract-")),store=new TaskStore(directory),task=store.create({title:"Fork contract",repositoryPath:directory});
+  const manager=new ForkManager(),cwd=path.resolve(task.contextDirectory);
+  manager.threads.push({id:"original",cwd});manager.histories.set("original",{id:"original",cwd,status:{type:active?"active":"idle"},turns:[{id:"original-turn",status:active?"inProgress":"completed",items:[{id:"original-message",type:"agentMessage",phase:"final",text:"Original completed evidence"}]}]});
+  store.bindConversation(task.id,"original","Original",true);const service=new TaskConversationService(store,manager as any);
+  return {directory,store,task,manager,service,close(){service.close();store.close();fs.rmSync(directory,{recursive:true,force:true});}};
+}
+test("history-preserving fork creation is scoped and idempotent",async()=>{
+  const f=forkSetup();try{
+    const result=await f.service.create(f.task.id,{clientMessageId:"fork-history-request"},{forkFromThreadId:"original"});
+    const call=f.manager.calls.find(call=>call.method==="thread/fork")!;assert.equal(call.params.lastTurnId,"original-turn");assert.equal(call.params.excludeTurns,true);
+    assert.notEqual(result.conversation.threadId,"original");
+    assert.equal((await f.service.read(f.task.id,result.conversation.threadId)).detail.turns[0].items[0].kind,"assistant");
+    const duplicate=await f.service.create(f.task.id,{clientMessageId:"fork-history-request"},{forkFromThreadId:"original"});
+    assert.equal(duplicate.conversation.threadId,result.conversation.threadId);assert.equal(f.manager.forks,1);assert.equal(f.store.listConversationBindings(f.task.id).length,2);
+    const other=f.store.create({title:"Other task",repositoryPath:f.directory});
+    await assert.rejects(f.service.create(other.id,{clientMessageId:"cross-task-fork-request"},{forkFromThreadId:"original"}),/not bound|not found|not available|does not belong/i);
+    assert.equal(f.manager.forks,1);
+  }finally{f.close();}
+});
+test("a real active turn prevents writer recovery from issuing another execution",async()=>{
+  const f=forkSetup(true);try{
+    await assert.rejects(f.service.create(f.task.id,{clientMessageId:"fork-active-request"},{forkFromThreadId:"original"}),(error:any)=>error.code==="TURN_CONFLICT");
+    assert.equal(f.manager.forks,0);assert.equal(f.store.listConversationBindings(f.task.id).length,1);assert.equal(f.manager.calls.filter(call=>call.method==="turn/start").length,0);
+  }finally{f.close();}
+});
+test("an uncertain fork is reconciled once instead of creating a second history branch",async()=>{
+  const f=forkSetup();try{
+    f.manager.uncertainFork=true;
+    await assert.rejects(f.service.create(f.task.id,{clientMessageId:"fork-uncertain-request"},{forkFromThreadId:"original"}),(error:any)=>error.code==="CREATE_OUTCOME_UNKNOWN");
+    await f.service.reconcile(f.task.id);
+    const recovered=await f.service.create(f.task.id,{clientMessageId:"fork-uncertain-request"},{forkFromThreadId:"original"});
+    assert.equal(recovered.conversation.threadId,"fork-1");assert.equal(f.manager.forks,1);
+  }finally{f.close();}
+});
+test("writer conflict is distinguished from network failure before submitting a turn",async()=>{
+  const f=forkSetup();try{
+    f.manager.writerConflict=true;
+    await assert.rejects(f.service.send(f.task.id,"original",{clientMessageId:"writer-send-contract",text:"Follow up"}),(error:any)=>error.code==="THREAD_WRITER_CONFLICT"&&error.status===409);
+    assert.equal(f.manager.calls.filter(call=>call.method==="turn/start").length,0);
+    assert.equal(f.store.getActiveConversationLease(f.task.id,"original"),null);
+  }finally{f.close();}
+});
+
+
+test("fresh polling reads only the requested latest turn and closes its durable lease",async()=>{
+  const f=forkSetup();try{
+    const request=f.manager.request.bind(f.manager);
+    f.manager.request=async(method:string,params:any)=>{
+      if(method==="thread/turns/list"){f.manager.calls.push({method,params});return {data:[{id:"latest-turn",status:"completed",items:[{id:"final",type:"agentMessage",phase:"final",text:"latest evidence"}]}]};}
+      return request(method,params);
+    };
+    const reserved=f.store.reserveConversationRequestAndLease({taskId:f.task.id,threadId:"original",operation:"send",clientMessageId:"paged-lease-request",requestHash:"hash",ownerInstanceId:f.service.instanceId});
+    f.store.markConversationRequestSubmitted(reserved.receipt.operationId,"latest-turn");
+    const turn=await f.service.readTurnFresh(f.task.id,"original","latest-turn");assert.equal(turn!.status,"completed");assert.equal(turn!.items[0].kind,"assistant");
+    assert.equal(f.manager.calls.filter(call=>call.method==="thread/read").length,0);
+    assert.equal(f.manager.calls.find(call=>call.method==="thread/turns/list")!.params.limit,1);
+    assert.equal(f.store.getActiveConversationLease(f.task.id,"original"),null);
+  }finally{f.close();}
+});
+test("fresh turn polling retains compatibility and never substitutes a different turn",async()=>{
+  const f=forkSetup();try{
+    const request=f.manager.request.bind(f.manager);let unsupported=true;
+    f.manager.request=async(method:string,params:any)=>{
+      if(method==="thread/turns/list"){f.manager.calls.push({method,params});if(unsupported)throw new CodexRpcError("Method not found",-32601);return {data:[{id:"another-turn",status:"completed",items:[]}]};}
+      return request(method,params);
+    };
+    assert.equal((await f.service.readTurnFresh(f.task.id,"original","original-turn"))!.id,"original-turn");
+    assert.equal((await f.service.readTurnFresh(f.task.id,"original","original-turn"))!.id,"original-turn");
+    assert.equal(f.manager.calls.filter(call=>call.method==="thread/turns/list").length,1);
+    const second=new TaskConversationService(f.store,f.manager as any);unsupported=false;
+    try{assert.equal((await second.readTurnFresh(f.task.id,"original","original-turn"))!.id,"original-turn");}finally{second.close();}
+  }finally{f.close();}
+});

@@ -3,8 +3,9 @@ import type { TaskApprovalsReviewer, TaskConversationApproval, TaskConversationI
 import type { TaskUsageSummary } from "./taskUsageTypes.js";
 
 export type WorkerPolicy = "auto" | "parallel" | "single";
-export type TaskModePhase = "idle" | "planning" | "working" | "reviewing" | "paused" | "blocked" | "needs_confirmation" | "completed";
-export type TaskModeAction = "pause" | "resume" | "retry" | "approve" | "reread_output" | "clarify_report";
+export type TaskAuthorizationType = "pending_approval" | "full_authorization";
+export type TaskModePhase = "idle" | "planning" | "working" | "reviewing" | "paused" | "blocked" | "awaiting_authorization" | "needs_confirmation" | "completed";
+export type TaskModeAction = "pause" | "resume" | "retry" | "approve" | "approve_authorization" | "reread_output" | "clarify_report";
 export interface TaskModeHeartbeat {
   status: "idle" | "healthy" | "recovering" | "needs_attention";
   checkedAt?: string;
@@ -16,6 +17,8 @@ export interface TaskModeHeartbeat {
 }
 export type InstructionStatus = "queued" | "submitted" | "agent_received" | "worker_received" | "completed" | "blocked";
 export interface TaskModeSettings {
+  /** Absent in legacy settings: preserve their existing approval policy. */
+  authorizationType?: TaskAuthorizationType;
   executionMode?: "collaborative" | "quick";
   agentModel: string;
   workerModel: string;
@@ -44,6 +47,7 @@ export interface RequirementSnapshot {
   references: Array<{ id: string; title: string; markdown: string; revision: number }>;
 }
 export interface TaskInstruction {
+  authorizationType?: TaskAuthorizationType;
   id: string; clientMessageId: string; text: string; timing: "now" | "after"; status: InstructionStatus; createdAt: string;
   archivedAt?: string;
   deletedAt?: string;
@@ -53,7 +57,8 @@ export interface TaskInstruction {
   snapshot: RequirementSnapshot; deliveries: Array<{ workerId: string; turnId: string; receivedAt: string }>;
 }
 export interface TaskRunResult {
-  status: "done" | "blocked" | "needs_confirmation" | "in_progress"; summary: string; changedFiles: string[];
+  changesDeferred?: boolean;
+  status: "done" | "blocked" | "awaiting_authorization" | "needs_confirmation" | "in_progress"; summary: string; changedFiles: string[];
   verification: TaskVerification[]; risks: string[]; artifacts: TaskAttachment[];
   changes: Array<{ path: string; diff: string }>; reviewedAt?: string;
   stopReason?: string;
@@ -61,9 +66,12 @@ export interface TaskRunResult {
   agentNextSteps?: string[];
   internalNextSteps?: string[];
   acceptanceReady?: boolean;
-  pauseCategory?: "blocked" | "unclear_requirement" | "exception";
+  pauseCategory?: "blocked" | "unclear_requirement" | "exception" | "authorization";
 }
 export interface TaskExecutionJob {
+  itemsDeferred?: boolean;
+  recoveredFromThreadId?: string;
+  writerRecovery?: { sourceThreadId: string; clientMessageId: string };
   id: string; role: "plan" | "worker" | "review" | "steer" | "execute"; name: string; objective: string; ownedPaths: string[];
   threadId?: string; turnId?: string; status: "pending" | "active" | "completed" | "failed" | "interrupted";
   attempt: number; text: string; model: string; output?: Record<string, unknown>; items: TaskConversationItem[]; error?: string; processed?: boolean;
@@ -75,6 +83,7 @@ export interface TaskExecutionJob {
   contextPacket?: { path:string; evidencePath:string; sha256:string; originalCharacters:number; submittedCharacters:number };
 }
 export interface TaskExecutionRun {
+  authorizationGrants?: Array<{ at: string; content: string }>;
   id: string; instructionIds: string[]; createdAt: string; completedAt?: string; settings: TaskModeSettings;
   jobs: TaskExecutionJob[]; result?: TaskRunResult; reviewAttempt: number;
   iteration?: number;
@@ -99,7 +108,21 @@ export interface TaskModeState {
 }
 export interface TaskModeDetail { task: TaskItem; state: TaskModeState; approvals: TaskConversationApproval[]; usage?: TaskUsageSummary }
 export interface TaskModeList { tasks: TaskItem[]; states: Array<Pick<TaskModeState, "taskId" | "phase" | "settings" | "heartbeat" | "updatedAt" | "processedDurationMs" | "processedVerifiedDurationMs" | "processingStartedAt" | "processedTimingCoverage" | "processedTimingSince" | "processedRecoveredDurationMs"> & { instructionCount: number }>; usage?: Record<string,TaskUsageSummary> }
-export interface SubmitTaskInstruction { clientMessageId: string; text: string; timing: "now" | "after"; attachmentIds?: string[]; referenceTaskIds?: string[]; documentIds?: string[] }
+export interface SubmitTaskInstruction { clientMessageId: string; text: string; timing: "now" | "after"; authorizationType?: TaskAuthorizationType; attachmentIds?: string[]; referenceTaskIds?: string[]; documentIds?: string[] }
+
+export function applyTaskAuthorization(settings: TaskModeSettings, authorizationType = settings.authorizationType): TaskModeSettings {
+  if (authorizationType === "full_authorization") return { ...settings, authorizationType, permissionPreset: "full_access", approvalsReviewer: "user", reviewPolicy: "agent" };
+  if (authorizationType === "pending_approval") return { ...settings, authorizationType, approvalsReviewer: "user" };
+  return { ...settings };
+}
+
+export function taskAuthorizationPrompt(settings: TaskModeSettings): string {
+  return settings.authorizationType === "full_authorization"
+    ? "本轮授权类型：完全授权。用户已明确授权在本任务目标范围内实施、修改文件、安装依赖、运行验证以及完成任务明确要求的发布或外部写入。无需再索取人工授权；不要因一般执行动作、产出审查附件或阶段结束停下。已有授权覆盖的操作继续执行。授权不扩展任务目标，缺失凭据、关键需求不明和真正的外部阻塞必须如实报告。"
+    : settings.authorizationType === "pending_approval"
+      ? "本轮授权类型：待批准。可在当前权限内继续工作；确需新增授权时明确列出操作、对象、范围和原因，pauseCategory=authorization，不能把待授权写成技术阻塞。已有批准继续有效，不得重复索取同一授权。"
+      : "沿用本轮既有权限和审批策略。先检查已有授权，不重复索取已批准的权限。待授权与技术阻塞区分，待授权返回 pauseCategory=authorization 并列出具体操作和原因。";
+}
 
 export interface TaskModeViewPreferences {
   layout: "board" | "desk" | "document"; board: "status" | "free"; taskOrder: string[]; columnOrder: string[];
